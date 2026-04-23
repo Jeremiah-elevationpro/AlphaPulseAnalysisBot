@@ -1,0 +1,31 @@
+# ============================================================
+# AlphaPulse — Python Dependencies
+# ============================================================
+
+# Core scientific / data
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.11.0
+
+# MetaTrader 5 (Windows only)
+MetaTrader5>=5.0.45; sys_platform == "win32"
+
+# HTTP (Telegram API)
+requests>=2.31.0
+
+# PostgreSQL
+psycopg2-binary>=2.9.7
+
+# Supabase (optional — only needed if USE_SUPABASE=true in .env)
+# Requires Microsoft C++ Build Tools to install on Windows:
+# https://visualstudio.microsoft.com/visual-cpp-build-tools/
+# supabase>=2.0.0
+
+# Streamlit dashboard
+streamlit>=1.32.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Logging / utilities
+colorlog>=6.7.0

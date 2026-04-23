@@ -1,0 +1,810 @@
+"""
+AlphaPulse - Database Connection Manager
+==========================================
+Supports both direct PostgreSQL (psycopg2) and Supabase REST API.
+
+When USE_SUPABASE=true the bot communicates with Supabase entirely over
+HTTPS (port 443) — no direct PostgreSQL port required.  All table operations
+are translated to Supabase REST calls.
+"""
+
+import json
+from contextlib import contextmanager
+from typing import Any, Dict, List, Optional
+
+from config.settings import (
+    USE_SUPABASE,
+    DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD,
+    SUPABASE_URL, SUPABASE_KEY,
+    ACTIVE_TIMEFRAME_PAIR_LABELS,
+)
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+def _normalise_tf_pair(value: str) -> str:
+    return str(value).replace("->", "-").replace(" ", "")
+
+
+# ─────────────────────────────────────────────────────────
+# PostgreSQL Connection Pool (direct psycopg2)
+# ─────────────────────────────────────────────────────────
+
+class PostgresDB:
+    """Thin psycopg2 wrapper with a simple threaded connection pool."""
+
+    def __init__(self):
+        self._pool = None
+
+    def init(self):
+        try:
+            from psycopg2 import pool as pg_pool
+            self._pool = pg_pool.ThreadedConnectionPool(
+                minconn=1, maxconn=10,
+                host=DB_HOST, port=DB_PORT,
+                dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD,
+            )
+            logger.info("PostgreSQL pool initialized — %s@%s:%s/%s",
+                        DB_USER, DB_HOST, DB_PORT, DB_NAME)
+        except Exception as e:
+            logger.error("Failed to init PostgreSQL pool: %s", e)
+            raise
+
+    @contextmanager
+    def _get_conn(self):
+        conn = self._pool.getconn()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._pool.putconn(conn)
+
+    def execute(self, sql: str, params: tuple = ()):
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+
+    def fetchall(self, sql: str, params: tuple = ()) -> List[tuple]:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return cur.fetchall()
+
+    def fetchone(self, sql: str, params: tuple = ()) -> Optional[tuple]:
+        with self._get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return cur.fetchone()
+
+    def close(self):
+        if self._pool:
+            self._pool.closeall()
+
+
+# ─────────────────────────────────────────────────────────
+# Supabase REST Client (HTTPS only — no direct PG port)
+# ─────────────────────────────────────────────────────────
+
+class SupabaseDB:
+    """
+    Full Supabase REST implementation using the PostgREST API.
+    Communicates entirely over HTTPS (port 443).
+
+    All CRUD operations map to:
+      GET/POST/PATCH  https://<project>.supabase.co/rest/v1/<table>
+    """
+
+    def __init__(self):
+        self._url: str = ""
+        self._headers: Dict = {}
+
+    def init(self):
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise ValueError(
+                "SUPABASE_URL and SUPABASE_KEY must be set in .env when USE_SUPABASE=true"
+            )
+        self._url = SUPABASE_URL.rstrip("/") + "/rest/v1"
+        self._headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        }
+        # Verify connectivity and that tables exist
+        try:
+            self._get("trades", limit=1)
+        except Exception as e:
+            err = str(e)
+            if "404" in err or "Not Found" in err:
+                raise RuntimeError(
+                    "Supabase tables not found. "
+                    "Run setup_supabase.sql in your Supabase SQL Editor first:\n"
+                    "  Dashboard -> SQL Editor -> New query -> paste setup_supabase.sql -> Run"
+                ) from e
+            raise
+        logger.info("Supabase REST client ready — %s", SUPABASE_URL)
+
+    # ── Low-level helpers ────────────────────────────────
+
+    def _get(self, table: str, params: Optional[Dict] = None,
+             limit: int = 1000) -> List[Dict]:
+        import requests
+        p = params or {}
+        p["limit"] = limit
+        r = requests.get(
+            f"{self._url}/{table}",
+            headers=self._headers,
+            params=p,
+            timeout=15,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def _post(self, table: str, data: Dict) -> Optional[Dict]:
+        import requests
+        r = requests.post(
+            f"{self._url}/{table}",
+            headers=self._headers,
+            data=json.dumps(data, default=str),
+            timeout=15,
+        )
+        if not r.ok:
+            # Log the Supabase error body before raising — this tells you exactly
+            # which column is invalid/missing (e.g. "column X does not exist").
+            try:
+                err_body = r.json()
+            except Exception:
+                err_body = r.text
+            logger.error(
+                "Supabase POST %s failed %d: %s",
+                table, r.status_code, err_body,
+            )
+            try:
+                r.raise_for_status()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Supabase POST {table} failed {r.status_code}: {err_body}"
+                ) from exc
+        r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else None
+
+    def _patch(self, table: str, filters: Dict, data: Dict):
+        import requests
+        params = {k: f"eq.{v}" for k, v in filters.items()}
+        r = requests.patch(
+            f"{self._url}/{table}",
+            headers=self._headers,
+            params=params,
+            data=json.dumps(data, default=str),
+            timeout=15,
+        )
+        r.raise_for_status()
+
+    def _upsert(self, table: str, data: Dict, on_conflict: str):
+        import requests
+        headers = {**self._headers, "Prefer": f"resolution=merge-duplicates,return=representation"}
+        r = requests.post(
+            f"{self._url}/{table}",
+            headers=headers,
+            params={"on_conflict": on_conflict},
+            data=json.dumps(data, default=str),
+            timeout=15,
+        )
+        r.raise_for_status()
+
+
+# ─────────────────────────────────────────────────────────
+# Unified Database Interface
+# ─────────────────────────────────────────────────────────
+
+class Database:
+    """
+    Single entry point for all DB operations.
+    Delegates to either PostgresDB or SupabaseDB based on USE_SUPABASE setting.
+    """
+
+    def __init__(self):
+        self._pg: Optional[PostgresDB] = None
+        self._sb: Optional[SupabaseDB] = None
+
+    def init(self):
+        if USE_SUPABASE:
+            sb = SupabaseDB()
+            sb.init()
+            self._sb = sb
+            logger.info("Using Supabase REST API for persistence.")
+        else:
+            pg = PostgresDB()
+            pg.init()
+            self._pg = pg
+            self._create_schema()
+
+    # ─────────────────────────────────────────────────────
+    # SCHEMA CREATION (PostgreSQL direct only)
+    # Supabase: run setup_supabase.sql in the SQL editor once.
+    # ─────────────────────────────────────────────────────
+
+    def _create_schema(self):
+        """Create all tables (PostgreSQL direct mode only)."""
+        logger.info("Ensuring database schema exists...")
+
+        self._pg.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id              SERIAL PRIMARY KEY,
+                trade_uuid      UUID UNIQUE NOT NULL,
+                pair            VARCHAR(20) NOT NULL DEFAULT 'XAUUSD',
+                direction       VARCHAR(4)  NOT NULL,
+                entry_price     NUMERIC(10,2) NOT NULL,
+                sl_price        NUMERIC(10,2) NOT NULL,
+                tp1             NUMERIC(10,2),
+                tp2             NUMERIC(10,2),
+                tp3             NUMERIC(10,2),
+                tp4             NUMERIC(10,2),
+                tp5             NUMERIC(10,2),
+                tp1_hit         BOOLEAN DEFAULT FALSE,
+                tp2_hit         BOOLEAN DEFAULT FALSE,
+                tp3_hit         BOOLEAN DEFAULT FALSE,
+                tp4_hit         BOOLEAN DEFAULT FALSE,
+                tp5_hit         BOOLEAN DEFAULT FALSE,
+                status          VARCHAR(30) NOT NULL DEFAULT 'PENDING',
+                level_type      VARCHAR(10),
+                level_price     NUMERIC(10,2),
+                higher_tf       VARCHAR(5),
+                lower_tf        VARCHAR(5),
+                result          VARCHAR(10),
+                confidence      NUMERIC(5,3) DEFAULT 0.5,
+                created_at      TIMESTAMPTZ DEFAULT NOW(),
+                activated_at    TIMESTAMPTZ,
+                closed_at       TIMESTAMPTZ,
+                be_moved        BOOLEAN DEFAULT FALSE,
+                tp_progress_reached INT DEFAULT 0,
+                protected_after_tp1 BOOLEAN DEFAULT FALSE,
+                tp1_alert_sent  BOOLEAN DEFAULT FALSE,
+                breakeven_exit  BOOLEAN DEFAULT FALSE,
+                notes           TEXT
+            );
+        """)
+
+        self._pg.execute("""
+            CREATE TABLE IF NOT EXISTS performance_stats (
+                id              SERIAL PRIMARY KEY,
+                level_type      VARCHAR(10),
+                tf_pair         VARCHAR(20),
+                wins            INT DEFAULT 0,
+                losses          INT DEFAULT 0,
+                total_trades    INT DEFAULT 0,
+                win_rate        NUMERIC(5,3) DEFAULT 0.5,
+                reward_score    NUMERIC(8,3) DEFAULT 0.0,
+                updated_at      TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(level_type, tf_pair)
+            );
+        """)
+
+        self._pg.execute("""
+            CREATE TABLE IF NOT EXISTS daily_summaries (
+                id              SERIAL PRIMARY KEY,
+                summary_date    DATE UNIQUE NOT NULL,
+                total_setups    INT DEFAULT 0,
+                activated       INT DEFAULT 0,
+                wins            INT DEFAULT 0,
+                losses          INT DEFAULT 0,
+                win_rate        NUMERIC(5,3) DEFAULT 0.0,
+                best_level_type VARCHAR(10),
+                best_tf_pair    VARCHAR(20),
+                created_at      TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+
+        self._pg.execute("""
+            CREATE TABLE IF NOT EXISTS confidence_scores (
+                id              SERIAL PRIMARY KEY,
+                level_type      VARCHAR(10) NOT NULL,
+                tf_pair         VARCHAR(20) NOT NULL,
+                score           NUMERIC(5,3) DEFAULT 0.5,
+                reward_total    NUMERIC(8,3) DEFAULT 0.0,
+                updated_at      TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE(level_type, tf_pair)
+            );
+        """)
+
+        logger.info("Schema verified/created.")
+
+    # ─────────────────────────────────────────────────────
+    # TRADE CRUD
+    # ─────────────────────────────────────────────────────
+
+    def insert_trade(self, trade: Dict[str, Any]) -> Optional[int]:
+        """Insert a new trade. Returns the new trade ID."""
+        if self._sb:
+            payload = {
+                "trade_uuid":   str(trade["trade_uuid"]),
+                "pair":         trade.get("pair", "XAUUSD"),
+                "direction":    trade["direction"],
+                "entry_price":  trade["entry_price"],
+                "sl_price":     trade["sl_price"],
+                "tp1":          trade.get("tp1"),
+                "tp2":          trade.get("tp2"),
+                "tp3":          trade.get("tp3"),
+                "tp4":          trade.get("tp4"),
+                "tp5":          trade.get("tp5"),
+                "level_type":   trade.get("level_type"),
+                "level_price":  trade.get("level_price"),
+                "higher_tf":    trade.get("higher_tf"),
+                "lower_tf":     trade.get("lower_tf"),
+                "confidence":   trade.get("confidence", 0.5),
+                "status":       trade.get("status", "PENDING"),
+                "tp_progress_reached": trade.get("tp_progress_reached", 0),
+                "protected_after_tp1": trade.get("protected_after_tp1", False),
+                "tp1_alert_sent": trade.get("tp1_alert_sent", False),
+                "breakeven_exit": trade.get("breakeven_exit", False),
+            }
+            row = self._sb._post("trades", payload)
+            return row.get("id") if row else None
+
+        if self._pg:
+            row = self._pg.fetchone("""
+                INSERT INTO trades (
+                    trade_uuid, pair, direction, entry_price, sl_price,
+                    tp1, tp2, tp3, tp4, tp5,
+                    level_type, level_price, higher_tf, lower_tf,
+                    confidence, status, tp_progress_reached,
+                    protected_after_tp1, tp1_alert_sent, breakeven_exit
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING id
+            """, (
+                trade["trade_uuid"], trade.get("pair", "XAUUSD"),
+                trade["direction"], trade["entry_price"], trade["sl_price"],
+                trade.get("tp1"), trade.get("tp2"), trade.get("tp3"),
+                trade.get("tp4"), trade.get("tp5"),
+                trade.get("level_type"), trade.get("level_price"),
+                trade.get("higher_tf"), trade.get("lower_tf"),
+                trade.get("confidence", 0.5), trade.get("status", "PENDING"),
+                trade.get("tp_progress_reached", 0),
+                trade.get("protected_after_tp1", False),
+                trade.get("tp1_alert_sent", False),
+                trade.get("breakeven_exit", False),
+            ))
+            return row[0] if row else None
+
+    def update_trade_status(self, trade_uuid: str, status: str, **kwargs):
+        """Update a trade's status and any additional fields."""
+        if self._sb:
+            self._sb._patch("trades", {"trade_uuid": trade_uuid},
+                            {"status": status, **kwargs})
+            return
+
+        if self._pg:
+            set_clauses = ["status = %s"]
+            params = [status]
+            for k, v in kwargs.items():
+                set_clauses.append(f"{k} = %s")
+                params.append(v)
+            params.append(trade_uuid)
+            self._pg.execute(
+                f"UPDATE trades SET {', '.join(set_clauses)} WHERE trade_uuid = %s",
+                tuple(params),
+            )
+
+    def update_tp_hit(self, trade_uuid: str, tp_index: int):
+        """Mark a specific TP level as hit (0-based index)."""
+        col = f"tp{tp_index + 1}_hit"
+
+        if self._sb:
+            self._sb._patch("trades", {"trade_uuid": trade_uuid}, {col: True})
+            return
+
+        if self._pg:
+            self._pg.execute(
+                f"UPDATE trades SET {col} = TRUE WHERE trade_uuid = %s",
+                (trade_uuid,),
+            )
+
+    def get_trade(self, trade_uuid: str) -> Optional[Dict]:
+        if self._sb:
+            rows = self._sb._get("trades", {"trade_uuid": f"eq.{trade_uuid}"}, limit=1)
+            return rows[0] if rows else None
+
+        if self._pg:
+            row = self._pg.fetchone(
+                "SELECT * FROM trades WHERE trade_uuid = %s", (trade_uuid,)
+            )
+            return dict(row) if row else None
+
+    def get_active_trades(self) -> List[Dict]:
+        if self._sb:
+            return self._sb._get(
+                "trades",
+                {"status": "not.in.(COMPLETED,STOP_LOSS_HIT,CANCELLED)",
+                 "order": "created_at.desc"},
+            )
+
+        if self._pg:
+            rows = self._pg.fetchall("""
+                SELECT * FROM trades
+                WHERE status NOT IN ('COMPLETED','STOP_LOSS_HIT','CANCELLED')
+                ORDER BY created_at DESC
+            """)
+            return list(rows)
+        return []
+
+    def get_today_trades(self) -> List[Dict]:
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        if self._sb:
+            return self._sb._get(
+                "trades",
+                {"created_at": f"gte.{today}T00:00:00Z",
+                 "order": "created_at.desc"},
+            )
+
+        if self._pg:
+            rows = self._pg.fetchall("""
+                SELECT * FROM trades
+                WHERE DATE(created_at) = CURRENT_DATE
+                ORDER BY created_at DESC
+            """)
+            return list(rows)
+        return []
+
+    def get_all_closed_trades(self) -> List[Dict]:
+        if self._sb:
+            return self._sb._get(
+                "trades",
+                {"status": "in.(COMPLETED,STOP_LOSS_HIT)",
+                 "order": "closed_at.desc"},
+            )
+
+        if self._pg:
+            rows = self._pg.fetchall("""
+                SELECT * FROM trades
+                WHERE status IN ('COMPLETED','STOP_LOSS_HIT')
+                ORDER BY closed_at DESC
+            """)
+            return list(rows)
+        return []
+
+    # ─────────────────────────────────────────────────────
+    # PERFORMANCE STATS
+    # ─────────────────────────────────────────────────────
+
+    # Historical replay persistence. Replay is Supabase-only so that results
+    # are available for later learning without affecting live trade tables.
+    def create_replay_run(self, payload: Dict[str, Any]) -> Optional[int]:
+        if not self._sb:
+            raise RuntimeError("Historical replay persistence requires USE_SUPABASE=true")
+        row = self._sb._post("historical_replay_runs", payload)
+        return row.get("id") if row else None
+
+    def update_replay_run(self, replay_run_id: int, payload: Dict[str, Any]):
+        if not self._sb:
+            raise RuntimeError("Historical replay persistence requires USE_SUPABASE=true")
+        self._sb._patch("historical_replay_runs", {"id": replay_run_id}, payload)
+
+    # All columns added by optional migrations. On a 400, the insert is retried
+    # without these fields so the replay always succeeds even when a migration
+    # hasn't been run yet. Run the migration SQLs to start capturing these values.
+    _OPTIONAL_TRADE_COLUMNS: frozenset = frozenset({
+        # migrate_replay_pip_metrics.sql
+        "pips_to_tp1", "pips_to_tp2", "pips_to_tp3", "pips_to_tp4", "pips_to_tp5",
+        "realized_pips", "max_potential_pips", "final_pips",
+        # migrate_replay_micro_confirmation.sql
+        "micro_confirmation_type", "micro_confirmation_score", "micro_layer_decision",
+        # migrate_replay_execution_filters.sql
+        "h1_liquidity_sweep", "h1_sweep_direction", "h1_reclaim_confirmed",
+        "pd_location", "pd_filter_score", "bias_gate_result",
+        # quality refinement tags
+        "high_quality_trade", "micro_strength",
+    })
+
+    _OPTIONAL_STATS_COLUMNS: frozenset = frozenset({
+        # migrate_replay_pip_metrics.sql (stats table)
+        "pip_summary", "pip_by_timeframe_pair", "pip_by_bias", "pip_by_session",
+        # migrate_replay_micro_confirmation.sql (stats table)
+        "performance_by_micro_confirmation",
+        # migrate_replay_execution_filters.sql (stats table)
+        "performance_by_h1_sweep", "performance_by_pd_location", "performance_by_bias_gate",
+    })
+
+    def insert_replay_trade(self, payload: Dict[str, Any]) -> Optional[int]:
+        if not self._sb:
+            raise RuntimeError("Historical replay persistence requires USE_SUPABASE=true")
+        try:
+            row = self._sb._post("historical_replay_trades", payload)
+        except Exception as exc:
+            if not self._is_400(exc):
+                raise
+            # At least one optional column is missing from the table.
+            # Strip ALL migration-optional fields and retry once. This handles
+            # any combination of missing migrations (pip, micro, or both).
+            fallback = {k: v for k, v in payload.items() if k not in self._OPTIONAL_TRADE_COLUMNS}
+            stripped = sorted(set(payload) & self._OPTIONAL_TRADE_COLUMNS)
+            logger.warning(
+                "Replay trade insert 400 — retrying without optional columns %s. "
+                "Run migrate_replay_pip_metrics.sql, migrate_replay_micro_confirmation.sql, "
+                "and migrate_replay_execution_filters.sql "
+                "in Supabase to capture full trade data.",
+                stripped,
+            )
+            row = self._sb._post("historical_replay_trades", fallback)
+        return row.get("id") if row else None
+
+    def insert_replay_stats(self, payload: Dict[str, Any]) -> Optional[int]:
+        if not self._sb:
+            raise RuntimeError("Historical replay persistence requires USE_SUPABASE=true")
+        try:
+            row = self._sb._post("historical_replay_stats", payload)
+        except Exception as exc:
+            if not self._is_400(exc):
+                raise
+            fallback = {k: v for k, v in payload.items() if k not in self._OPTIONAL_STATS_COLUMNS}
+            stripped = sorted(set(payload) & self._OPTIONAL_STATS_COLUMNS)
+            logger.warning(
+                "Replay stats insert 400 — retrying without optional columns %s. "
+                "Run migrate_replay_pip_metrics.sql, migrate_replay_micro_confirmation.sql, "
+                "and migrate_replay_execution_filters.sql.",
+                stripped,
+            )
+            row = self._sb._post("historical_replay_stats", fallback)
+        return row.get("id") if row else None
+
+    @staticmethod
+    def _is_400(exc: Exception) -> bool:
+        """Return True when exc is an HTTP 400 from the Supabase client.
+
+        Supabase REST errors are first raised as ``requests.HTTPError`` inside
+        ``_post`` and then wrapped as ``RuntimeError`` with the response body.
+        Keep this helper tolerant so optional replay-column fallbacks still
+        work when a local Supabase schema is missing a recently added column.
+        """
+        try:
+            from requests import HTTPError
+
+            if (
+                isinstance(exc, HTTPError)
+                and exc.response is not None
+                and exc.response.status_code == 400
+            ):
+                return True
+        except Exception:
+            pass
+
+        message = str(exc)
+        retryable_markers = (
+            "failed 400",
+            "400 Client Error",
+            "PGRST204",
+            "schema cache",
+            "Could not find the",
+        )
+        return any(marker in message for marker in retryable_markers)
+
+    def get_replay_trades_for_learning(
+        self,
+        limit: int = 1000,
+        replay_run_id: Optional[int] = None,
+    ) -> List[Dict]:
+        """Fetch learning-grade activated replay trades from Supabase."""
+        if not self._sb:
+            raise RuntimeError("Historical replay persistence requires USE_SUPABASE=true")
+        filters = {
+            "source": "eq.historical_replay",
+            "final_result": "in.(PARTIAL_WIN,BREAKEVEN_WIN,WIN,STRONG_WIN,LOSS)",
+            "order": "timestamp.asc",
+        }
+        if replay_run_id:
+            filters["replay_run_id"] = f"eq.{replay_run_id}"
+        rows = self._sb._get(
+            "historical_replay_trades",
+            filters,
+            limit=limit,
+        )
+        active_rows = [
+            row for row in rows
+            if _normalise_tf_pair(row.get("timeframe_pair", "")) in ACTIVE_TIMEFRAME_PAIR_LABELS
+        ]
+        skipped = len(rows) - len(active_rows)
+        if skipped:
+            logger.info("Replay learning skipped %d disabled timeframe-pair trade(s).", skipped)
+        return active_rows
+
+    def get_latest_replay_run(self) -> Optional[Dict]:
+        """Return the most recent historical replay run from Supabase."""
+        if not self._sb:
+            raise RuntimeError("Historical replay persistence requires USE_SUPABASE=true")
+        rows = self._sb._get(
+            "historical_replay_runs",
+            {"order": "id.desc"},
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    def get_replay_run(self, replay_run_id: int) -> Optional[Dict]:
+        """Return one historical replay run by id."""
+        if not self._sb:
+            raise RuntimeError("Historical replay persistence requires USE_SUPABASE=true")
+        rows = self._sb._get(
+            "historical_replay_runs",
+            {"id": f"eq.{replay_run_id}"},
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    def get_replay_trades(self, replay_run_id: int, limit: int = 10000) -> List[Dict]:
+        """Return activated replay trades for one replay run."""
+        if not self._sb:
+            raise RuntimeError("Historical replay persistence requires USE_SUPABASE=true")
+        return self._sb._get(
+            "historical_replay_trades",
+            {"replay_run_id": f"eq.{replay_run_id}", "order": "timestamp.asc"},
+            limit=limit,
+        )
+
+    def get_replay_stats(self, replay_run_id: int) -> Optional[Dict]:
+        """Return aggregate replay stats for one replay run."""
+        if not self._sb:
+            raise RuntimeError("Historical replay persistence requires USE_SUPABASE=true")
+        rows = self._sb._get(
+            "historical_replay_stats",
+            {"replay_run_id": f"eq.{replay_run_id}", "order": "id.desc"},
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    def upsert_performance(self, level_type: str, tf_pair: str,
+                           wins: int, losses: int, reward: float):
+        total = wins + losses
+        win_rate = round(wins / total, 3) if total > 0 else 0.5
+
+        if self._sb:
+            self._sb._upsert("performance_stats", {
+                "level_type": level_type, "tf_pair": tf_pair,
+                "wins": wins, "losses": losses,
+                "total_trades": total, "win_rate": win_rate,
+                "reward_score": reward,
+            }, on_conflict="level_type,tf_pair")
+            return
+
+        if self._pg:
+            self._pg.execute("""
+                INSERT INTO performance_stats
+                    (level_type, tf_pair, wins, losses, total_trades, win_rate, reward_score)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (level_type, tf_pair) DO UPDATE SET
+                    wins=EXCLUDED.wins, losses=EXCLUDED.losses,
+                    total_trades=EXCLUDED.total_trades, win_rate=EXCLUDED.win_rate,
+                    reward_score=EXCLUDED.reward_score, updated_at=NOW()
+            """, (level_type, tf_pair, wins, losses, total, win_rate, reward))
+
+    def get_all_performance(self) -> List[Dict]:
+        if self._sb:
+            return self._sb._get("performance_stats",
+                                 {"order": "win_rate.desc"})
+
+        if self._pg:
+            return list(self._pg.fetchall(
+                "SELECT * FROM performance_stats ORDER BY win_rate DESC"
+            ))
+        return []
+
+    # ─────────────────────────────────────────────────────
+    # CONFIDENCE SCORES
+    # ─────────────────────────────────────────────────────
+
+    def upsert_confidence(self, level_type: str, tf_pair: str,
+                          score: float, reward_total: float):
+        if self._sb:
+            self._sb._upsert("confidence_scores", {
+                "level_type": level_type, "tf_pair": tf_pair,
+                "score": score, "reward_total": reward_total,
+            }, on_conflict="level_type,tf_pair")
+            return
+
+        if self._pg:
+            self._pg.execute("""
+                INSERT INTO confidence_scores (level_type, tf_pair, score, reward_total)
+                VALUES (%s,%s,%s,%s)
+                ON CONFLICT (level_type, tf_pair) DO UPDATE SET
+                    score=EXCLUDED.score, reward_total=EXCLUDED.reward_total,
+                    updated_at=NOW()
+            """, (level_type, tf_pair, score, reward_total))
+
+    def get_confidence(self, level_type: str, tf_pair: str) -> float:
+        if self._sb:
+            rows = self._sb._get("confidence_scores", {
+                "level_type": f"eq.{level_type}",
+                "tf_pair": f"eq.{tf_pair}",
+            }, limit=1)
+            return float(rows[0]["score"]) if rows else 0.5
+
+        if self._pg:
+            row = self._pg.fetchone(
+                "SELECT score FROM confidence_scores WHERE level_type=%s AND tf_pair=%s",
+                (level_type, tf_pair),
+            )
+            return float(row[0]) if row else 0.5
+        return 0.5
+
+    def get_learned_combo_scores(self) -> List[Dict]:
+        """Return persisted learned setup-combination scores."""
+        if self._sb:
+            return self._sb._get(
+                "confidence_scores",
+                {"level_type": "eq.learned_combo"},
+                limit=5000,
+            )
+
+        if self._pg:
+            rows = self._pg.fetchall(
+                """
+                SELECT level_type, tf_pair, score, reward_total
+                FROM confidence_scores
+                WHERE level_type=%s
+                """,
+                ("learned_combo",),
+            )
+            return [
+                {
+                    "level_type": row[0],
+                    "tf_pair": row[1],
+                    "score": row[2],
+                    "reward_total": row[3],
+                }
+                for row in rows
+            ]
+        return []
+
+    # ─────────────────────────────────────────────────────
+    # DAILY SUMMARY
+    # ─────────────────────────────────────────────────────
+
+    def upsert_daily_summary(self, summary: Dict[str, Any]):
+        if self._sb:
+            self._sb._upsert("daily_summaries", {
+                "summary_date": str(summary["date"]),
+                "total_setups": summary["total_setups"],
+                "activated":    summary["activated"],
+                "wins":         summary["wins"],
+                "losses":       summary["losses"],
+                "win_rate":     summary["win_rate"],
+            }, on_conflict="summary_date")
+            return
+
+        if self._pg:
+            self._pg.execute("""
+                INSERT INTO daily_summaries
+                    (summary_date, total_setups, activated, wins, losses, win_rate)
+                VALUES (%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (summary_date) DO UPDATE SET
+                    total_setups=EXCLUDED.total_setups, activated=EXCLUDED.activated,
+                    wins=EXCLUDED.wins, losses=EXCLUDED.losses, win_rate=EXCLUDED.win_rate
+            """, (
+                summary["date"], summary["total_setups"],
+                summary["activated"], summary["wins"],
+                summary["losses"], summary["win_rate"],
+            ))
+
+    def get_daily_summaries(self, days: int = 30) -> List[Dict]:
+        if self._sb:
+            return self._sb._get("daily_summaries",
+                                 {"order": "summary_date.desc"}, limit=days)
+
+        if self._pg:
+            return list(self._pg.fetchall(
+                "SELECT * FROM daily_summaries ORDER BY summary_date DESC LIMIT %s",
+                (days,),
+            ))
+        return []
+
+    # ─────────────────────────────────────────────────────
+    # CLOSE
+    # ─────────────────────────────────────────────────────
+
+    def close(self):
+        if self._pg:
+            self._pg.close()
