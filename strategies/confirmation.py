@@ -38,6 +38,7 @@ from config.settings import (
     LEVEL_TOLERANCE_PIPS, PIP_SIZE,
     MAX_SL_PIPS, MIN_SL_PIPS,
     MIN_WICK_BODY_RATIO, MIN_CANDLE_BODY_PIPS,
+    ACTIVE_STRATEGY_ALLOWED_MICRO_TYPES,
 )
 from utils.helpers import upper_wick, lower_wick, candle_body
 from utils.logger import get_logger
@@ -49,6 +50,7 @@ _TOL            = LEVEL_TOLERANCE_PIPS * PIP_SIZE
 _MIN_SL_PRICE   = MIN_SL_PIPS * PIP_SIZE
 _MAX_SL_PRICE   = MAX_SL_PIPS * PIP_SIZE
 _MIN_BODY_PRICE = MIN_CANDLE_BODY_PIPS * PIP_SIZE
+_ACTIVE_MICRO_TYPES = set(ACTIVE_STRATEGY_ALLOWED_MICRO_TYPES)
 
 
 @dataclass
@@ -192,7 +194,8 @@ class ConfirmationEngine:
                         results.append(result)
 
         # ── 4. Double-pattern upgrade (post-process) ──────────────────
-        self._upgrade_double_patterns(results, window)
+        if "double_pattern" in _ACTIVE_MICRO_TYPES:
+            self._upgrade_double_patterns(results, window)
 
         return results
 

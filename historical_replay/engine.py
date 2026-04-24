@@ -21,6 +21,7 @@ from data.mt5_client import MT5Client
 from db.database import Database
 from db.models import TradeStatus
 from signals.signal_generator import SignalGenerator
+from strategies.filters import SessionFilter
 from strategies.strategy_manager import StrategyManager, StrategySignal
 from historical_replay.models import PendingReplayTrade, ReplayCounters
 from historical_replay.storage import ReplayStorage
@@ -61,6 +62,7 @@ class HistoricalReplayEngine:
         self.mt5 = mt5 or MT5Client()
         self.strategy_manager = strategy_manager or StrategyManager(learning_engine=None)
         self.signal_generator = signal_generator or SignalGenerator(learning_engine=None)
+        self.session_filter = SessionFilter()
         self.storage = ReplayStorage(self.db)
         if DISABLED_TIMEFRAME_PAIRS:
             disabled = ", ".join(f"{high}->{low}" for high, low in DISABLED_TIMEFRAME_PAIRS)
@@ -150,6 +152,15 @@ class HistoricalReplayEngine:
             if not self._snapshot_ready(snapshot):
                 continue
 
+            session_label = self.session_filter.get_session(bar_close_time)
+            replay_allowed, local_time, _active_until = self.session_filter.is_bot_window_active(bar_close_time)
+            logger.info(
+                "REPLAY SESSION CHECK: local_time=%s | bot_window=07:00-19:00 | allowed=%s | session_label=%s",
+                local_time,
+                str(replay_allowed).lower(),
+                session_label,
+            )
+
             # Log once that M5/M1 are (or are not) in the snapshot
             if not _snapshot_micro_logged:
                 _snapshot_micro_logged = True
@@ -168,6 +179,10 @@ class HistoricalReplayEngine:
                 bar_time=bar_close_time,
                 counters=counters,
             )
+
+            if not replay_allowed:
+                logger.info("REPLAY SCAN SKIPPED: outside bot operating window | %s", local_time)
+                continue
 
             run_result = self.strategy_manager.run(
                 snapshot,

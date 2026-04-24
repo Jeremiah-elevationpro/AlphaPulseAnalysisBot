@@ -91,12 +91,9 @@ class ExecutionFilterEngine:
                 )
             elif neutral:
                 logger.info(
-                    "PD FILTER REJECT: equilibrium zone | %s near midpoint",
-                    setup.direction,
+                    "EXECUTION FILTER PENALTY: PD equilibrium | %s near midpoint | %.0f",
+                    setup.direction, pd_score,
                 )
-                result.passed = False
-                result.reason = "PD FILTER REJECT: equilibrium zone"
-                return result
             else:
                 logger.info(
                     "EXECUTION FILTER PENALTY: PD opposite | %s in %s | %.0f",
@@ -127,16 +124,16 @@ class ExecutionFilterEngine:
             return True, f"penalized_{dominant}_{strength}", -BIAS_MIXED_PENALTY
         if dominant != expected:
             micro_type = getattr(setup, "micro_confirmation_type", "none") or "none"
-            if strength == "strong" and micro_type == "liquidity_sweep_reclaim":
+            if micro_type == "liquidity_sweep_reclaim":
                 logger.info(
-                    "EXECUTION FILTER PASS: strong counter-trend allowed by liquidity_sweep_reclaim | %s setup vs %s %s",
+                    "EXECUTION FILTER PASS: counter-trend allowed by liquidity_sweep_reclaim | %s setup vs %s %s",
                     setup.direction,
                     dominant,
                     strength,
                 )
                 return True, f"passed_counter_{dominant}_{strength}_liquidity_sweep_reclaim", 0.0
             logger.info(
-                "EXECUTION FILTER REJECT: counter-trend requires strong bias + liquidity_sweep_reclaim | %s setup vs %s %s | micro=%s",
+                "EXECUTION FILTER REJECT: counter-trend requires liquidity_sweep_reclaim | %s setup vs %s %s | micro=%s",
                 setup.direction,
                 dominant,
                 strength,

@@ -4,30 +4,30 @@
 
 @layer base {
   :root {
-    --background: 228 30% 5%;
-    --foreground: 210 20% 94%;
-    --card: 228 28% 8%;
-    --card-foreground: 210 20% 94%;
-    --popover: 228 28% 9%;
-    --popover-foreground: 210 20% 94%;
-    --primary: 43 68% 52%;
-    --primary-foreground: 228 30% 5%;
-    --secondary: 228 22% 14%;
-    --secondary-foreground: 210 15% 68%;
-    --muted: 228 22% 13%;
-    --muted-foreground: 215 12% 46%;
-    --accent: 228 22% 14%;
-    --accent-foreground: 210 20% 94%;
-    --destructive: 0 84% 58%;
-    --destructive-foreground: 210 20% 94%;
-    --border: 228 22% 15%;
-    --input: 228 22% 15%;
-    --ring: 43 68% 52%;
-    --radius: 0.75rem;
+    --background: 280 31% 9%;
+    --foreground: 276 50% 97%;
+    --card: 286 35% 13%;
+    --card-foreground: 276 50% 97%;
+    --popover: 286 35% 13%;
+    --popover-foreground: 276 50% 97%;
+    --primary: 271 61% 46%;
+    --primary-foreground: 276 50% 97%;
+    --secondary: 286 28% 20%;
+    --secondary-foreground: 274 25% 77%;
+    --muted: 286 26% 17%;
+    --muted-foreground: 270 18% 69%;
+    --accent: 286 26% 17%;
+    --accent-foreground: 276 50% 97%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 276 50% 97%;
+    --border: 282 33% 21%;
+    --input: 282 33% 21%;
+    --ring: 45 89% 61%;
+    --radius: 0.85rem;
   }
 
   * {
-    @apply border-border box-border;
+    @apply box-border border-border;
   }
 
   html,
@@ -39,87 +39,77 @@
   body {
     @apply bg-ap-bg text-foreground font-sans antialiased;
     font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    background-image:
+      radial-gradient(circle at top center, rgba(111, 45, 189, 0.18), transparent 34%),
+      radial-gradient(circle at 80% 0%, rgba(244, 197, 66, 0.08), transparent 28%);
   }
 
-  /* Scrollbar */
   ::-webkit-scrollbar {
-    width: 4px;
-    height: 4px;
+    width: 6px;
+    height: 6px;
   }
   ::-webkit-scrollbar-track {
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: hsl(228 22% 18%);
-    border-radius: 2px;
+    background: rgba(111, 45, 189, 0.28);
+    border-radius: 999px;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: hsl(228 22% 24%);
+    background: rgba(139, 63, 242, 0.38);
   }
   * {
     scrollbar-width: thin;
-    scrollbar-color: hsl(228 22% 18%) transparent;
+    scrollbar-color: rgba(111, 45, 189, 0.35) transparent;
   }
 
-  /* Selection */
   ::selection {
-    background: rgba(212, 175, 55, 0.25);
-    color: #f0c040;
+    background: rgba(244, 197, 66, 0.28);
+    color: #f8f4ff;
   }
 }
 
 @layer components {
-  /* ─── Monospace numbers ────────────────────────── */
   .num {
     @apply font-mono tabular-nums tracking-tight;
   }
 
-  /* ─── Section micro-label ──────────────────────── */
   .label-xs {
-    @apply text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground;
+    @apply text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground;
   }
 
-  /* ─── Gold gradient text ───────────────────────── */
   .text-gold {
-    background: linear-gradient(135deg, #f0c040 0%, #d4af37 50%, #b8941a 100%);
+    background: linear-gradient(135deg, #ffd766 0%, #f4c542 45%, #d9ab26 100%);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
   }
 
-  /* ─── Card glass shine ─────────────────────────── */
   .card-shine {
-    background: linear-gradient(135deg, rgba(255, 255, 255, 0.04) 0%, transparent 60%);
+    background: linear-gradient(135deg, rgba(255, 255, 255, 0.04) 0%, transparent 62%);
   }
 
-  /* ─── Signal type badge presets ────────────────── */
   .badge-a {
-    @apply bg-sell-dim text-sell border border-sell-border;
+    @apply border border-sell-border bg-sell-dim text-sell;
   }
   .badge-v {
-    @apply bg-buy-dim text-buy border border-buy-border;
+    @apply border border-buy-border bg-buy-dim text-buy;
   }
   .badge-gap {
-    @apply bg-[rgba(212,175,55,0.1)] text-gold-400 border border-[rgba(212,175,55,0.2)];
+    @apply border border-gold-500/25 bg-gold-500/10 text-gold-300;
   }
 
-  /* ─── Dot-grid background ──────────────────────── */
   .bg-dot {
-    background-image: radial-gradient(
-      circle,
-      rgba(26, 31, 48, 0.75) 1px,
-      transparent 1px
-    );
+    background-image: radial-gradient(circle, rgba(80, 48, 99, 0.5) 1px, transparent 1px);
     background-size: 28px 28px;
   }
 
-  /* ─── Gold-top ambient glow ────────────────────── */
   .glow-gold {
-    background-image: radial-gradient(
-      ellipse 80% 25% at 50% 0%,
-      rgba(212, 175, 55, 0.07) 0%,
-      transparent 70%
-    );
+    background-image: radial-gradient(ellipse 80% 25% at 50% 0%, rgba(244, 197, 66, 0.08) 0%, transparent 70%);
+  }
+
+  .glow-purple {
+    background-image: radial-gradient(ellipse 80% 30% at 50% 0%, rgba(111, 45, 189, 0.18) 0%, transparent 74%);
   }
 }
 
@@ -132,18 +122,16 @@
     display: none;
   }
 
-  /* Inset 1px border trick (no DOM element needed) */
   .inset-border {
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+    box-shadow: inset 0 0 0 1px rgba(248, 244, 255, 0.04);
   }
 
-  /* Text shimmer for loading */
   .shimmer {
     background: linear-gradient(
       90deg,
-      rgba(255, 255, 255, 0.04) 0%,
-      rgba(255, 255, 255, 0.1) 50%,
-      rgba(255, 255, 255, 0.04) 100%
+      rgba(248, 244, 255, 0.04) 0%,
+      rgba(248, 244, 255, 0.12) 50%,
+      rgba(248, 244, 255, 0.04) 100%
     );
     background-size: 200% 100%;
     animation: shimmer 2s linear infinite;

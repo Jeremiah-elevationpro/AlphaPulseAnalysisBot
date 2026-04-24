@@ -8,7 +8,8 @@ const badgeVariants = cva(
     variants: {
       variant: {
         default: "bg-ap-surface border-ap-border text-foreground",
-        gold: "bg-[rgba(212,175,55,0.12)] border-[rgba(212,175,55,0.25)] text-gold-400",
+        gold: "bg-gold-500/12 border-gold-500/25 text-gold-300",
+        purple: "bg-purple-500/16 border-purple-400/30 text-purple-300",
         buy: "bg-buy-dim border-buy-border text-buy",
         sell: "bg-sell-dim border-sell-border text-sell",
         warn: "bg-warn-dim border-warn-border text-warn",

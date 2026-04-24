@@ -17,11 +17,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
 from config.settings import (
     SESSION_ASIA_UTC, SESSION_LONDON_UTC, SESSION_NEW_YORK_UTC,
+    BOT_ACTIVE_START_HOUR, BOT_ACTIVE_END_HOUR, BOT_TIMEZONE,
     ALLOWED_SESSIONS, BLOCK_OFF_SESSION,
     H4_EMA_PERIOD, VOLATILITY_MIN_BODY,
     USD_NEWS_TIMES, NEWS_FILTER_MINUTES,
@@ -51,6 +53,9 @@ class MarketContext:
     is_high_conf_session: bool = False
     session_allowed: bool = True
     session_block_reason: str = ""
+    bot_window_active: bool = True
+    local_time: str = ""
+    active_until: str = ""
 
     # Trend
     h4_bias: str = "neutral"         # "bullish" | "bearish" | "neutral"
@@ -86,6 +91,12 @@ class MarketContext:
 class SessionFilter:
     """Identifies whether the current UTC time falls in a high-probability session."""
 
+    def __init__(self):
+        try:
+            self._local_tz = ZoneInfo(BOT_TIMEZONE)
+        except Exception:
+            self._local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+
     def get_session(self, utc_dt: datetime) -> str:
         h = utc_dt.hour
         in_asia = SESSION_ASIA_UTC[0] <= h < SESSION_ASIA_UTC[1]
@@ -106,12 +117,29 @@ class SessionFilter:
     def is_high_confidence(self, utc_dt: datetime) -> bool:
         return self.get_session(utc_dt) in ALLOWED_SESSIONS
 
-    def is_allowed(self, session_name: str) -> tuple[bool, str]:
-        if session_name == "off_session" and BLOCK_OFF_SESSION:
-            return False, "off_session blocked by config"
-        if session_name not in ALLOWED_SESSIONS:
-            return False, f"session {session_name} not in ALLOWED_SESSIONS"
-        return True, ""
+    def local_time(self, utc_dt: datetime) -> datetime:
+        return utc_dt.astimezone(self._local_tz)
+
+    def is_bot_window_active(self, utc_dt: datetime) -> tuple[bool, str, str]:
+        local_dt = self.local_time(utc_dt)
+        hour = local_dt.hour
+        minute = local_dt.minute
+        current_minutes = hour * 60 + minute
+        start_minutes = BOT_ACTIVE_START_HOUR * 60
+        end_minutes = BOT_ACTIVE_END_HOUR * 60
+
+        if start_minutes <= end_minutes:
+            allowed = start_minutes <= current_minutes < end_minutes
+        else:
+            allowed = current_minutes >= start_minutes or current_minutes < end_minutes
+
+        return allowed, local_dt.strftime("%H:%M"), f"{BOT_ACTIVE_END_HOUR:02d}:00"
+
+    def is_allowed(self, utc_dt: datetime, session_name: str) -> tuple[bool, str, str, str]:
+        allowed, local_time, active_until = self.is_bot_window_active(utc_dt)
+        if not allowed:
+            return False, "outside bot operating window", local_time, active_until
+        return True, "", local_time, active_until
 
 
 # ─────────────────────────────────────────────────────────
@@ -590,7 +618,13 @@ class MarketContextEngine:
         # Session
         ctx.session_name        = self._session.get_session(utc_dt)
         ctx.is_high_conf_session = self._session.is_high_confidence(utc_dt)
-        ctx.session_allowed, ctx.session_block_reason = self._session.is_allowed(ctx.session_name)
+        (
+            ctx.session_allowed,
+            ctx.session_block_reason,
+            ctx.local_time,
+            ctx.active_until,
+        ) = self._session.is_allowed(utc_dt, ctx.session_name)
+        ctx.bot_window_active = ctx.session_allowed
 
         # Multi-timeframe directional bias
         bias = self._bias.analyze(data)
@@ -613,10 +647,10 @@ class MarketContextEngine:
 
         logger.debug(
             "MarketContext | session=%s | %s | volatile=%s | "
-            "sweep=%s | news_block=%s | session_allowed=%s",
+            "sweep=%s | news_block=%s | session_allowed=%s | local_time=%s",
             ctx.session_name, ctx.bias_note,
             ctx.is_volatile, ctx.sweep_direction or "none",
-            ctx.is_news_window, ctx.session_allowed,
+            ctx.is_news_window, ctx.session_allowed, ctx.local_time,
         )
         return ctx
 

@@ -87,3 +87,52 @@ def _use_plain_file_handler() -> bool:
     if override in ("0", "false", "no"):
         return True
     return sys.platform == "win32"
+
+
+# Absolute path to the runtime event log — safe to compute at import time.
+_RUNTIME_LOG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "logs",
+    "spencer_runtime.log",
+)
+
+
+class _RuntimeInstanceFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "instance_id"):
+            record.instance_id = os.getenv("ALPHAPULSE_INSTANCE_ID", "api")
+        return True
+
+
+def get_runtime_logger() -> logging.Logger:
+    """
+    Dedicated logger for high-level lifecycle events only.
+
+    Format:  [YYYY-MM-DD HH:MM:SS] EVENT_TYPE: message
+    File:    logs/spencer_runtime.log
+
+    Only write events that have operational meaning to the user/frontend:
+    BOT STARTED/STOPPED, ANALYSIS PHASE, SCAN STARTED/COMPLETE,
+    WATCHLIST LOOP STARTED, NO WATCHLIST SETUPS FOUND, WATCHLIST ALERT SENT/FAILED,
+    TELEGRAM SEND SUCCESS/FAILED.
+    """
+    name = "alphapulse.runtime"
+    rl = logging.getLogger(name)
+    if rl.handlers:
+        return rl
+
+    os.makedirs(os.path.dirname(_RUNTIME_LOG_PATH), exist_ok=True)
+
+    rl.setLevel(logging.INFO)
+    rl.propagate = False
+
+    fmt = logging.Formatter(
+        "[%(asctime)s] instance_id=%(instance_id)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    fh = logging.FileHandler(_RUNTIME_LOG_PATH, encoding="utf-8")
+    fh.setFormatter(fmt)
+    fh.addFilter(_RuntimeInstanceFilter())
+    rl.addHandler(fh)
+
+    return rl

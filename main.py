@@ -19,11 +19,14 @@ Scan loop:
   5. Graceful shutdown on Ctrl+C
 """
 
+import json
+import os
 import signal
 import sys
 import time
 import threading
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Dict, Optional, Set
 
 import pandas as pd
@@ -35,18 +38,22 @@ from config.settings import (
     WATCHLIST_SOFT_DISTANCE_PIPS, WATCHLIST_MIN_ADJUSTED_SCORE,
     WATCHLIST_MAX_ALERTS_BY_HORIZON, ENTRY_READY_MAX_ALERTS_PER_SCAN,
     ACTIVE_TIMEFRAME_PAIR_LABELS, DISABLED_TIMEFRAME_PAIRS,
+    SEND_NO_SETUP_STATUS_ALERT, NO_SETUP_STATUS_INTERVAL_MINUTES,
+    BOT_ACTIVE_START_HOUR, BOT_ACTIVE_END_HOUR,
 )
 from data.mt5_client import MT5Client
 from strategies.strategy_manager import StrategyManager
+from strategies.filters import MarketContextEngine
 from signals.signal_generator import SignalGenerator
 from trade_manager.trade_tracker import TradeManager
 from notifications.telegram_bot import TelegramBot
 from db.database import Database
 from learning.stats_learner import StatisticalLearner
 from learning.rl_engine import LearningEngine
-from utils.logger import get_logger
+from utils.logger import get_logger, get_runtime_logger
 
 logger = get_logger("AlphaPulse")
+runtime_logger = get_runtime_logger()
 
 
 class AlphaPulse:
@@ -56,6 +63,8 @@ class AlphaPulse:
     """
 
     def __init__(self):
+        self._instance_id = str(os.getpid())
+        os.environ["ALPHAPULSE_INSTANCE_ID"] = self._instance_id
         logger.info("=" * 60)
         logger.info("  AlphaPulse — XAUUSD Analysis Engine")
         logger.info("=" * 60)
@@ -68,6 +77,7 @@ class AlphaPulse:
         self.db = Database()
         self.mt5 = MT5Client()
         self.telegram = TelegramBot()
+        self.context_engine = MarketContextEngine()
         # StrategyManager is created without a learning engine here;
         # _learning is wired in start() after LearningEngine is ready.
         self.strategy_manager = StrategyManager(learning_engine=None)
@@ -112,6 +122,41 @@ class AlphaPulse:
         # Last daily summary sent
         self._last_daily_date: Optional[str] = None
 
+        # Heartbeat file for API status sync
+        self._heartbeat_file = Path(__file__).resolve().parent / "bot_heartbeat.json"
+        # Tracks when the last no-setup status alert was sent
+        self._last_no_setup_alert_time: Optional[datetime] = None
+        # Per-scan pipeline summary — written to heartbeat and SCAN COMPLETE log
+        self._last_scan_summary: dict = {
+            "last_candidates_count": 0,
+            "last_alerts_sent":      0,
+            "last_alerts_failed":    0,
+            "last_reject_reason":    "",
+            "last_telegram_status":  "none",
+            "last_telegram_error":   "",
+            "last_scan_number":      0,
+            "session_blocking":      False,
+        }
+
+    def _bot_window_active(self, ctx) -> bool:
+        if ctx is None:
+            return True
+        return bool(getattr(ctx, "bot_window_active", getattr(ctx, "session_allowed", True)))
+
+    def _log_time_block_check(self, ctx) -> bool:
+        local_time = getattr(ctx, "local_time", "--:--") if ctx else "--:--"
+        session_label = getattr(ctx, "session_name", "unknown") if ctx else "unknown"
+        bot_window_active = self._bot_window_active(ctx)
+        will_block = not bot_window_active
+        runtime_logger.info(
+            "TIME BLOCK CHECK: local_time=%s | bot_window_active=%s | session_label=%s | will_block=%s",
+            local_time,
+            str(bot_window_active).lower(),
+            session_label,
+            str(will_block).lower(),
+        )
+        return will_block
+
     # ─────────────────────────────────────────────────────
     # STARTUP
     # ─────────────────────────────────────────────────────
@@ -151,9 +196,16 @@ class AlphaPulse:
         # Register shutdown handlers
         signal.signal(signal.SIGINT, self._shutdown_handler)
         signal.signal(signal.SIGTERM, self._shutdown_handler)
+        # Windows: CTRL_BREAK_EVENT sent by API maps to SIGBREAK, not SIGTERM
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, self._shutdown_handler)
 
         # Notify Telegram (sends "started" + "analyzing charts..." messages)
         self.telegram.send_startup()
+
+        runtime_logger.info("BOT INSTANCE STARTED: instance_id=%s", self._instance_id)
+        runtime_logger.info("BOT STARTED")
+        runtime_logger.info("ANALYSIS PHASE STARTED: 5-minute silent phase — no alerts until complete")
 
         # Mark startup time — alerts suppressed for first 5 minutes
         self._startup_time = datetime.now(timezone.utc)
@@ -195,11 +247,23 @@ class AlphaPulse:
         if not self._analysis_complete and not in_silent_phase:
             self._analysis_complete = True
             logger.info("Analysis phase complete — setup alerts now active.")
+            runtime_logger.info("ANALYSIS PHASE COMPLETE: setup watchlist alerts now active")
+
+        runtime_logger.info(
+            "SCAN STARTED: symbol=XAUUSD | scan=%d | phase=%s",
+            self._scan_count, "analyzing" if in_silent_phase else "watching",
+        )
 
         # 1. Fetch OHLCV data for all timeframes
         data = self._fetch_all_data()
         if not data:
             logger.warning("No data fetched — skipping scan.")
+            runtime_logger.info("NO WATCHLIST SETUPS FOUND: symbol=XAUUSD | reason=mt5_no_data")
+            self._last_scan_summary.update({
+                "last_reject_reason": "mt5_no_data",
+                "last_scan_number": self._scan_count,
+                "session_blocking": False,
+            })
             if not in_silent_phase:
                 self.telegram.send_system_alert(
                     "⚠️ No market data received from MT5.\n"
@@ -208,40 +272,89 @@ class AlphaPulse:
             return
 
         # 2. Get current price
-        current_price = self.mt5.get_current_price()
+        tick = self.mt5.get_tick()
+        current_price = tick["mid"] if tick else self.mt5.get_current_price()
         if current_price is None:
             df_m15 = data.get("M15")
             if df_m15 is not None and len(df_m15) > 0:
                 current_price = float(df_m15.iloc[-1]["close"])
+                tick = {
+                    "bid": current_price,
+                    "ask": current_price,
+                    "mid": current_price,
+                    "spread": None,
+                    "spread_pips": None,
+                }
 
-        # 3. Run strategy manager — selects best strategy, returns unified signals
-        run_result = self.strategy_manager.run(data, current_price=current_price)
-        outlook  = run_result.outlook
-        signals  = run_result.signals
-        ctx      = outlook.context
+        # 3. Monitoring layer always computes current market context
+        ctx = self.context_engine.analyze(data, utc_dt=now)
 
-        # 3a. Log strategy performance and filter states (internal only)
-        self._log_strategy_performance(run_result)
-        if ctx:
-            if not ctx.is_volatile:
-                logger.debug("Filter: low volatility — signals may be weaker")
-            if ctx.is_news_window:
-                logger.debug("Filter: news window active")
+        runtime_logger.info(
+            "SESSION CHECK: local_time=%s | bot_window=%02d:00-%02d:00 | allowed=%s | session_label=%s",
+            getattr(ctx, "local_time", "--:--") if ctx else "--:--",
+            BOT_ACTIVE_START_HOUR,
+            BOT_ACTIVE_END_HOUR,
+            str(getattr(ctx, "session_allowed", True)).lower() if ctx else "true",
+            getattr(ctx, "session_name", "unknown") if ctx else "unknown",
+        )
+        scan_blocked = self._log_time_block_check(ctx)
+        if scan_blocked:
+            runtime_logger.info("SCAN SKIPPED: outside bot operating window")
+            runtime_logger.info("ALERT SKIPPED: outside active trading window")
+            self._last_scan_summary.update({
+                "last_candidates_count": 0,
+                "last_alerts_sent": 0,
+                "last_alerts_failed": 0,
+                "last_reject_reason": "session_blocked",
+                "last_telegram_status": "none",
+                "last_telegram_error": "",
+                "last_scan_number": self._scan_count,
+                "session_blocking": True,
+            })
+        else:
+            runtime_logger.info("SCAN ALLOWED: inside bot operating window")
+            self._last_scan_summary.update({
+                "last_scan_number": self._scan_count,
+                "session_blocking": False,
+            })
 
-        # 3b. Track structural level changes (state management — no Telegram send)
-        outlook_key = self._outlook_fingerprint(outlook)
-        if outlook_key != self._last_outlook_hash:
-            self._last_outlook_hash = outlook_key
-            self._seen_setups.clear()
-            self._confirmed_levels.clear()
-            self._last_watch_distance.clear()
-            # _watch_alerted intentionally NOT cleared (expires via 25-pip rule)
-            logger.info("Structural levels refreshed (%d groups)", len(outlook.timeframe_levels))
+        signals = []
+        outlook = None
+        watchlist_sent = 0
 
-        # 3c. Setup watchlist + watch-level approach alerts (silent-phase gated)
-        if current_price and not in_silent_phase:
-            self._send_shortlisted_level_alerts(outlook, current_price)
-            self._check_watch_levels(outlook, current_price)
+        # 3a. Scanning layer only runs inside the active bot window
+        if not scan_blocked:
+            run_result = self.strategy_manager.run(data, current_price=current_price)
+            outlook = run_result.outlook
+            signals = run_result.signals
+            ctx = outlook.context
+
+            # 3b. Log strategy performance and filter states (internal only)
+            self._log_strategy_performance(run_result)
+            if ctx:
+                if not ctx.is_volatile:
+                    logger.debug("Filter: low volatility — signals may be weaker")
+                if ctx.is_news_window:
+                    logger.debug("Filter: news window active")
+
+            # 3c. Track structural level changes (state management — no Telegram send)
+            outlook_key = self._outlook_fingerprint(outlook)
+            if outlook_key != self._last_outlook_hash:
+                self._last_outlook_hash = outlook_key
+                self._seen_setups.clear()
+                self._watchlist_alerted.clear()
+                self._confirmed_levels.clear()
+                self._last_watch_distance.clear()
+                logger.info("Structural levels refreshed (%d groups)", len(outlook.timeframe_levels))
+                runtime_logger.info(
+                    "WATCHLIST DEDUPE CLEARED: structural levels changed — %d timeframe groups",
+                    len(outlook.timeframe_levels),
+                )
+
+            # 3d. Alert layer only runs inside the active bot window
+            if current_price and not in_silent_phase:
+                watchlist_sent = self._send_shortlisted_level_alerts(outlook, current_price) or 0
+                self._check_watch_levels(outlook, current_price)
 
         # 4. Freshness filter removed — historical rejection candles ARE valid pending
         #    setups (e.g. a level rejection from yesterday is still actionable today).
@@ -259,7 +372,7 @@ class AlphaPulse:
 
             if new_signals:
                 # ── Session gate (relaxed for manual bot) ────────────────────
-                if not (ctx and getattr(ctx, "session_allowed", True)):
+                if self._bot_window_active(ctx) is False:
                     session_label = getattr(ctx, "session_name", "off_session") if ctx else "off_session"
                     logger.info(
                         "Off-session (%s): %d signal(s) found — manual discretion advised.",
@@ -355,7 +468,7 @@ class AlphaPulse:
                             trade.confidence * 100,
                         )
 
-        elif self._scan_count % 5 == 0:
+        elif self._scan_count % 5 == 0 and self._bot_window_active(ctx):
             logger.debug(
                 "Scan #%d — no new setups | session=%s | bias=%s",
                 self._scan_count,
@@ -374,6 +487,44 @@ class AlphaPulse:
 
         # 8. Check if we should send daily summary
         self._check_daily_summary(now)
+
+        # 9. Periodic no-setup status alert (disabled by default — opt-in via config)
+        if not in_silent_phase and SEND_NO_SETUP_STATUS_ALERT:
+            if not signals and watchlist_sent == 0:
+                now_ts = datetime.now(timezone.utc)
+                interval = timedelta(minutes=NO_SETUP_STATUS_INTERVAL_MINUTES)
+                if (self._last_no_setup_alert_time is None
+                        or (now_ts - self._last_no_setup_alert_time) >= interval):
+                    session_name = getattr(ctx, "session_name", "unknown") if ctx else "unknown"
+                    bias = getattr(ctx, "h4_bias", "neutral") if ctx else "neutral"
+                    if self._bot_window_active(ctx) is False:
+                        logger.info("NO-SETUP STATUS ALERT SUPPRESSED: outside bot operating window")
+                    else:
+                        self.telegram.send_system_alert(
+                            f"Spencer is watching — no active setups in the last "
+                            f"{NO_SETUP_STATUS_INTERVAL_MINUTES} minutes.\n"
+                            f"Session: {session_name} | Bias: {bias}"
+                        )
+                        self._last_no_setup_alert_time = now_ts
+                        logger.info(
+                            "NO WATCHLIST SETUPS FOUND: no-setup alert sent (session=%s bias=%s)",
+                            session_name, bias,
+                        )
+
+        # 10. Write heartbeat so the API can surface richer status
+        self._write_heartbeat(in_silent_phase, signals, ctx, current_price, tick)
+        logger.info(
+            "SCAN COMPLETE: symbol=XAUUSD | scan=%d | signals=%d | watchlist_sent=%d",
+            self._scan_count, len(signals or []), watchlist_sent,
+        )
+        runtime_logger.info(
+            "SCAN COMPLETE: symbol=XAUUSD | scan=%d | signals=%d | watchlist=%d | reject=%s | tg=%s",
+            self._scan_count,
+            len(signals or []),
+            watchlist_sent,
+            self._last_scan_summary.get("last_reject_reason", ""),
+            self._last_scan_summary.get("last_telegram_status", "none"),
+        )
 
     # ─────────────────────────────────────────────────────
     # DATA FETCHING
@@ -404,6 +555,65 @@ class AlphaPulse:
             logger.info("Learning engine refreshed.")
         except Exception as e:
             logger.error("Learning refresh failed: %s", e)
+
+    # ─────────────────────────────────────────────────────
+    # HEARTBEAT
+    # ─────────────────────────────────────────────────────
+
+    def _write_heartbeat(self, in_silent_phase: bool, signals: list, ctx, current_price: Optional[float], tick: Optional[dict]) -> None:
+        """Write bot_heartbeat.json so the API can surface analyzing/watching status."""
+        try:
+            status = "analyzing" if in_silent_phase else "watching"
+            if self._bot_window_active(ctx) is False and not in_silent_phase:
+                message = "Spencer online — outside active trading window"
+            else:
+                message = "Spencer is analyzing charts" if in_silent_phase else "Spencer is watching the market"
+            session = getattr(ctx, "session_name", None) if ctx else None
+            ss = self._last_scan_summary
+            alerts_sent = ss.get("last_alerts_sent", 0)
+            reject_reason = ss.get("last_reject_reason", "")
+            scan_result = (
+                f"{alerts_sent} watchlist alert(s) sent"
+                if alerts_sent > 0
+                else f"no setups — {reject_reason}" if reject_reason else "watching for setups"
+            )
+            data = {
+                "status":               status,
+                "message":              message,
+                "timestamp":            datetime.now(timezone.utc).isoformat(),
+                "last_scan_at":         datetime.now(timezone.utc).isoformat(),
+                "last_scan_result":     scan_result,
+                "current_session":      session,
+                "last_scan_symbol":     "XAUUSD",
+                "last_candidates_count": ss.get("last_candidates_count", 0),
+                "last_alerts_sent":     ss.get("last_alerts_sent", 0),
+                "last_reject_reason":   ss.get("last_reject_reason", ""),
+                "last_telegram_status": ss.get("last_telegram_status", "none"),
+                "last_telegram_error":  ss.get("last_telegram_error", ""),
+                "last_scan_number":     ss.get("last_scan_number", self._scan_count),
+                "session_blocking":     ss.get("session_blocking", False),
+                "instance_id":          self._instance_id,
+                "process_id":           os.getpid(),
+                "current_symbol":       "XAUUSD",
+                "current_price":        current_price,
+                "bid":                  tick.get("bid") if tick else current_price,
+                "ask":                  tick.get("ask") if tick else current_price,
+                "spread":               tick.get("spread") if tick else None,
+                "spread_pips":          tick.get("spread_pips") if tick else None,
+                "d1_bias":              getattr(ctx, "d1_bias", "neutral") if ctx else "neutral",
+                "h4_bias":              getattr(ctx, "h4_bias", "neutral") if ctx else "neutral",
+                "h1_bias":              getattr(ctx, "h1_bias", "neutral") if ctx else "neutral",
+                "dominant_bias":        getattr(ctx, "dominant_bias", "neutral") if ctx else "neutral",
+                "bias_strength":        getattr(ctx, "bias_strength", "weak") if ctx else "weak",
+                "bot_window_active":    getattr(ctx, "bot_window_active", True) if ctx else True,
+                "session_name":         getattr(ctx, "session_name", None) if ctx else None,
+                "local_time":           getattr(ctx, "local_time", "") if ctx else "",
+                "active_until":         getattr(ctx, "active_until", f"{BOT_ACTIVE_END_HOUR:02d}:00") if ctx else f"{BOT_ACTIVE_END_HOUR:02d}:00",
+                "last_market_update_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._heartbeat_file.write_text(json.dumps(data), encoding="utf-8")
+        except Exception as exc:
+            logger.debug("Heartbeat write failed: %s", exc)
 
     # ─────────────────────────────────────────────────────
     # DAILY SUMMARY
@@ -538,9 +748,9 @@ class AlphaPulse:
           5. No alert when price is already within LEVEL_TOLERANCE_PIPS (at the level)
         """
         ctx = getattr(outlook, "context", None)
-        if ctx is not None and not getattr(ctx, "session_allowed", True):
+        if self._log_time_block_check(ctx):
             logger.info(
-                "WATCH LEVELS SKIPPED: session filter (%s | %s)",
+                "WATCH LEVELS SKIPPED: outside bot window (%s | %s)",
                 getattr(ctx, "session_name", "off_session"),
                 getattr(ctx, "session_block_reason", "blocked"),
             )
@@ -648,13 +858,56 @@ class AlphaPulse:
         by the existing signal pipeline.
         """
         ctx = getattr(outlook, "context", None)
-        if ctx is not None and not getattr(ctx, "session_allowed", True):
+        _session_name = getattr(ctx, "session_name", "unknown") if ctx else "unknown"
+
+        if self._log_time_block_check(ctx):
             logger.info(
-                "WATCHLIST SKIPPED: session filter (%s | %s)",
+                "WATCHLIST SKIPPED: outside bot window (%s | %s)",
                 getattr(ctx, "session_name", "off_session"),
                 getattr(ctx, "session_block_reason", "blocked"),
             )
-            return
+            runtime_logger.info(
+                "NO WATCHLIST SETUPS FOUND: symbol=%s | reason=session_blocked | session=%s",
+                outlook.pair, _session_name,
+            )
+            self._last_scan_summary.update({
+                "last_candidates_count": 0,
+                "last_alerts_sent": 0,
+                "last_reject_reason": "session_blocked",
+                "last_telegram_status": "none",
+                "last_scan_number": self._scan_count,
+                "session_blocking": True,
+            })
+            runtime_logger.info(
+                "SCAN SUMMARY: %s",
+                json.dumps({
+                    "symbol": outlook.pair,
+                    "levels_detected": 0,
+                    "gap_levels": 0,
+                    "bias_passed": 0,
+                    "sweep_confirmed": 0,
+                    "session_passed": 0,
+                    "distance_passed": 0,
+                    "watchlist_candidates": 0,
+                    "alerts_sent": 0,
+                    "alerts_failed": 0,
+                    "reject_reasons": {"session_blocked": 1},
+                }),
+            )
+            return 0
+
+        runtime_logger.info(
+            "WATCHLIST LOOP STARTED: symbol=%s | session=%s | timeframe_groups=%d",
+            outlook.pair, _session_name, len(outlook.timeframe_levels),
+        )
+
+        # Diagnostic counters — tracking only, no strategy logic change
+        _levels_scanned = 0
+        _gap_levels = 0
+        _already_alerted = 0
+        _already_confirmed = 0
+        _rejected_count = 0
+        _primary_reject_reason = ""
 
         candidates = []
         for tfl in outlook.timeframe_levels:
@@ -664,13 +917,28 @@ class AlphaPulse:
                 continue
             horizon = self._watchlist_horizon(tf_pair)
             for level in tfl.levels + tfl.recent_levels + tfl.previous_levels:
+                _levels_scanned += 1
+                if getattr(level, "level_type", "") == "Gap":
+                    _gap_levels += 1
+
                 direction = self._level_trade_direction(level, current_price)
                 alert_key = self._watchlist_key(outlook.pair, level, direction)
                 level_id = self._watch_key(outlook.pair, level.price)
+                already_alerted = alert_key in self._watchlist_alerted
+                runtime_logger.info(
+                    "WATCHLIST DEDUPE CHECK: setup_key=%s | already_alerted=%s",
+                    alert_key,
+                    str(already_alerted).lower(),
+                )
 
-                if alert_key in self._watchlist_alerted:
+                if already_alerted:
+                    _already_alerted += 1
+                    runtime_logger.info(
+                        "WATCHLIST ALERT SKIPPED: duplicate | setup_key=%s", alert_key
+                    )
                     continue
                 if level_id in self._confirmed_levels:
+                    _already_confirmed += 1
                     continue
 
                 watch_score, watch_notes, reject_reason = self._watchlist_score(
@@ -682,6 +950,11 @@ class AlphaPulse:
                 distance_pips = abs(current_price - level.price) / PIP_SIZE
 
                 if reject_reason:
+                    _rejected_count += 1
+                    if "too far" in reject_reason.lower():
+                        _primary_reject_reason = "distance_rejected"
+                    elif not _primary_reject_reason:
+                        _primary_reject_reason = "score_too_low"
                     logger.info(
                         "WATCHLIST SKIPPED: %s %s %.2f | %s %s | base=%.0f adj=%.0f dist=%.1fp | %s | selected because: %s",
                         outlook.pair,
@@ -711,7 +984,54 @@ class AlphaPulse:
                 })
 
         if not candidates:
-            return
+            if _levels_scanned == 0 or _gap_levels == 0:
+                _no_reason = "no_gap_level"
+            elif (_already_alerted + _already_confirmed) >= _levels_scanned and _rejected_count == 0:
+                _no_reason = "all_alerted"
+            elif _primary_reject_reason:
+                _no_reason = _primary_reject_reason
+            else:
+                _no_reason = "unknown"
+            runtime_logger.info(
+                "NO WATCHLIST SETUPS FOUND: symbol=%s | reason=%s | levels=%d | gap=%d"
+                " | alerted=%d | confirmed=%d | rejected=%d",
+                outlook.pair, _no_reason,
+                _levels_scanned, _gap_levels,
+                _already_alerted, _already_confirmed, _rejected_count,
+            )
+            self._last_scan_summary.update({
+                "last_candidates_count": 0,
+                "last_alerts_sent": 0,
+                "last_alerts_failed": 0,
+                "last_reject_reason": _no_reason,
+                "last_telegram_status": "none",
+                "last_telegram_error": "",
+                "last_scan_number": self._scan_count,
+                "session_blocking": False,
+            })
+            runtime_logger.info(
+                "SCAN SUMMARY: %s",
+                json.dumps({
+                    "symbol": outlook.pair,
+                    "levels_detected": _levels_scanned,
+                    "gap_levels": _gap_levels,
+                    "bias_passed": 0,
+                    "sweep_confirmed": 0,
+                    "session_passed": 0 if _no_reason == "session_blocked" else 1,
+                    "distance_passed": 0,
+                    "watchlist_candidates": 0,
+                    "alerts_sent": 0,
+                    "alerts_failed": 0,
+                    "reject_reasons": {
+                        "no_gap_level": 1 if _no_reason == "no_gap_level" else 0,
+                        "session_blocked": 1 if _no_reason == "session_blocked" else 0,
+                        "distance_rejected": 1 if _no_reason == "distance_rejected" else 0,
+                        "approach_filter_failed": 1 if _no_reason == "score_too_low" else 0,
+                        "unknown": 1 if _no_reason not in {"no_gap_level", "session_blocked", "distance_rejected", "score_too_low"} else 0,
+                    },
+                }),
+            )
+            return 0
 
         # If the same price appears in multiple timeframe groups, keep only the
         # strongest representation so the trader gets one clean watchlist alert.
@@ -747,8 +1067,15 @@ class AlphaPulse:
             ranked.append(candidate)
 
         sent_count = 0
+        failed_count = 0
         horizon_counts: Dict[str, int] = {}
         bias = self._watchlist_bias(outlook)
+
+        if ranked:
+            runtime_logger.info(
+                "WATCHLIST ALERT CALLING TELEGRAM: candidates=%d | symbol=%s",
+                len(ranked), outlook.pair,
+            )
 
         for candidate in ranked:
             horizon = candidate["horizon"]
@@ -792,12 +1119,62 @@ class AlphaPulse:
                     candidate["distance_pips"],
                     "; ".join(getattr(level, "accepted_reasons", []) + candidate["watch_notes"]),
                 )
+                runtime_logger.info(
+                    "WATCHLIST ALERT SENT: %s %s %.2f | %s",
+                    outlook.pair, candidate["direction"], level.price, candidate["tf_pair"],
+                )
+            else:
+                failed_count += 1
+                runtime_logger.info(
+                    "WATCHLIST ALERT FAILED: telegram returned False for %s %s %.2f",
+                    outlook.pair, candidate["direction"], level.price,
+                )
 
         if sent_count:
             logger.info(
-                "Setup watchlist alerts sent: %d shortlisted level(s).",
+                "WATCHLIST ALERT SENT: count=%d shortlisted level(s).",
                 sent_count,
             )
+            runtime_logger.info("WATCHLIST ALERT SENT: count=%d total", sent_count)
+        if failed_count:
+            runtime_logger.info(
+                "WATCHLIST ALERT FAILED: count=%d total alerts failed", failed_count
+            )
+
+        _tg_status = "success" if sent_count > 0 else ("failed" if failed_count > 0 else "none")
+        _tg_error = "telegram returned False" if failed_count > 0 and sent_count == 0 else ""
+        self._last_scan_summary.update({
+            "last_candidates_count": len(ranked),
+            "last_alerts_sent":      sent_count,
+            "last_alerts_failed":    failed_count,
+            "last_reject_reason":    "" if sent_count > 0 else ("telegram_failed" if failed_count > 0 else ""),
+            "last_telegram_status":  _tg_status,
+            "last_telegram_error":   _tg_error,
+            "last_scan_number":      self._scan_count,
+            "session_blocking":      False,
+        })
+        runtime_logger.info(
+            "SCAN SUMMARY: %s",
+            json.dumps({
+                "symbol": outlook.pair,
+                "levels_detected": _levels_scanned,
+                "gap_levels": _gap_levels,
+                "bias_passed": len(candidates),
+                "sweep_confirmed": 0,
+                "session_passed": 1,
+                "distance_passed": len(ranked),
+                "watchlist_candidates": len(ranked),
+                "alerts_sent": sent_count,
+                "alerts_failed": failed_count,
+                "reject_reasons": {
+                    "distance_rejected": _rejected_count if _primary_reject_reason == "distance_rejected" else 0,
+                    "approach_filter_failed": _rejected_count if _primary_reject_reason == "score_too_low" else 0,
+                    "duplicate": _already_alerted,
+                },
+            }),
+        )
+
+        return sent_count
 
     @staticmethod
     def _outlook_fingerprint(outlook) -> str:
@@ -1089,6 +1466,8 @@ class AlphaPulse:
     def stop(self):
         self._running = False
         logger.info("Shutting down AlphaPulse...")
+        runtime_logger.info("BOT INSTANCE STOPPED: instance_id=%s", self._instance_id)
+        runtime_logger.info("BOT STOPPED")
         self.telegram.send_shutdown()
         self.mt5.disconnect()
         self.db.close()

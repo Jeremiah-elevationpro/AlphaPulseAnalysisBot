@@ -52,6 +52,7 @@ from config.settings import (
     SESSION_MIN_CONFIRMATION_BONUS,
     MICRO_CONFIRMATION_ENABLED,
     MICRO_CONFIRMATION_USE_M1_FALLBACK,
+    MICRO_CONFIRMATION_LOOKBACK,
     MICRO_CONFIDENCE_SCALE,
     MICRO_DOUBLE_PATTERN_MIN_QUALITY,
     MICRO_LIQUIDITY_SWEEP_EXTRA_BONUS,
@@ -76,6 +77,8 @@ from config.settings import (
     TP1_BONUS_MIN_PIPS,
     TP1_QUALITY_SCORE_BONUS,
     HIGH_QUALITY_TRADE_SCORE,
+    ENGULFING_BOOST_SCORE,
+    ENGULFING_SWEEP_COMBO_BOOST,
 )
 from utils.logger import get_logger
 
@@ -211,6 +214,7 @@ class SetupResult:
     bias_gate_result: str = "not_checked"
     tp1_room_pips: float = 0.0
     tp1_quality_bonus: float = 0.0
+    engulfing_bonus: float = 0.0
     high_quality_trade: bool = False
     micro_strength: str = "normal"
 
@@ -289,6 +293,7 @@ def _compute_final_setup_score(setup: SetupResult) -> float:
     micro_bonus = float(getattr(setup, "micro_confirmation_score", 0.0) or 0.0)
     pd_bonus = float(getattr(setup, "pd_filter_score", 0.0) or 0.0)
     tp1_bonus = float(getattr(setup, "tp1_quality_bonus", 0.0) or 0.0)
+    engulfing_bonus = float(getattr(setup, "engulfing_bonus", 0.0) or 0.0)
     # Extra reward for A/V setups that earned micro confirmation — compensates for their
     # stricter scoring path relative to Gap levels.
     micro_type = getattr(setup, "micro_confirmation_type", "none") or "none"
@@ -311,12 +316,15 @@ def _compute_final_setup_score(setup: SetupResult) -> float:
         + micro_bonus
         + pd_bonus
         + tp1_bonus
+        + engulfing_bonus
         + alignment_bonus,
         1,
     )
 
 
 def _final_score_threshold(setup: SetupResult) -> float:
+    if (getattr(setup, "micro_confirmation_type", "") or "") == "liquidity_sweep_reclaim":
+        return 60.0
     threshold = FINAL_SETUP_SCORE_MIN + SESSION_FINAL_SCORE_ADJUSTMENT.get(setup.session_name or "off_session", 0)
     if not setup.trend_aligned:
         threshold += DIRECTIONAL_COUNTER_SCORE_PREMIUM
@@ -364,6 +372,35 @@ def _estimate_tp1_room_pips(setup: SetupResult) -> float:
         nearest = min(blockers) if setup.direction == "BUY" else max(blockers)
         return round(abs(nearest - entry) / (PIP_SIZE or 1.0), 1)
     return round(default_tp1_pips, 1)
+
+
+def _detect_engulfing_boost(micro_confirmator: MicroConfirmationEngine, data: Dict[str, pd.DataFrame], setup: SetupResult) -> float:
+    """Use engulfing only as a sidecar boost, never as a standalone entry trigger."""
+    if (getattr(setup, "micro_confirmation_type", "") or "") != "liquidity_sweep_reclaim":
+        return 0.0
+    for timeframe in ("M5", "M1"):
+        df = data.get(timeframe)
+        if df is None or len(df) < 5:
+            continue
+        window = df.iloc[-MICRO_CONFIRMATION_LOOKBACK:].reset_index(drop=True)
+        if len(window) < 5:
+            continue
+        details = micro_confirmator._detect_engulfing_reversal(window, setup.direction, float(setup.level.price))
+        if details:
+            bonus = ENGULFING_SWEEP_COMBO_BOOST
+            logger.info(
+                "ENGULFING BOOST: %+g | micro=%s | %s | %s XAUUSD | Level %s %.2f | [%s->%s]",
+                bonus,
+                setup.micro_confirmation_type,
+                details,
+                setup.direction,
+                setup.level.level_type,
+                setup.level.price,
+                setup.higher_tf,
+                setup.lower_tf,
+            )
+            return float(bonus)
+    return 0.0
 
 
 def _av_has_tp_room(candidate: LevelInfo, structural: List[LevelInfo]) -> bool:
@@ -471,6 +508,9 @@ class MultiTimeframeAnalyzer:
         self.quality_filter = StructureQualityFilter()
         self.level_selector = EliteLevelSelector()
         self.learning_engine = None
+        logger.info(
+            "ACTIVE STRATEGY LOCKED: GAP + LIQUIDITY_SWEEP_RECLAIM ONLY"
+        )
         self.last_rejections: List[ConfirmationRejection] = []
         if DISABLED_TIMEFRAME_PAIRS:
             disabled = ", ".join(f"{high}->{low}" for high, low in DISABLED_TIMEFRAME_PAIRS)
@@ -519,9 +559,9 @@ class MultiTimeframeAnalyzer:
                 "(min confidence 0.85, QM or psychological level required)."
             )
 
-        if not ctx.session_allowed:
+        if not getattr(ctx, "bot_window_active", ctx.session_allowed):
             logger.info(
-                "Session filter active: %s setups will be blocked (%s).",
+                "Bot operating window closed: %s setups will be blocked (%s).",
                 ctx.session_name,
                 ctx.session_block_reason,
             )
@@ -883,23 +923,6 @@ class MultiTimeframeAnalyzer:
                                 lower_tf,
                             )
 
-                        if (
-                            micro.confirmation_type == "double_pattern"
-                            and micro_quality < MICRO_DOUBLE_PATTERN_MIN_QUALITY
-                        ):
-                            logger.info(
-                                "MICRO FILTER REJECT: weak double pattern | score=%.1f < %.0f | "
-                                "%s XAUUSD | Level %s %.2f | [%s->%s]",
-                                micro_quality,
-                                MICRO_DOUBLE_PATTERN_MIN_QUALITY,
-                                setup.direction,
-                                conf.level.level_type,
-                                conf.level.price,
-                                higher_tf,
-                                lower_tf,
-                            )
-                            continue
-
                         if micro.decision == "blocked":
                             logger.info(
                                 "SETUP REJECTED: %s XAUUSD | Reason: micro-confirmation contradiction "
@@ -915,42 +938,7 @@ class MultiTimeframeAnalyzer:
                             continue
 
                         min_micro_score = _session_min_micro_score(setup.session_name)
-                        if setup.session_name == "asia":
-                            logger.info(
-                                "ASIA STRICT MODE: only sweep_reclaim allowed | micro=%s | %s XAUUSD | Level %s %.2f | [%s->%s]",
-                                micro.confirmation_type,
-                                setup.direction,
-                                conf.level.level_type,
-                                conf.level.price,
-                                higher_tf,
-                                lower_tf,
-                            )
-                            if micro.confirmation_type != "liquidity_sweep_reclaim":
-                                logger.info(
-                                    "ASIA STRICT MODE: only sweep_reclaim allowed | rejecting micro=%s | %s XAUUSD | Level %s %.2f | [%s->%s]",
-                                    micro.confirmation_type,
-                                    setup.direction,
-                                    conf.level.level_type,
-                                    conf.level.price,
-                                    higher_tf,
-                                    lower_tf,
-                                )
-                                continue
-                            if weighted_micro_score < min_micro_score:
-                                logger.info(
-                                    "ASIA MICRO RULE: reject weak micro (%.0f < %.0f) | type=%s | "
-                                    "%s XAUUSD | Level %s %.2f | [%s->%s]",
-                                    weighted_micro_score,
-                                    min_micro_score,
-                                    micro.confirmation_type,
-                                    setup.direction,
-                                    conf.level.level_type,
-                                    conf.level.price,
-                                    higher_tf,
-                                    lower_tf,
-                                )
-                                continue
-                        elif _session_requires_micro(setup.session_name) and weighted_micro_score < min_micro_score:
+                        if _session_requires_micro(setup.session_name) and weighted_micro_score < min_micro_score:
                             logger.info(
                                 "SETUP REJECTED: %s XAUUSD | Reason: %s session requires micro confirmation "
                                 "(score %.0f < %.0f) | micro=%s | Level %s %.2f | [%s->%s]",
@@ -996,12 +984,11 @@ class MultiTimeframeAnalyzer:
 
                     if ACTIVE_STRATEGY_REQUIRE_MICRO:
                         micro_type = setup.micro_confirmation_type or "none"
-                        if micro_type not in _ACTIVE_MICRO_TYPES:
+                        if micro_type != "liquidity_sweep_reclaim" or micro_type not in _ACTIVE_MICRO_TYPES:
                             logger.info(
-                                "ACTIVE STRATEGY FILTER: rejecting micro=%s | allowed=%s | "
+                                "ACTIVE MICRO REJECT: non-sweep confirmation blocked | micro=%s | "
                                 "%s XAUUSD | Level %s %.2f | [%s->%s]",
                                 micro_type,
-                                ",".join(sorted(_ACTIVE_MICRO_TYPES)),
                                 setup.direction,
                                 setup.level.level_type,
                                 setup.level.price,
@@ -1010,9 +997,7 @@ class MultiTimeframeAnalyzer:
                             )
                             continue
                         logger.info(
-                            "ACTIVE STRATEGY PASS: %s + %s | %s XAUUSD | Level %.2f | [%s->%s]",
-                            setup.level.level_type,
-                            micro_type,
+                            "ACTIVE PIPELINE PASS: GAP + SWEEP_RECLAIM | %s XAUUSD | Level %.2f | [%s->%s]",
                             setup.direction,
                             setup.level.price,
                             higher_tf,
@@ -1038,6 +1023,53 @@ class MultiTimeframeAnalyzer:
                             lower_tf,
                         )
                         continue
+
+                    time_blocked = not getattr(ctx, "bot_window_active", ctx.session_allowed)
+                    logger.info(
+                        "TIME BLOCK CHECK: local_time=%s | bot_window_active=%s | session_label=%s | will_block=%s",
+                        getattr(ctx, "local_time", "--:--"),
+                        str(getattr(ctx, "bot_window_active", ctx.session_allowed)).lower(),
+                        setup.session_name or ctx.session_name,
+                        str(time_blocked).lower(),
+                    )
+                    if time_blocked:
+                        logger.info(
+                            "SETUP REJECTED: %s XAUUSD | Reason: bot window closed (%s) | "
+                            "Level %s %.2f | [%s->%s]",
+                            conf.direction,
+                            ctx.session_block_reason,
+                            conf.level.level_type,
+                            conf.level.price,
+                            higher_tf,
+                            lower_tf,
+                        )
+                        continue
+                    if setup.session_name == "off_session":
+                        logger.info(
+                            "OFF-SESSION LABEL INFO ONLY | %s XAUUSD | Level %s %.2f | [%s->%s]",
+                            conf.direction,
+                            conf.level.level_type,
+                            conf.level.price,
+                            higher_tf,
+                            lower_tf,
+                        )
+
+                    # Entry distance filter — reject entries that are too close to
+                    # current price (< 15 pips). These produce useless signals like
+                    # "price is 4790, sell at 4797" which offer no realistic fill.
+                    if current_price is not None:
+                        entry_dist_pips = abs(conf.entry_price - current_price) / PIP_SIZE
+                        if entry_dist_pips < 15:
+                            logger.info(
+                                "SETUP REJECTED: %s XAUUSD | Reason: entry too close to "
+                                "current price (%.1f pips < 15 min) | Level %s %.2f | [%s→%s]",
+                                conf.direction, entry_dist_pips,
+                                conf.level.level_type, conf.level.price,
+                                higher_tf, lower_tf,
+                            )
+                            continue
+
+                    setup.engulfing_bonus = _detect_engulfing_boost(self.micro_confirmator, data, setup)
 
                     setup.tp1_room_pips = _estimate_tp1_room_pips(setup)
                     if setup.tp1_room_pips >= TP1_BONUS_MIN_PIPS:
@@ -1098,12 +1130,13 @@ class MultiTimeframeAnalyzer:
                     )
                     logger.info(
                         "SCORE COMPONENTS: %s XAUUSD | gap_score=%.0f micro_bonus=%+.0f "
-                        "bias_bonus=%+.0f pd_bonus=%+.0f tp1_bonus=%+.0f learned_edge=%+.1f | Level %s %.2f | [%s->%s]",
+                        "bias_bonus=%+.0f pd_bonus=%+.0f engulfing_bonus=%+.0f tp1_bonus=%+.0f learned_edge=%+.1f | Level %s %.2f | [%s->%s]",
                         setup.direction,
                         float(getattr(setup.level, "selection_score", getattr(setup.level, "quality_score", 0.0)) or 0.0),
                         float(getattr(setup, "micro_confirmation_score", 0.0) or 0.0),
                         float(getattr(execution, "bias_gate_score", 0.0) or 0.0),
                         float(getattr(execution, "pd_bonus", 0.0) or 0.0),
+                        float(getattr(setup, "engulfing_bonus", 0.0) or 0.0),
                         float(getattr(setup, "tp1_quality_bonus", 0.0) or 0.0),
                         learned_edge_bonus,
                         setup.level.level_type,
@@ -1216,34 +1249,6 @@ class MultiTimeframeAnalyzer:
                             higher_tf,
                             lower_tf,
                         )
-
-                    if not ctx.session_allowed:
-                        logger.info(
-                            "SETUP REJECTED: %s XAUUSD | Reason: session filter (%s) | "
-                            "Level %s %.2f | [%s->%s]",
-                            conf.direction,
-                            ctx.session_block_reason,
-                            conf.level.level_type,
-                            conf.level.price,
-                            higher_tf,
-                            lower_tf,
-                        )
-                        continue
-
-                    # Entry distance filter — reject entries that are too close to
-                    # current price (< 15 pips). These produce useless signals like
-                    # "price is 4790, sell at 4797" which offer no realistic fill.
-                    if current_price is not None:
-                        entry_dist_pips = abs(conf.entry_price - current_price) / PIP_SIZE
-                        if entry_dist_pips < 15:
-                            logger.info(
-                                "SETUP REJECTED: %s XAUUSD | Reason: entry too close to "
-                                "current price (%.1f pips < 15 min) | Level %s %.2f | [%s→%s]",
-                                conf.direction, entry_dist_pips,
-                                conf.level.level_type, conf.level.price,
-                                higher_tf, lower_tf,
-                            )
-                            continue
 
                     setups.append(setup)
 

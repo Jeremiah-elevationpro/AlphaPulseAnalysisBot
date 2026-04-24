@@ -9,14 +9,16 @@ const buttonVariants = cva(
     variants: {
       variant: {
         default:
-          "bg-gold-500 text-ap-bg hover:bg-gold-400 shadow shadow-gold-xs font-semibold",
+          "bg-gold-400 text-ap-bg hover:bg-gold-300 shadow shadow-gold-xs font-semibold",
+        purple:
+          "bg-purple-500 text-foreground hover:bg-purple-400 shadow shadow-purple-xs font-semibold",
         outline:
-          "border border-ap-border-strong bg-transparent text-foreground hover:bg-ap-surface hover:border-ap-border-strong/80",
+          "border border-ap-border-strong bg-transparent text-foreground hover:bg-ap-surface hover:border-purple-400/40",
         ghost:
           "text-muted-foreground hover:bg-ap-surface hover:text-foreground",
         secondary:
           "bg-ap-surface text-foreground border border-ap-border hover:bg-ap-card-hover",
-        buy: "bg-buy-dim text-buy border border-buy-border hover:bg-[rgba(16,185,129,0.2)] font-semibold",
+        buy: "bg-buy-dim text-buy border border-buy-border hover:bg-[rgba(34,197,94,0.2)] font-semibold",
         sell: "bg-sell-dim text-sell border border-sell-border hover:bg-[rgba(239,68,68,0.2)] font-semibold",
         destructive:
           "bg-destructive/10 text-destructive border border-destructive/25 hover:bg-destructive/20",

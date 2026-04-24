@@ -80,8 +80,33 @@ CREATE TABLE IF NOT EXISTS confidence_scores (
     UNIQUE(level_type, tf_pair)
 );
 
+-- Manual setups entered from the frontend and later consumed by the bot
+CREATE TABLE IF NOT EXISTS manual_setups (
+    id                              BIGSERIAL PRIMARY KEY,
+    symbol                          TEXT NOT NULL DEFAULT 'XAUUSD',
+    direction                       TEXT NOT NULL,
+    timeframe_pair                  TEXT NOT NULL,
+    entry_price                     NUMERIC(10,2) NOT NULL,
+    stop_loss                       NUMERIC(10,2) NOT NULL,
+    tp1                             NUMERIC(10,2) NOT NULL,
+    tp2                             NUMERIC(10,2),
+    tp3                             NUMERIC(10,2),
+    bias                            TEXT NOT NULL,
+    confirmation_type               TEXT NOT NULL,
+    session                         TEXT NOT NULL,
+    notes                           TEXT DEFAULT '',
+    activation_mode                 TEXT NOT NULL,
+    move_sl_to_be_after_tp1         BOOLEAN DEFAULT FALSE,
+    enable_telegram_alerts          BOOLEAN DEFAULT FALSE,
+    high_priority                   BOOLEAN DEFAULT FALSE,
+    status                          TEXT NOT NULL DEFAULT 'draft',
+    created_at                      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at                      TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Disable RLS so the service-role key can read/write freely
 ALTER TABLE trades            DISABLE ROW LEVEL SECURITY;
 ALTER TABLE performance_stats DISABLE ROW LEVEL SECURITY;
 ALTER TABLE daily_summaries   DISABLE ROW LEVEL SECURITY;
 ALTER TABLE confidence_scores DISABLE ROW LEVEL SECURITY;
+ALTER TABLE manual_setups     DISABLE ROW LEVEL SECURITY;

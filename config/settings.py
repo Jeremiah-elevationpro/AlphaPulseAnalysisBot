@@ -165,7 +165,7 @@ LEVEL_PAIR_SOFT_FLOOR_PENALTY_PER_PIP = {
 LEVEL_PAIR_MAX_DISTANCE_PIPS = {
     "H4->H1": 0,       # 0 disables max-distance rejection for swing structures
     "H1->M30": 320,
-    "M30->M15": 200,
+    "M30->M15": 300,
 }
 LEVEL_PAIR_NEAR_DISTANCE_PIPS = {
     "H4->H1": 180,
@@ -296,6 +296,9 @@ PSYCH_MINOR_STEP  = 10          # minor (3210, 3220 ...)
 SESSION_ASIA_UTC      = (0, 7)
 SESSION_LONDON_UTC    = (7, 10)
 SESSION_NEW_YORK_UTC  = (13, 16)
+BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Africa/Johannesburg")
+BOT_ACTIVE_START_HOUR = int(os.getenv("BOT_ACTIVE_START_HOUR", "7"))
+BOT_ACTIVE_END_HOUR = int(os.getenv("BOT_ACTIVE_END_HOUR", "19"))
 ALLOWED_SESSIONS = [
     item.strip().lower()
     for item in os.getenv("ALLOWED_SESSIONS", "asia,london,new_york,overlap").split(",")
@@ -321,14 +324,14 @@ SESSION_FINAL_SCORE_ADJUSTMENT = {
     "london": 0,
     "new_york": -3,
     "overlap": 2,
-    "off_session": 999,
+    "off_session": 0,
 }
 SESSION_MIN_CONFIRMATION_BONUS = {
     "asia": 8,
     "london": 0,
     "new_york": 0,
     "overlap": 8,
-    "off_session": 999,
+    "off_session": 0,
 }
 
 # News filter — list of UTC times "HH:MM" for high-impact USD events
@@ -398,6 +401,8 @@ MICRO_PRIORITY_WEIGHTS = {
     "double_pattern": float(os.getenv("MICRO_PRIORITY_DOUBLE_PATTERN", "1.0")),
 }
 MICRO_LIQUIDITY_SWEEP_EXTRA_BONUS = float(os.getenv("MICRO_LIQUIDITY_SWEEP_EXTRA_BONUS", "4"))
+ENGULFING_BOOST_SCORE = float(os.getenv("ENGULFING_BOOST_SCORE", "2"))
+ENGULFING_SWEEP_COMBO_BOOST = float(os.getenv("ENGULFING_SWEEP_COMBO_BOOST", "4"))
 MICRO_DOUBLE_PATTERN_MIN_QUALITY = float(os.getenv("MICRO_DOUBLE_PATTERN_MIN_QUALITY", "60"))
 MICRO_QUALITY_SCORE_SCALE = float(os.getenv("MICRO_QUALITY_SCORE_SCALE", "8"))
 MICRO_SESSION_MIN_SCORE = {
@@ -405,14 +410,14 @@ MICRO_SESSION_MIN_SCORE = {
     "london": float(os.getenv("MICRO_SESSION_MIN_LONDON", "0")),
     "new_york": float(os.getenv("MICRO_SESSION_MIN_NEW_YORK", "0")),
     "overlap": float(os.getenv("MICRO_SESSION_MIN_OVERLAP", "8")),
-    "off_session": float(os.getenv("MICRO_SESSION_MIN_OFF_SESSION", "999")),
+    "off_session": float(os.getenv("MICRO_SESSION_MIN_OFF_SESSION", "0")),
 }
 MICRO_SESSION_REQUIRED = {
     "asia": os.getenv("MICRO_SESSION_REQUIRED_ASIA", "true").lower() == "true",
     "london": os.getenv("MICRO_SESSION_REQUIRED_LONDON", "false").lower() == "true",
     "new_york": os.getenv("MICRO_SESSION_REQUIRED_NEW_YORK", "false").lower() == "true",
     "overlap": os.getenv("MICRO_SESSION_REQUIRED_OVERLAP", "false").lower() == "true",
-    "off_session": os.getenv("MICRO_SESSION_REQUIRED_OFF_SESSION", "true").lower() == "true",
+    "off_session": os.getenv("MICRO_SESSION_REQUIRED_OFF_SESSION", "false").lower() == "true",
 }
 # Score penalty applied to the final_score when London/NY setups have no micro confirmation.
 # London is stricter than NY because Asia liquidity makes London reversals more predictable.
@@ -427,14 +432,10 @@ ACTIVE_STRATEGY_LEVEL_TYPES = [
     if item.strip()
 ]
 ACTIVE_STRATEGY_REQUIRE_MICRO = os.getenv("ACTIVE_STRATEGY_REQUIRE_MICRO", "true").lower() == "true"
-ACTIVE_STRATEGY_ALLOWED_MICRO_TYPES = [
-    item.strip()
-    for item in os.getenv(
-        "ACTIVE_STRATEGY_ALLOWED_MICRO_TYPES",
-        "liquidity_sweep_reclaim,double_pattern",
-    ).split(",")
-    if item.strip()
-]
+# Final production lock: active strategy uses sweep-reclaim only.
+# Other micro patterns may remain in the codebase for research/debug, but they
+# are not allowed to participate in the active trading path.
+ACTIVE_STRATEGY_ALLOWED_MICRO_TYPES = ["liquidity_sweep_reclaim"]
 
 # Institutional-style execution filters layered on top of the active Gap +
 # approved-micro strategy.
@@ -652,3 +653,11 @@ LOG_FILE = "logs/alphapulse.log"
 # DASHBOARD
 # ─────────────────────────────────────────────
 DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", 8501))
+
+# ─────────────────────────────────────────────
+# NO-SETUP STATUS ALERTS
+# ─────────────────────────────────────────────
+# When true, Spencer sends a periodic Telegram message when no setups are
+# found over the configured interval (useful to confirm the bot is alive).
+SEND_NO_SETUP_STATUS_ALERT = os.getenv("SEND_NO_SETUP_STATUS_ALERT", "false").lower() == "true"
+NO_SETUP_STATUS_INTERVAL_MINUTES = int(os.getenv("NO_SETUP_STATUS_INTERVAL_MINUTES", "30"))

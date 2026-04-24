@@ -287,6 +287,38 @@ class MT5Client:
         tick = mt5.symbol_info_tick(self._symbol)
         return tick.bid if tick else None
 
+    def get_tick(self) -> Optional[dict]:
+        """Return live tick context for the active symbol."""
+        if self._demo_mode:
+            price = self.get_current_price()
+            if price is None:
+                return None
+            bid = float(price)
+            ask = float(price + 0.08)
+            spread = ask - bid
+            return {
+                "bid": bid,
+                "ask": ask,
+                "mid": round((bid + ask) / 2, 2),
+                "spread": round(spread, 2),
+                "spread_pips": round(spread / 0.01, 1),
+            }
+        if not self.ensure_connected():
+            return None
+        tick = mt5.symbol_info_tick(self._symbol)
+        if not tick:
+            return None
+        bid = float(tick.bid)
+        ask = float(tick.ask)
+        spread = ask - bid
+        return {
+            "bid": bid,
+            "ask": ask,
+            "mid": round((bid + ask) / 2, 2),
+            "spread": round(spread, 2),
+            "spread_pips": round(spread / 0.01, 1),
+        }
+
     # ──────────────────────────────────────────────
     # INTERNAL HELPERS
     # ──────────────────────────────────────────────

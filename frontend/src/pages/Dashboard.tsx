@@ -1,378 +1,384 @@
 import {
   Activity,
-  Zap,
-  Target,
-  TrendingUp,
-  ArrowUpRight,
-  ArrowDownRight,
   AlertTriangle,
-  Info,
-  BarChart3,
-  Clock,
+  ArrowDownRight,
+  ArrowUpRight,
+  BarChart2,
+  Bell,
+  Globe2,
   Layers,
-  Radio,
 } from "lucide-react"
-import { motion } from "framer-motion"
-import { cn } from "@/lib/utils"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { Badge } from "@/components/ui/badge"
-import { StatusDot } from "@/components/ui/status-dot"
-import { Separator } from "@/components/ui/separator"
-import { Button } from "@/components/ui/button"
 import { Link } from "react-router-dom"
 
-// ── Static placeholder data ──────────────────────────────────────────
-const STATS = [
-  {
-    label: "Bot Status",
-    value: "Online",
-    sub: "M30 → M15 · XAUUSD",
-    icon: Activity,
-    accent: "buy" as const,
-    dot: true,
-  },
-  {
-    label: "Today's Signals",
-    value: "7",
-    sub: "↑ 2 vs yesterday",
-    icon: Zap,
-    accent: "gold" as const,
-  },
-  {
-    label: "Win Rate",
-    value: "68.4%",
-    sub: "+2.1% this week",
-    icon: Target,
-    accent: "buy" as const,
-  },
-  {
-    label: "Today's P&L",
-    value: "+$847",
-    sub: "3 trades closed",
-    icon: TrendingUp,
-    accent: "buy" as const,
-  },
-]
-
-const SIGNALS = [
-  { type: "A", price: 2287.5, quality: 78, time: "14m ago", dir: "SELL", basis: "origin-based" },
-  { type: "V", price: 2245.3, quality: 82, time: "1h ago", dir: "BUY", basis: "wick-based" },
-  { type: "Gap", price: 2271.0, quality: 65, time: "2h ago", dir: "BUY", basis: "imbalance" },
-  { type: "A", price: 2295.0, quality: 71, time: "3h ago", dir: "SELL", basis: "wick-based" },
-  { type: "V", price: 2238.75, quality: 89, time: "5h ago", dir: "BUY", basis: "origin-based" },
-]
-
-const ALERTS = [
-  { id: 1, sev: "warning", msg: "High-impact NFP news at 14:30 UTC", time: "2h" },
-  { id: 2, sev: "info", msg: "Bot session started — M30→M15 pair active", time: "9h" },
-]
-
-const BIAS_ITEMS = [
-  { tf: "H4", bias: "bearish", label: "H4 Trend" },
-  { tf: "D1", bias: "neutral", label: "D1 Structure" },
-  { tf: "W1", bias: "bullish", label: "W1 Bias" },
-]
-
-const stagger = {
-  animate: { transition: { staggerChildren: 0.07 } },
-}
-const fadeUp = {
-  initial: { opacity: 0, y: 12 },
-  animate: { opacity: 1, y: 0, transition: { duration: 0.3 } },
-}
+import { BotControlPanel } from "@/components/control/BotControlPanel"
+import { ReplayRunner } from "@/components/control/ReplayRunner"
+import { SpencerStatus } from "@/components/control/SpencerStatus"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Badge } from "@/components/ui/badge"
+import { Separator } from "@/components/ui/separator"
+import { StatusDot } from "@/components/ui/status-dot"
+import {
+  useActiveTrades,
+  useAlerts,
+  useAnalytics,
+  useBotStatus,
+  useHealth,
+  useMarketContext,
+  useSignals,
+} from "@/hooks/use-data"
+import { cn } from "@/lib/utils"
 
 export default function Dashboard() {
+  const health = useHealth()
+  const analytics = useAnalytics()
+  const signals = useSignals(6)
+  const trades = useActiveTrades(6)
+  const alerts = useAlerts(6)
+  const botStatus = useBotStatus()
+  const isBotOnline = ["online", "analyzing", "watching", "starting"].includes(botStatus.data?.status ?? "")
+  const market = useMarketContext(botStatus.data?.symbol ?? "XAUUSD", isBotOnline)
+
+  const metrics = analytics.data?.metrics
+  const marketContext = market.data
+  const dominantBias = marketContext?.bias?.dominant ?? "neutral"
+  const botWindowActive = Boolean(marketContext?.session?.botWindowActive)
+
   return (
-    <div className="p-4 md:p-6 space-y-5 bg-dot bg-dot-28">
-      {/* Ambient top glow */}
-      <div className="fixed inset-x-0 top-0 h-48 bg-glow-gold-top pointer-events-none" />
+    <div className="space-y-5 p-4 md:p-6">
+      <div className="pointer-events-none fixed inset-x-0 top-0 h-44 bg-glow-purple-top" />
+      <div className="pointer-events-none fixed inset-x-0 top-0 h-28 bg-glow-gold-top" />
 
-      {/* ── Stats Row ─────────────────────────────────────── */}
-      <motion.div
-        variants={stagger}
-        initial="initial"
-        animate="animate"
-        className="grid grid-cols-2 xl:grid-cols-4 gap-3"
-      >
-        {STATS.map((s) => (
-          <motion.div key={s.label} variants={fadeUp}>
-            <StatCard stat={s} />
-          </motion.div>
-        ))}
-      </motion.div>
-
-      {/* ── Main Grid ─────────────────────────────────────── */}
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
-        {/* Chart / Market Panel (2/3) */}
-        <motion.div
-          variants={fadeUp}
-          initial="initial"
-          animate="animate"
-          className="xl:col-span-2 space-y-4"
-        >
-          {/* Price display */}
-          <Card glow className="overflow-hidden">
-            <div className="h-1 bg-gradient-to-r from-gold-600 via-gold-400 to-gold-600 opacity-60" />
-            <CardHeader className="pb-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Radio className="w-3.5 h-3.5 text-gold-400 animate-pulse" />
-                  <CardTitle className="text-gold-400 tracking-wider font-mono">XAUUSD</CardTitle>
-                  <Badge variant="gold" className="text-[10px]">LIVE</Badge>
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="label-xs">Spread</span>
-                  <span className="num text-xs text-muted-foreground">0.28</span>
-                </div>
+      <Card glow>
+        <CardContent className="relative overflow-hidden py-5">
+          <div className="pointer-events-none absolute inset-y-0 right-0 w-1/3 bg-gradient-to-l from-purple-500/14 via-gold-500/8 to-transparent" />
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+            <div className="space-y-2">
+              <div className="inline-flex items-center gap-2 rounded-full border border-gold-500/20 bg-gold-500/8 px-3 py-1 text-[11px] font-semibold text-gold-300">
+                <Activity className="h-3.5 w-3.5" />
+                FX Unfiltered Dashboard
               </div>
-              <div className="flex items-baseline gap-3 pt-1">
-                <span className="num text-3xl font-bold text-foreground tracking-tight">
-                  2,287.50
-                </span>
-                <div className="flex items-center gap-1 text-buy">
-                  <ArrowUpRight className="w-4 h-4" />
-                  <span className="num text-sm font-semibold">+12.30</span>
-                  <span className="text-xs text-muted-foreground">(+0.54%)</span>
-                </div>
-              </div>
-            </CardHeader>
-            <CardContent className="pt-0">
-              {/* Chart placeholder */}
-              <div className="relative h-44 rounded-lg border border-ap-border bg-ap-surface overflow-hidden flex items-center justify-center">
-                <div className="absolute inset-0 bg-dot-grid opacity-40" />
-                {/* Fake sparkline silhouette */}
-                <svg
-                  className="absolute inset-0 w-full h-full"
-                  viewBox="0 0 400 176"
-                  preserveAspectRatio="none"
-                >
-                  <defs>
-                    <linearGradient id="lineGrad" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="#D4AF37" stopOpacity="0.3" />
-                      <stop offset="100%" stopColor="#D4AF37" stopOpacity="0" />
-                    </linearGradient>
-                  </defs>
-                  <path
-                    d="M0,120 C40,110 60,140 100,100 S160,60 200,80 S260,120 300,70 S360,40 400,55"
-                    fill="none"
-                    stroke="#D4AF37"
-                    strokeWidth="1.5"
-                    strokeLinecap="round"
-                    opacity="0.5"
-                  />
-                  <path
-                    d="M0,120 C40,110 60,140 100,100 S160,60 200,80 S260,120 300,70 S360,40 400,55 L400,176 L0,176 Z"
-                    fill="url(#lineGrad)"
-                  />
-                </svg>
-                <div className="relative flex flex-col items-center gap-1 text-center z-10">
-                  <BarChart3 className="w-6 h-6 text-muted-foreground/40" />
-                  <p className="text-xs text-muted-foreground/60">
-                    Live chart connects when backend is active
-                  </p>
-                </div>
-              </div>
-
-              {/* Bias row */}
-              <div className="flex items-center gap-3 mt-3">
-                {BIAS_ITEMS.map((b) => (
-                  <BiasTag key={b.tf} {...b} />
-                ))}
-                <div className="ml-auto flex items-center gap-1.5">
-                  <Clock className="w-3 h-3 text-muted-foreground" />
-                  <span className="text-xs text-muted-foreground">London session</span>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-
-          {/* Active Trades card */}
-          <Card>
-            <CardHeader>
-              <div className="flex items-center justify-between">
-                <CardTitle>Active Trades</CardTitle>
-                <Badge variant="muted">0 open</Badge>
-              </div>
-            </CardHeader>
-            <CardContent>
-              <div className="flex flex-col items-center justify-center py-8 gap-2">
-                <Layers className="w-8 h-8 text-muted-foreground/30" />
-                <p className="text-sm text-muted-foreground">No active trades</p>
-                <p className="text-xs text-muted-foreground/60">
-                  Signals will appear here when confirmed
+              <div>
+                <h2 className="text-xl font-bold text-foreground md:text-2xl">Powered by AlphaPulse</h2>
+                <p className="max-w-2xl text-sm text-muted-foreground">
+                  Spencer is monitoring the live engine, replay flow, signals, trades, and alerts from one premium control surface.
                 </p>
               </div>
-            </CardContent>
-          </Card>
-        </motion.div>
+            </div>
 
-        {/* Right panel (1/3) */}
-        <motion.div
-          variants={fadeUp}
-          initial="initial"
-          animate="animate"
-          transition={{ delay: 0.12 }}
-          className="space-y-4"
+            <div className="flex flex-wrap gap-2">
+              <Badge variant="gold" className="text-[10px]">Engine: AlphaPulse</Badge>
+              <Badge variant="purple" className="text-[10px]">Assistant: Spencer</Badge>
+              <Badge variant={health.data?.db_connected ? "buy" : "sell"} className="text-[10px]">
+                {health.data?.db_connected ? "Supabase Connected" : "DB Unavailable"}
+              </Badge>
+              <Button asChild size="sm">
+                <Link to="/signals">Review Signals</Link>
+              </Button>
+              <Button asChild variant="outline" size="sm">
+                <Link to="/settings">Open Controls</Link>
+              </Button>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <SpencerStatus status={botStatus.data} />
+
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+        <StatusCard
+          icon={Activity}
+          title="AlphaPulse Engine Status"
+          subtitle={health.isLoading ? "Checking runtime" : `v${health.data?.version ?? "1.0.0"}`}
+          accent={health.data?.status === "ok" ? "buy" : "sell"}
         >
-          {/* Recent Signals */}
-          <Card className="flex flex-col">
-            <CardHeader>
-              <div className="flex items-center justify-between">
-                <CardTitle>Recent Signals</CardTitle>
-                <Button variant="ghost" size="sm" asChild>
-                  <Link to="/signals">View all</Link>
-                </Button>
-              </div>
-            </CardHeader>
-            <CardContent className="pt-2 space-y-1">
-              {SIGNALS.map((sig, i) => (
-                <SignalRow key={i} sig={sig} />
-              ))}
-            </CardContent>
-          </Card>
+          <div className="flex items-center justify-between">
+            <div className="inline-flex items-center gap-2 text-xs font-semibold">
+              <StatusDot status={health.data?.status === "ok" ? "online" : "offline"} pulse />
+              {health.isLoading ? "Loading..." : health.data?.status === "ok" ? "Online & Running" : "Degraded"}
+            </div>
+            <span className="text-[10px] text-muted-foreground">
+              {health.data?.timestamp ? new Date(health.data.timestamp).toLocaleTimeString() : "--"}
+            </span>
+          </div>
+          <InfoRow label="Database" value={health.data?.db_connected ? "Connected" : "Disconnected"} />
+          <InfoRow label="Active Trades" value={String(health.data?.active_trades ?? 0)} mono />
+          <InfoRow label="Uptime" value={health.data ? `${Math.floor(health.data.uptime / 60)}m` : "--"} mono />
+        </StatusCard>
 
-          {/* Alerts */}
-          <Card>
-            <CardHeader>
-              <div className="flex items-center justify-between">
-                <CardTitle>Recent Alerts</CardTitle>
-                <Badge variant="sell" className="text-[10px]">2 new</Badge>
-              </div>
-            </CardHeader>
-            <CardContent className="pt-2 space-y-2">
-              {ALERTS.map((a) => (
-                <AlertRow key={a.id} alert={a} />
-              ))}
-            </CardContent>
-          </Card>
+        <StatusCard
+          icon={Globe2}
+          title="Market Context"
+          subtitle={
+            market.isLoading
+              ? "Loading live context"
+              : `${formatSessionName(marketContext?.session?.sessionName)} session`
+          }
+          accent="gold"
+        >
+          <InfoRow label="Symbol" value={marketContext?.symbol ?? botStatus.data?.symbol ?? "XAUUSD"} mono />
+          <InfoRow label="Current Price" value={formatMaybeNumber(marketContext?.currentPrice)} mono />
+          <InfoRow label="Bid" value={formatMaybeNumber(marketContext?.bid)} mono />
+          <InfoRow label="Ask" value={formatMaybeNumber(marketContext?.ask)} mono />
+          <InfoRow label="Spread" value={marketContext?.spreadPips != null ? `${marketContext.spreadPips.toFixed(1)} pips` : "Unavailable"} mono />
+          <InfoRow label="D1 Bias" value={formatBiasLabel(marketContext?.bias?.d1)} valueClass={biasColor(marketContext?.bias?.d1)} />
+          <InfoRow label="H4 Bias" value={formatBiasLabel(marketContext?.bias?.h4)} valueClass={biasColor(marketContext?.bias?.h4)} />
+          <InfoRow label="H1 Bias" value={formatBiasLabel(marketContext?.bias?.h1)} valueClass={biasColor(marketContext?.bias?.h1)} />
+          <InfoRow label="Dominant Bias" value={formatBiasLabel(dominantBias)} valueClass={biasColor(dominantBias)} />
+          <InfoRow label="Bias Strength" value={marketContext?.bias?.strength ?? "Unavailable"} />
+          <InfoRow
+            label="Bot Window"
+            value={marketContext?.session ? (botWindowActive ? `Active until ${marketContext.session.activeUntil}` : "Closed") : "Unavailable"}
+            valueClass={botWindowActive ? "text-buy" : "text-muted-foreground"}
+          />
+          <InfoRow label="Market Session" value={formatSessionName(marketContext?.session?.sessionName)} />
+          <InfoRow label="Local Time" value={marketContext?.session?.localTime ?? "Unavailable"} mono />
+          <InfoRow label="Last Updated" value={marketContext?.timestamp ? new Date(marketContext.timestamp).toLocaleTimeString() : "Unavailable"} mono />
+        </StatusCard>
 
-          {/* Pipeline summary */}
-          <Card>
-            <CardHeader>
-              <CardTitle>Pipeline · M30→M15</CardTitle>
-            </CardHeader>
-            <CardContent className="pt-3 space-y-3">
-              {[
-                { label: "Detected", a: 14, v: 11, gap: 4 },
-                { label: "Survived filters", a: 8, v: 7, gap: 4 },
-                { label: "Shortlisted", a: 3, v: 2, gap: 2 },
-                { label: "Confirmed", a: 2, v: 1, gap: 1 },
-              ].map((row) => (
-                <div key={row.label} className="space-y-1">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs text-muted-foreground">{row.label}</span>
-                    <div className="flex items-center gap-2">
-                      <span className="text-[10px] font-mono text-sell">A:{row.a}</span>
-                      <span className="text-[10px] font-mono text-buy">V:{row.v}</span>
-                      <span className="text-[10px] font-mono text-gold-400">G:{row.gap}</span>
-                    </div>
-                  </div>
-                  <div className="h-1 rounded-full bg-ap-border overflow-hidden flex gap-0.5">
-                    <div
-                      className="h-full bg-sell/60 rounded-full"
-                      style={{ width: `${(row.a / 14) * 100}%` }}
-                    />
-                    <div
-                      className="h-full bg-buy/60 rounded-full"
-                      style={{ width: `${(row.v / 11) * 100}%` }}
-                    />
-                  </div>
+        <StatusCard
+          icon={BarChart2}
+          title="Replay Edge"
+          subtitle={analytics.isLoading ? "Loading performance" : "Latest replay-backed metrics"}
+          accent="gold"
+        >
+          <InfoRow label="Win Rate" value={`${metrics?.win_rate ?? 0}%`} mono valueClass="text-buy" />
+          <InfoRow label="TP1 Hit Rate" value={`${metrics?.tp1_hit_rate ?? 0}%`} mono />
+          <InfoRow
+            label="Net Pips"
+            value={`${(metrics?.net_pips ?? 0) > 0 ? "+" : ""}${metrics?.net_pips ?? 0}`}
+            mono
+            valueClass={(metrics?.net_pips ?? 0) >= 0 ? "text-buy" : "text-sell"}
+          />
+          <InfoRow label="Avg Pips / Trade" value={`${metrics?.avg_pips_per_trade ?? 0}`} mono />
+        </StatusCard>
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+        <BotControlPanel />
+        <ReplayRunner />
+      </div>
+
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-4">
+        <MetricCard label="Signals" value={String(signals.data?.total ?? 0)} accent="gold" />
+        <MetricCard label="Active Trades" value={String(trades.data?.total ?? 0)} accent="buy" />
+        <MetricCard label="Alerts" value={String(alerts.data?.total ?? 0)} accent={alerts.data?.total ? "warn" : "muted"} />
+        <MetricCard label="Replay Trades" value={String(metrics?.total_trades ?? 0)} accent="gold" />
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
+        <FeedCard
+          title="Recent Signals"
+          actionLabel="View all"
+          actionTo="/signals"
+          loading={signals.isLoading}
+          error={signals.error instanceof Error ? signals.error.message : null}
+          empty={!signals.data?.signals.length}
+          emptyLabel="No signals available yet."
+        >
+          {signals.data?.signals.map((signal) => (
+            <div key={signal.id} className="flex items-center justify-between rounded-lg border border-ap-border bg-ap-surface/35 px-3 py-2.5">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <Badge variant={signal.type === "Gap" ? "gold" : "outline"} className="text-[10px]">{signal.type}</Badge>
+                  <span className={cn("flex items-center gap-1 text-xs font-semibold", signal.direction === "BUY" ? "text-buy" : "text-sell")}>
+                    {signal.direction === "BUY" ? <ArrowUpRight className="h-3.5 w-3.5" /> : <ArrowDownRight className="h-3.5 w-3.5" />}
+                    {signal.direction}
+                  </span>
                 </div>
-              ))}
-            </CardContent>
-          </Card>
-        </motion.div>
+                <div className="num text-xs text-foreground">{signal.price?.toFixed(2) ?? "--"}</div>
+                <div className="text-[10px] text-muted-foreground">{signal.basis} | {signal.timeframe}</div>
+              </div>
+              <div className="text-right">
+                <div className="num text-sm font-bold text-gold-300">Q{signal.quality}</div>
+                <div className="text-[10px] text-muted-foreground">{signal.status}</div>
+              </div>
+            </div>
+          ))}
+        </FeedCard>
+
+        <FeedCard
+          title="Active Trades"
+          actionLabel="Open trades"
+          actionTo="/trades"
+          loading={trades.isLoading}
+          error={trades.error instanceof Error ? trades.error.message : null}
+          empty={!trades.data?.trades.length}
+          emptyLabel="No active trades right now."
+        >
+          {trades.data?.trades.map((trade) => (
+            <div key={trade.id} className="rounded-lg border border-ap-border bg-ap-surface/35 px-3 py-2.5">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="num text-xs font-bold text-foreground">{trade.pair}</span>
+                  <span className={cn("flex items-center gap-1 text-xs font-semibold", trade.direction === "BUY" ? "text-buy" : "text-sell")}>
+                    {trade.direction === "BUY" ? <ArrowUpRight className="h-3.5 w-3.5" /> : <ArrowDownRight className="h-3.5 w-3.5" />}
+                    {trade.direction}
+                  </span>
+                </div>
+                <Badge variant="gold" className="text-[10px]">{trade.status}</Badge>
+              </div>
+              <div className="mt-2 grid grid-cols-3 gap-2 text-[10px] text-muted-foreground">
+                <span>Entry <span className="num text-foreground">{trade.entry_price?.toFixed(2) ?? "--"}</span></span>
+                <span>TP1 <span className="num text-buy">{trade.tp1?.toFixed(2) ?? "--"}</span></span>
+                <span>Pips <span className={cn("num", (trade.realized_pips ?? 0) >= 0 ? "text-buy" : "text-sell")}>{trade.realized_pips?.toFixed(1) ?? "--"}</span></span>
+              </div>
+            </div>
+          ))}
+        </FeedCard>
+
+        <FeedCard
+          title="Recent Alerts"
+          actionLabel="Open alerts"
+          actionTo="/alerts"
+          loading={alerts.isLoading}
+          error={alerts.error instanceof Error ? alerts.error.message : null}
+          empty={!alerts.data?.alerts.length}
+          emptyLabel="No alerts in the feed."
+        >
+          {alerts.data?.alerts.map((alert) => (
+            <div key={alert.id} className="rounded-lg border border-ap-border bg-ap-surface/35 px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                <Bell className={cn("h-3.5 w-3.5", alert.priority === "critical" ? "text-sell" : alert.priority === "high" ? "text-warn" : "text-gold-300")} />
+                <span className="text-xs font-semibold text-foreground">{alert.title}</span>
+              </div>
+              <p className="mt-1 line-clamp-2 text-[11px] text-muted-foreground">{alert.message}</p>
+              <div className="mt-2 flex items-center justify-between text-[10px] text-muted-foreground">
+                <span>{alert.related_label}</span>
+                <span>{new Date(alert.timestamp).toLocaleString()}</span>
+              </div>
+            </div>
+          ))}
+        </FeedCard>
       </div>
     </div>
   )
 }
 
-// ── Sub-components ───────────────────────────────────────────────────
-
-function StatCard({ stat }: { stat: (typeof STATS)[0] }) {
-  const accentColor = {
-    buy: "text-buy",
-    gold: "text-gold-400",
-    sell: "text-sell",
-  }[stat.accent]
-
+function StatusCard({
+  icon: Icon,
+  title,
+  subtitle,
+  accent,
+  children,
+}: {
+  icon: typeof Activity
+  title: string
+  subtitle: string
+  accent: "buy" | "sell" | "gold"
+  children: React.ReactNode
+}) {
+  const accentClass =
+    accent === "buy"
+      ? "border-buy/20 bg-buy/10 text-buy"
+      : accent === "sell"
+      ? "border-sell/20 bg-sell/10 text-sell"
+      : "border-gold-500/20 bg-gold-500/10 text-gold-300"
   return (
-    <Card className="hover:border-ap-border-strong transition-all duration-200">
-      <CardContent className="pt-5 pb-4">
-        <div className="flex items-start justify-between mb-3">
-          <div className={cn("w-9 h-9 rounded-lg flex items-center justify-center", "bg-ap-surface border border-ap-border")}>
-            <stat.icon className={cn("w-4 h-4", accentColor)} />
+    <Card className="h-full">
+      <CardHeader className="pb-3">
+        <div className="flex items-center gap-3">
+          <div className={cn("flex h-9 w-9 items-center justify-center rounded-lg border", accentClass)}>
+            <Icon className="h-4 w-4" />
           </div>
-          {stat.dot && <StatusDot status="online" pulse size="sm" />}
+          <div>
+            <CardTitle className="text-sm">{title}</CardTitle>
+            <p className="text-[10px] text-muted-foreground">{subtitle}</p>
+          </div>
         </div>
-        <div className={cn("num text-2xl font-bold tracking-tight leading-tight", accentColor)}>
-          {stat.value}
-        </div>
-        <div className="text-xs text-muted-foreground mt-0.5 leading-tight">{stat.sub}</div>
-        <Separator className="mt-3 mb-2.5" />
-        <div className="label-xs">{stat.label}</div>
+      </CardHeader>
+      <CardContent className="space-y-2 pt-0">{children}</CardContent>
+    </Card>
+  )
+}
+
+function MetricCard({ label, value, accent }: { label: string; value: string; accent: "gold" | "buy" | "warn" | "muted" }) {
+  const color = accent === "buy" ? "text-buy" : accent === "warn" ? "text-warn" : accent === "gold" ? "text-gold-300" : "text-foreground"
+  return (
+    <Card>
+      <CardContent className="py-4">
+        <div className="label-xs">{label}</div>
+        <div className={cn("num mt-2 text-xl font-bold", color)}>{value}</div>
       </CardContent>
     </Card>
   )
 }
 
-function SignalRow({ sig }: { sig: (typeof SIGNALS)[0] }) {
-  const isBuy = sig.dir === "BUY"
-  const badgeClass = sig.type === "A" ? "badge-a" : sig.type === "V" ? "badge-v" : "badge-gap"
+function FeedCard({
+  title,
+  actionLabel,
+  actionTo,
+  loading,
+  error,
+  empty,
+  emptyLabel,
+  children,
+}: {
+  title: string
+  actionLabel: string
+  actionTo: string
+  loading: boolean
+  error: string | null
+  empty: boolean
+  emptyLabel: string
+  children: React.ReactNode
+}) {
   return (
-    <div className="flex items-center gap-2.5 py-2 px-2 rounded-lg hover:bg-ap-surface transition-colors group cursor-pointer">
-      <span
-        className={cn(
-          "inline-flex items-center justify-center w-8 h-6 rounded text-[10px] font-bold border flex-shrink-0",
-          badgeClass
-        )}
-      >
-        {sig.type}
-      </span>
-      <div className="flex-1 min-w-0">
-        <div className="num text-xs font-semibold text-foreground">
-          {sig.price.toLocaleString("en-US", { minimumFractionDigits: 2 })}
+    <Card>
+      <CardHeader>
+        <div className="flex items-center justify-between">
+          <CardTitle>{title}</CardTitle>
+          <Button asChild variant="ghost" size="sm">
+            <Link to={actionTo}>{actionLabel}</Link>
+          </Button>
         </div>
-        <div className="text-[10px] text-muted-foreground">{sig.basis}</div>
-      </div>
-      <div className="flex flex-col items-end gap-0.5">
-        <div className={cn("flex items-center gap-0.5 text-[10px] font-semibold", isBuy ? "text-buy" : "text-sell")}>
-          {isBuy ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
-          {sig.dir}
-        </div>
-        <div className="text-[10px] text-muted-foreground">{sig.time}</div>
-      </div>
-      <div className="w-7 text-right">
-        <span className="num text-[10px] font-semibold text-gold-400">Q{sig.quality}</span>
-      </div>
+      </CardHeader>
+      <CardContent className="space-y-3 pt-0">
+        {loading ? <StateBlock icon={Activity} label="Loading live data..." /> : null}
+        {!loading && error ? <StateBlock icon={AlertTriangle} label={error} tone="error" /> : null}
+        {!loading && !error && empty ? <StateBlock icon={Layers} label={emptyLabel} /> : null}
+        {!loading && !error && !empty ? children : null}
+      </CardContent>
+    </Card>
+  )
+}
+
+function StateBlock({ icon: Icon, label, tone = "muted" }: { icon: typeof Activity; label: string; tone?: "muted" | "error" }) {
+  return (
+    <div className="flex items-center gap-3 rounded-lg border border-ap-border bg-ap-surface/35 px-3 py-4">
+      <Icon className={cn("h-4 w-4", tone === "error" ? "text-sell" : "text-muted-foreground")} />
+      <span className={cn("text-sm", tone === "error" ? "text-sell" : "text-muted-foreground")}>{label}</span>
     </div>
   )
 }
 
-function BiasTag({ tf, bias }: { tf: string; bias: string; label: string }) {
-  const color =
-    bias === "bullish" ? "text-buy" : bias === "bearish" ? "text-sell" : "text-muted-foreground"
-  const bg =
-    bias === "bullish" ? "bg-buy-dim border-buy-border" : bias === "bearish" ? "bg-sell-dim border-sell-border" : "bg-ap-surface border-ap-border"
+function InfoRow({ label, value, mono, valueClass }: { label: string; value: string; mono?: boolean; valueClass?: string }) {
   return (
-    <div className={cn("flex items-center gap-1.5 rounded-md border px-2 py-1", bg)}>
-      <span className="text-[10px] text-muted-foreground font-mono">{tf}</span>
-      <span className={cn("text-[10px] font-semibold capitalize", color)}>{bias}</span>
-    </div>
+    <>
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] text-muted-foreground">{label}</span>
+        <span className={cn("text-[10px] text-foreground", mono ? "font-mono" : "", valueClass)}>{value}</span>
+      </div>
+      <Separator />
+    </>
   )
 }
 
-function AlertRow({ alert }: { alert: (typeof ALERTS)[0] }) {
-  const Icon = alert.sev === "warning" ? AlertTriangle : Info
-  const color = alert.sev === "warning" ? "text-warn" : "text-muted-foreground"
-  const bg = alert.sev === "warning" ? "bg-warn-dim" : "bg-ap-surface"
-  return (
-    <div className={cn("flex items-start gap-2.5 p-2.5 rounded-lg", bg)}>
-      <Icon className={cn("w-3.5 h-3.5 mt-0.5 flex-shrink-0", color)} />
-      <div className="flex-1 min-w-0">
-        <p className="text-xs text-foreground leading-snug">{alert.msg}</p>
-        <p className="text-[10px] text-muted-foreground mt-0.5">{alert.time} ago</p>
-      </div>
-    </div>
-  )
+function formatMaybeNumber(value?: number | null) {
+  return value != null ? value.toFixed(2) : "Unavailable"
+}
+
+function formatBiasLabel(value?: string | null) {
+  return value ? value.replace(/_/g, " ") : "Unavailable"
+}
+
+function formatSessionName(value?: string | null) {
+  if (!value) return "Off-session"
+  return value.replace(/_/g, " ")
+}
+
+function biasColor(value?: string | null) {
+  if (value === "bullish") return "text-buy"
+  if (value === "bearish") return "text-sell"
+  return "text-gold-300"
 }

@@ -312,6 +312,31 @@ class Database:
             );
         """)
 
+        self._pg.execute("""
+            CREATE TABLE IF NOT EXISTS manual_setups (
+                id                              SERIAL PRIMARY KEY,
+                symbol                          VARCHAR(20) NOT NULL DEFAULT 'XAUUSD',
+                direction                       VARCHAR(10) NOT NULL,
+                timeframe_pair                  VARCHAR(20) NOT NULL,
+                entry_price                     NUMERIC(12,2) NOT NULL,
+                stop_loss                       NUMERIC(12,2) NOT NULL,
+                tp1                             NUMERIC(12,2) NOT NULL,
+                tp2                             NUMERIC(12,2),
+                tp3                             NUMERIC(12,2),
+                bias                            VARCHAR(40),
+                confirmation_type               VARCHAR(50),
+                session                         VARCHAR(30),
+                notes                           TEXT,
+                activation_mode                 VARCHAR(50),
+                move_sl_to_be_after_tp1         BOOLEAN DEFAULT TRUE,
+                enable_telegram_alerts          BOOLEAN DEFAULT TRUE,
+                high_priority                   BOOLEAN DEFAULT FALSE,
+                status                          VARCHAR(30) NOT NULL DEFAULT 'draft',
+                created_at                      TIMESTAMPTZ DEFAULT NOW(),
+                updated_at                      TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+
         logger.info("Schema verified/created.")
 
     # ─────────────────────────────────────────────────────
@@ -451,6 +476,10 @@ class Database:
             """)
             return list(rows)
         return []
+
+    def get_closed_trades(self, limit: int = 50) -> List[Dict]:
+        rows = self.get_all_closed_trades()
+        return rows[:limit]
 
     def get_all_closed_trades(self) -> List[Dict]:
         if self._sb:
@@ -758,6 +787,169 @@ class Database:
                 for row in rows
             ]
         return []
+
+    # ─────────────────────────────────────────────────────────────────────
+    # MANUAL SETUPS
+    # ─────────────────────────────────────────────────────────────────────
+
+    def get_manual_setups(self, limit: int = 500) -> List[Dict]:
+        if self._sb:
+            return self._sb._get(
+                "manual_setups",
+                {"order": "updated_at.desc"},
+                limit=limit,
+            )
+
+        if self._pg:
+            rows = self._pg.fetchall(
+                """
+                SELECT
+                    id, symbol, direction, timeframe_pair, entry_price, stop_loss,
+                    tp1, tp2, tp3, bias, confirmation_type, session, notes,
+                    activation_mode, move_sl_to_be_after_tp1, enable_telegram_alerts,
+                    high_priority, status, created_at, updated_at
+                FROM manual_setups
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            return [
+                {
+                    "id": row[0],
+                    "symbol": row[1],
+                    "direction": row[2],
+                    "timeframe_pair": row[3],
+                    "entry_price": float(row[4]) if row[4] is not None else None,
+                    "stop_loss": float(row[5]) if row[5] is not None else None,
+                    "tp1": float(row[6]) if row[6] is not None else None,
+                    "tp2": float(row[7]) if row[7] is not None else None,
+                    "tp3": float(row[8]) if row[8] is not None else None,
+                    "bias": row[9],
+                    "confirmation_type": row[10],
+                    "session": row[11],
+                    "notes": row[12],
+                    "activation_mode": row[13],
+                    "move_sl_to_be_after_tp1": row[14],
+                    "enable_telegram_alerts": row[15],
+                    "high_priority": row[16],
+                    "status": row[17],
+                    "created_at": str(row[18]) if row[18] else None,
+                    "updated_at": str(row[19]) if row[19] else None,
+                }
+                for row in rows
+            ]
+        return []
+
+    def insert_manual_setup(self, payload: Dict[str, Any]) -> Optional[Dict]:
+        if self._sb:
+            return self._sb._post("manual_setups", payload)
+
+        if self._pg:
+            row = self._pg.fetchone(
+                """
+                INSERT INTO manual_setups (
+                    symbol, direction, timeframe_pair, entry_price, stop_loss,
+                    tp1, tp2, tp3, bias, confirmation_type, session, notes,
+                    activation_mode, move_sl_to_be_after_tp1, enable_telegram_alerts,
+                    high_priority, status
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING
+                    id, symbol, direction, timeframe_pair, entry_price, stop_loss,
+                    tp1, tp2, tp3, bias, confirmation_type, session, notes,
+                    activation_mode, move_sl_to_be_after_tp1, enable_telegram_alerts,
+                    high_priority, status, created_at, updated_at
+                """,
+                (
+                    payload["symbol"],
+                    payload["direction"],
+                    payload["timeframe_pair"],
+                    payload["entry_price"],
+                    payload["stop_loss"],
+                    payload["tp1"],
+                    payload.get("tp2"),
+                    payload.get("tp3"),
+                    payload.get("bias"),
+                    payload.get("confirmation_type"),
+                    payload.get("session"),
+                    payload.get("notes"),
+                    payload.get("activation_mode"),
+                    payload.get("move_sl_to_be_after_tp1", True),
+                    payload.get("enable_telegram_alerts", True),
+                    payload.get("high_priority", False),
+                    payload.get("status", "draft"),
+                ),
+            )
+            return {
+                "id": row[0],
+                "symbol": row[1],
+                "direction": row[2],
+                "timeframe_pair": row[3],
+                "entry_price": float(row[4]) if row[4] is not None else None,
+                "stop_loss": float(row[5]) if row[5] is not None else None,
+                "tp1": float(row[6]) if row[6] is not None else None,
+                "tp2": float(row[7]) if row[7] is not None else None,
+                "tp3": float(row[8]) if row[8] is not None else None,
+                "bias": row[9],
+                "confirmation_type": row[10],
+                "session": row[11],
+                "notes": row[12],
+                "activation_mode": row[13],
+                "move_sl_to_be_after_tp1": row[14],
+                "enable_telegram_alerts": row[15],
+                "high_priority": row[16],
+                "status": row[17],
+                "created_at": str(row[18]) if row[18] else None,
+                "updated_at": str(row[19]) if row[19] else None,
+            }
+        return None
+
+    def update_manual_setup(self, setup_id: int, payload: Dict[str, Any]) -> Optional[Dict]:
+        payload = {**payload, "updated_at": "now()" if self._sb else None}
+
+        if self._sb:
+            clean_payload = {k: v for k, v in payload.items() if v is not None}
+            if "updated_at" in clean_payload:
+                clean_payload.pop("updated_at")
+            self._sb._patch("manual_setups", {"id": setup_id}, clean_payload)
+            rows = self._sb._get("manual_setups", {"id": f"eq.{setup_id}"}, limit=1)
+            return rows[0] if rows else None
+
+        if self._pg:
+            assignments = []
+            params: List[Any] = []
+            for key, value in payload.items():
+                if key == "updated_at":
+                    continue
+                assignments.append(f"{key} = %s")
+                params.append(value)
+            assignments.append("updated_at = NOW()")
+            params.append(setup_id)
+            self._pg.execute(
+                f"UPDATE manual_setups SET {', '.join(assignments)} WHERE id = %s",
+                tuple(params),
+            )
+            rows = self.get_manual_setups(limit=500)
+            return next((row for row in rows if row.get("id") == setup_id), None)
+        return None
+
+    def delete_manual_setup(self, setup_id: int) -> bool:
+        if self._sb:
+            import requests
+
+            r = requests.delete(
+                f"{self._sb._url}/manual_setups",
+                headers=self._sb._headers,
+                params={"id": f"eq.{setup_id}"},
+                timeout=15,
+            )
+            r.raise_for_status()
+            return True
+
+        if self._pg:
+            self._pg.execute("DELETE FROM manual_setups WHERE id = %s", (setup_id,))
+            return True
+        return False
 
     # ─────────────────────────────────────────────────────
     # DAILY SUMMARY

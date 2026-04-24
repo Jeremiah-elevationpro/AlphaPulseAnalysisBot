@@ -28,7 +28,10 @@ export function AppShell() {
           <TopHeader />
 
           {/* Page content with transition */}
-          <main className="flex-1 overflow-y-auto overflow-x-hidden pb-20 lg:pb-0">
+          <main className="relative flex-1 overflow-y-auto overflow-x-hidden pb-20 lg:pb-0">
+            <div className="pointer-events-none absolute inset-0 bg-dot opacity-[0.18]" />
+            <div className="pointer-events-none absolute inset-x-0 top-0 h-40 bg-glow-purple" />
+            <div className="pointer-events-none absolute inset-x-0 top-0 h-28 bg-glow-gold" />
             <AnimatePresence mode="wait" initial={false}>
               <motion.div
                 key={location.pathname}
@@ -37,7 +40,7 @@ export function AppShell() {
                 animate="animate"
                 exit="exit"
                 transition={{ duration: 0.22, ease: [0.4, 0, 0.2, 1] }}
-                className="min-h-full"
+                className="relative min-h-full"
               >
                 <Outlet />
               </motion.div>

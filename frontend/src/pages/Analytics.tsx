@@ -1,261 +1,319 @@
-import { TrendingUp, Target, Award, Clock } from "lucide-react"
-import { motion } from "framer-motion"
+import { useState, type ReactNode } from "react"
+import { Activity, CalendarRange, Layers3, ShieldCheck, TrendingUp } from "lucide-react"
+import {
+  Area,
+  AreaChart,
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Cell,
+  Legend,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts"
+
+import { Badge } from "@/components/ui/badge"
+import { ActivityLogFeed } from "@/components/control/ActivityLogFeed"
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { useAnalytics } from "@/hooks/use-data"
 import { cn } from "@/lib/utils"
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
-
-const PERF_STATS = [
-  { label: "Win Rate", value: "68.4%", sub: "Last 30 trades", icon: Target, color: "text-buy" },
-  { label: "Profit Factor", value: "2.34", sub: "Gross profit / loss", icon: TrendingUp, color: "text-gold-400" },
-  { label: "Avg Win", value: "+$186", sub: "Per winning trade", icon: Award, color: "text-buy" },
-  { label: "Avg Hold", value: "2h 18m", sub: "Average duration", icon: Clock, color: "text-muted-foreground" },
-]
-
-const TYPE_BREAKDOWN = [
-  { type: "A", label: "A-Level (SELL)", wins: 8, total: 12, pnl: 624, badgeClass: "badge-a" },
-  { type: "V", label: "V-Level (BUY)", wins: 10, total: 13, pnl: 847, badgeClass: "badge-v" },
-  { type: "Gap", label: "Gap / FVG", wins: 3, total: 5, pnl: 213, badgeClass: "badge-gap" },
-]
-
-const MONTHLY = [
-  { month: "Nov", pnl: 1240, trades: 18 },
-  { month: "Dec", pnl: 890, trades: 14 },
-  { month: "Jan", pnl: -320, trades: 11 },
-  { month: "Feb", pnl: 1680, trades: 22 },
-  { month: "Mar", pnl: 2140, trades: 28 },
-  { month: "Apr", pnl: 847, trades: 9 },
-]
-
-const maxPnl = Math.max(...MONTHLY.map((m) => Math.abs(m.pnl)))
 
 export default function Analytics() {
+  const [session, setSession] = useState("all")
+  const [confirmation, setConfirmation] = useState("all")
+  const [symbol, setSymbol] = useState("all")
+
+  const query = useAnalytics({ session, confirmation_type: confirmation, symbol })
+  const data = query.data
+  const metrics = data?.metrics
+  const charts = data?.charts ?? {
+    cumulative_pips: [],
+    session_performance: [],
+    micro_confirmation_performance: [],
+    win_loss_distribution: [],
+    performance_by_bias: [],
+    performance_by_period: [],
+  }
+  const breakdowns = data?.breakdowns ?? {
+    session: [],
+    setup_type: [],
+    micro_confirmation: [],
+    bias_gate: [],
+    outcome_mix: [],
+  }
+
   return (
     <div className="p-4 md:p-6 space-y-5">
-      <div>
-        <h2 className="text-lg font-bold text-foreground">Analytics</h2>
-        <p className="text-sm text-muted-foreground">Performance metrics and strategy statistics</p>
+      <div className="fixed inset-x-0 top-0 h-44 bg-glow-gold-top pointer-events-none" />
+
+      <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+        <div className="space-y-1">
+          <div className="inline-flex items-center gap-2 rounded-full border border-gold-500/20 bg-gold-500/8 px-3 py-1 text-[11px] font-semibold text-gold-400">
+            <TrendingUp className="h-3.5 w-3.5" />
+            Replay Analytics
+          </div>
+          <h1 className="text-xl font-bold text-foreground md:text-2xl">Analytics</h1>
+          <p className="max-w-2xl text-sm text-muted-foreground">Supabase-backed replay and performance data visualized without changing the existing premium dashboard feel.</p>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-3">
+          <FilterPill icon={CalendarRange} label="Session" value={session} onChange={setSession} options={["all", "asia", "london", "new_york"]} />
+          <FilterPill icon={ShieldCheck} label="Confirmation" value={confirmation} onChange={setConfirmation} options={["all", "liquidity_sweep_reclaim", "double_pattern", "unknown"]} />
+          <FilterPill icon={Layers3} label="Symbol" value={symbol} onChange={setSymbol} options={["all", "XAUUSD"]} />
+        </div>
       </div>
 
-      {/* Top stats */}
-      <motion.div
-        className="grid grid-cols-2 xl:grid-cols-4 gap-3"
-        initial={{ opacity: 0, y: 10 }}
-        animate={{ opacity: 1, y: 0 }}
-      >
-        {PERF_STATS.map((s) => (
-          <Card key={s.label}>
-            <CardContent className="pt-4 pb-4">
-              <div className="flex items-center gap-2 mb-2">
-                <s.icon className={cn("w-4 h-4", s.color)} />
-                <span className="label-xs">{s.label}</span>
-              </div>
-              <div className={cn("num text-2xl font-bold", s.color)}>{s.value}</div>
-              <div className="text-xs text-muted-foreground mt-0.5">{s.sub}</div>
-            </CardContent>
-          </Card>
-        ))}
-      </motion.div>
+      <div className="grid grid-cols-2 gap-3 xl:grid-cols-5">
+        <Metric label="Total Trades" value={String(metrics?.total_trades ?? 0)} accent="gold" />
+        <Metric label="Win Rate" value={`${metrics?.win_rate ?? 0}%`} accent="buy" />
+        <Metric label="TP1 Hit Rate" value={`${metrics?.tp1_hit_rate ?? 0}%`} accent="gold" />
+        <Metric label="Net Pips" value={`${(metrics?.net_pips ?? 0) > 0 ? "+" : ""}${metrics?.net_pips ?? 0}`} accent={(metrics?.net_pips ?? 0) >= 0 ? "buy" : "sell"} />
+        <Metric label="Avg Pips / Trade" value={`${metrics?.avg_pips_per_trade ?? 0}`} accent="muted" />
+      </div>
 
-      <Tabs defaultValue="overview">
-        <TabsList>
-          <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="bytype">By Level Type</TabsTrigger>
-          <TabsTrigger value="monthly">Monthly P&L</TabsTrigger>
-        </TabsList>
+      {query.isLoading ? <State label="Loading analytics..." /> : null}
+      {query.error instanceof Error ? <State label={query.error.message} tone="error" /> : null}
 
-        <TabsContent value="overview">
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-            {/* Win rate gauge */}
-            <Card>
-              <CardHeader>
-                <CardTitle>Win Rate Distribution</CardTitle>
-                <CardDescription>Based on last 30 closed trades</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="flex items-center justify-center py-6">
-                  <GaugeChart value={68.4} />
-                </div>
-                <div className="grid grid-cols-3 gap-3 mt-4">
-                  <StatBox label="Wins" value="20" color="text-buy" />
-                  <StatBox label="Losses" value="9" color="text-sell" />
-                  <StatBox label="Break Even" value="1" color="text-muted-foreground" />
-                </div>
-              </CardContent>
-            </Card>
+      {!query.isLoading && !(query.error instanceof Error) ? (
+        <>
+          <div className="grid grid-cols-1 gap-4 2xl:grid-cols-12">
+            <ChartCard title="Cumulative Pips Curve" description="Replay growth across the filtered sample." className="2xl:col-span-7">
+              <ChartWrap>
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={charts.cumulative_pips}>
+                    <defs>
+                      <linearGradient id="pipsFill" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor="#D4AF37" stopOpacity={0.32} />
+                        <stop offset="100%" stopColor="#D4AF37" stopOpacity={0.02} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid stroke="rgba(255,255,255,0.05)" vertical={false} />
+                    <XAxis dataKey="label" stroke="#667085" tickLine={false} axisLine={false} fontSize={11} />
+                    <YAxis stroke="#667085" tickLine={false} axisLine={false} fontSize={11} />
+                    <Tooltip content={<ChartTooltip />} />
+                    <Area type="monotone" dataKey="pips" stroke="#D4AF37" strokeWidth={2.5} fill="url(#pipsFill)" />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </ChartWrap>
+            </ChartCard>
 
-            {/* Equity curve placeholder */}
-            <Card>
-              <CardHeader>
-                <CardTitle>Equity Curve</CardTitle>
-                <CardDescription>Cumulative P&L over time</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="relative h-48 rounded-lg bg-ap-surface border border-ap-border overflow-hidden flex items-center justify-center">
-                  <div className="absolute inset-0">
-                    <svg className="w-full h-full" viewBox="0 0 300 150" preserveAspectRatio="none">
-                      <defs>
-                        <linearGradient id="equityGrad" x1="0" y1="0" x2="0" y2="1">
-                          <stop offset="0%" stopColor="#10B981" stopOpacity="0.25" />
-                          <stop offset="100%" stopColor="#10B981" stopOpacity="0" />
-                        </linearGradient>
-                      </defs>
-                      <path
-                        d="M0,130 L30,125 L60,110 L90,115 L110,100 L140,65 L170,55 L200,70 L230,40 L260,30 L300,18"
-                        fill="none"
-                        stroke="#10B981"
-                        strokeWidth="1.5"
-                        strokeLinecap="round"
-                      />
-                      <path
-                        d="M0,130 L30,125 L60,110 L90,115 L110,100 L140,65 L170,55 L200,70 L230,40 L260,30 L300,18 L300,150 L0,150Z"
-                        fill="url(#equityGrad)"
-                      />
-                    </svg>
-                  </div>
-                  <p className="relative text-xs text-muted-foreground/40 z-10">
-                    Connects to live data when backend is active
-                  </p>
-                </div>
-                <div className="flex items-center justify-between mt-3 px-1">
-                  <span className="num text-xs text-muted-foreground">$0</span>
-                  <span className="num text-sm font-bold text-buy">+$5,204</span>
-                </div>
-              </CardContent>
-            </Card>
+            <ChartCard title="Win / Loss Distribution" description="Closed replay outcomes." className="2xl:col-span-5">
+              <ChartWrap>
+                <ResponsiveContainer width="100%" height="100%">
+                  <PieChart>
+                    <Pie data={charts.win_loss_distribution} dataKey="value" cx="50%" cy="50%" innerRadius={64} outerRadius={96} paddingAngle={4}>
+                      {charts.win_loss_distribution.map((entry) => <Cell key={entry.name} fill={entry.color} />)}
+                    </Pie>
+                    <Tooltip content={<ChartTooltip />} />
+                    <Legend verticalAlign="bottom" iconType="circle" wrapperStyle={{ fontSize: "12px" }} />
+                  </PieChart>
+                </ResponsiveContainer>
+              </ChartWrap>
+            </ChartCard>
           </div>
-        </TabsContent>
 
-        <TabsContent value="bytype">
-          <div className="space-y-3">
-            {TYPE_BREAKDOWN.map((row) => (
-              <Card key={row.type}>
-                <CardContent className="pt-4 pb-4">
-                  <div className="flex items-start justify-between gap-4 flex-wrap">
-                    <div className="flex items-center gap-3">
-                      <span className={cn("inline-flex items-center justify-center w-10 h-8 rounded-lg text-xs font-bold border", row.badgeClass)}>
-                        {row.type}
-                      </span>
-                      <div>
-                        <div className="text-sm font-semibold text-foreground">{row.label}</div>
-                        <div className="text-xs text-muted-foreground">{row.total} trades · {row.wins} wins</div>
-                      </div>
-                    </div>
+          <div className="grid grid-cols-1 gap-4 2xl:grid-cols-12">
+            <ChartCard title="Session Performance" description="Trade count, win rate, and pip contribution by session." className="2xl:col-span-6">
+              <ChartWrap>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={charts.session_performance}>
+                    <CartesianGrid stroke="rgba(255,255,255,0.05)" vertical={false} />
+                    <XAxis dataKey="name" stroke="#667085" tickLine={false} axisLine={false} fontSize={11} />
+                    <YAxis stroke="#667085" tickLine={false} axisLine={false} fontSize={11} />
+                    <Tooltip content={<ChartTooltip />} />
+                    <Legend verticalAlign="top" height={20} wrapperStyle={{ fontSize: "12px" }} />
+                    <Bar dataKey="net_pips" fill="#D4AF37" radius={[6, 6, 0, 0]} />
+                    <Bar dataKey="trades" fill="#10B981" radius={[6, 6, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </ChartWrap>
+            </ChartCard>
 
-                    <div className="flex items-center gap-6">
-                      <div>
-                        <div className="label-xs">Win Rate</div>
-                        <div className="num text-sm font-bold text-buy mt-0.5">
-                          {((row.wins / row.total) * 100).toFixed(0)}%
-                        </div>
-                      </div>
-                      <div>
-                        <div className="label-xs">Net P&L</div>
-                        <div className="num text-sm font-bold text-buy mt-0.5">+${row.pnl}</div>
-                      </div>
-                    </div>
-
-                    <div className="w-full">
-                      <div className="h-2 rounded-full bg-ap-border overflow-hidden">
-                        <motion.div
-                          initial={{ width: 0 }}
-                          animate={{ width: `${(row.wins / row.total) * 100}%` }}
-                          transition={{ duration: 0.7, ease: "easeOut" }}
-                          className="h-full rounded-full bg-buy"
-                        />
-                      </div>
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
-            ))}
+            <ChartCard title="Micro Confirmation Performance" description="Replay edge by confirmation type." className="2xl:col-span-6">
+              <ChartWrap>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={charts.micro_confirmation_performance} layout="vertical" margin={{ left: 20 }}>
+                    <CartesianGrid stroke="rgba(255,255,255,0.05)" horizontal={false} />
+                    <XAxis type="number" stroke="#667085" tickLine={false} axisLine={false} fontSize={11} />
+                    <YAxis type="category" dataKey="name" stroke="#667085" tickLine={false} axisLine={false} fontSize={11} width={110} />
+                    <Tooltip content={<ChartTooltip />} />
+                    <Bar dataKey="win_rate" fill="#10B981" radius={[0, 6, 6, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </ChartWrap>
+            </ChartCard>
           </div>
-        </TabsContent>
 
-        <TabsContent value="monthly">
+          <div className="grid grid-cols-1 gap-4 2xl:grid-cols-12">
+            <ChartCard title="Performance by Bias" description="Which bias states deliver the cleanest results." className="2xl:col-span-6">
+              <ChartWrap>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={charts.performance_by_bias}>
+                    <CartesianGrid stroke="rgba(255,255,255,0.05)" vertical={false} />
+                    <XAxis dataKey="name" stroke="#667085" tickLine={false} axisLine={false} fontSize={10} interval={0} angle={-10} textAnchor="end" height={50} />
+                    <YAxis stroke="#667085" tickLine={false} axisLine={false} fontSize={11} />
+                    <Tooltip content={<ChartTooltip />} />
+                    <Bar dataKey="net_pips" fill="#D4AF37" radius={[6, 6, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </ChartWrap>
+            </ChartCard>
+
+            <ChartCard title="Performance by Month / Week" description="Distribution of trades and net pips over time." className="2xl:col-span-6">
+              <ChartWrap>
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={charts.performance_by_period}>
+                    <CartesianGrid stroke="rgba(255,255,255,0.05)" vertical={false} />
+                    <XAxis dataKey="label" stroke="#667085" tickLine={false} axisLine={false} fontSize={11} />
+                    <YAxis stroke="#667085" tickLine={false} axisLine={false} fontSize={11} />
+                    <Tooltip content={<ChartTooltip />} />
+                    <Legend verticalAlign="top" height={20} wrapperStyle={{ fontSize: "12px" }} />
+                    <Bar dataKey="net_pips" fill="#10B981" radius={[6, 6, 0, 0]} />
+                    <Bar dataKey="trades" fill="#D4AF37" radius={[6, 6, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </ChartWrap>
+            </ChartCard>
+          </div>
+
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+            <BreakdownTable title="Session Breakdown" subtitle="Session contribution to replay results." headers={["Session", "Trades", "Wins", "TP1", "Net Pips", "Avg Pips"]} rows={breakdowns.session.map((row) => [row.session, String(row.trades), String(row.wins), String(row.tp1), `${row.net_pips}`, `${row.avg_pips}`])} />
+            <BreakdownTable title="Setup Type Breakdown" subtitle="Performance by setup model." headers={["Setup Type", "Trades", "Win Rate", "Net Pips"]} rows={breakdowns.setup_type.map((row) => [row.setup_type, String(row.trades), `${row.win_rate}%`, `${row.net_pips}`])} />
+            <BreakdownTable title="Micro Confirmation Breakdown" subtitle="How confirmations are contributing to outcomes." headers={["Micro", "Trades", "Win Rate", "TP1 Rate", "Net Pips"]} rows={breakdowns.micro_confirmation.map((row) => [row.micro, String(row.trades), `${row.win_rate}%`, `${row.tp1_rate}%`, `${row.net_pips}`])} />
+            <BreakdownTable title="Bias Gate Breakdown" subtitle="Performance by bias gate quality." headers={["Bias Gate", "Trades", "Win Rate", "Net Pips"]} rows={breakdowns.bias_gate.map((row) => [row.bias_gate, String(row.trades), `${row.win_rate}%`, `${row.net_pips}`])} />
+          </div>
+
           <Card>
-            <CardHeader>
-              <CardTitle>Monthly P&L</CardTitle>
-              <CardDescription>Net profit/loss per month</CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="flex items-end justify-between gap-2 h-40 mt-2">
-                {MONTHLY.map((m, i) => {
-                  const barH = (Math.abs(m.pnl) / maxPnl) * 100
-                  const isPos = m.pnl >= 0
-                  return (
-                    <motion.div
-                      key={m.month}
-                      className="flex-1 flex flex-col items-center gap-1.5"
-                      initial={{ opacity: 0, scaleY: 0 }}
-                      animate={{ opacity: 1, scaleY: 1 }}
-                      transition={{ delay: i * 0.06, duration: 0.4, origin: "bottom" }}
-                    >
-                      <span className={cn("num text-[10px] font-semibold", isPos ? "text-buy" : "text-sell")}>
-                        {isPos ? "+" : ""}${Math.abs(m.pnl)}
-                      </span>
-                      <div className="w-full flex flex-col justify-end" style={{ height: "80px" }}>
-                        <div
-                          className={cn("w-full rounded-t transition-all", isPos ? "bg-buy/60" : "bg-sell/60")}
-                          style={{ height: `${barH}%`, minHeight: "4px" }}
-                        />
-                      </div>
-                      <span className="text-[10px] text-muted-foreground">{m.month}</span>
-                    </motion.div>
-                  )
-                })}
+            <CardHeader className="pb-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <CardTitle>Outcome Mix</CardTitle>
+                  <CardDescription>Closed trade composition across replay results.</CardDescription>
+                </div>
+                <Badge variant="muted" className="text-[10px]">{breakdowns.outcome_mix.length} outcome states</Badge>
               </div>
+            </CardHeader>
+            <CardContent className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4 pt-0">
+              {breakdowns.outcome_mix.map((item) => (
+                <div key={item.outcome} className="rounded-xl border border-ap-border bg-ap-surface/35 p-4">
+                  <div className="label-xs">{item.outcome}</div>
+                  <div className={cn("num mt-2 text-2xl font-bold", item.color)}>{item.trades}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">trades in this outcome bucket</div>
+                </div>
+              ))}
             </CardContent>
           </Card>
-        </TabsContent>
-      </Tabs>
+
+          <ActivityLogFeed />
+        </>
+      ) : null}
     </div>
   )
 }
 
-function StatBox({ label, value, color }: { label: string; value: string; color: string }) {
+function FilterPill({ icon: Icon, label, value, onChange, options }: { icon: typeof Activity; label: string; value: string; onChange: (value: string) => void; options: string[] }) {
   return (
-    <div className="bg-ap-surface rounded-lg border border-ap-border p-3 text-center">
-      <div className="label-xs">{label}</div>
-      <div className={cn("num text-lg font-bold mt-1", color)}>{value}</div>
-    </div>
+    <Card>
+      <CardContent className="py-3">
+        <div className="flex items-center gap-2">
+          <Icon className="h-4 w-4 text-gold-400" />
+          <div className="min-w-0 flex-1">
+            <div className="label-xs">{label}</div>
+            <select value={value} onChange={(e) => onChange(e.target.value)} className="mt-1 w-full bg-transparent text-xs font-semibold text-foreground outline-none">
+              {options.map((option) => <option key={option} value={option}>{option}</option>)}
+            </select>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
   )
 }
 
-function GaugeChart({ value }: { value: number }) {
-  const radius = 70
-  const stroke = 10
-  const normalizedR = radius - stroke / 2
-  const circ = Math.PI * normalizedR
-  const offset = circ - (value / 100) * circ
-
+function Metric({ label, value, accent }: { label: string; value: string; accent: "gold" | "buy" | "sell" | "muted" }) {
+  const color = accent === "buy" ? "text-buy" : accent === "sell" ? "text-sell" : accent === "gold" ? "text-gold-400" : "text-foreground"
   return (
-    <div className="relative flex items-center justify-center">
-      <svg width="160" height="90" viewBox="0 0 160 90">
-        {/* Background arc */}
-        <path
-          d="M 20,80 A 60,60 0 0,1 140,80"
-          fill="none"
-          stroke="hsl(228 22% 14%)"
-          strokeWidth="10"
-          strokeLinecap="round"
-        />
-        {/* Value arc */}
-        <motion.path
-          d="M 20,80 A 60,60 0 0,1 140,80"
-          fill="none"
-          stroke="#10B981"
-          strokeWidth="10"
-          strokeLinecap="round"
-          strokeDasharray={`${circ}`}
-          initial={{ strokeDashoffset: circ }}
-          animate={{ strokeDashoffset: offset }}
-          transition={{ duration: 1, ease: "easeOut" }}
-        />
-      </svg>
-      <div className="absolute bottom-0 text-center">
-        <div className="num text-2xl font-bold text-buy">{value}%</div>
-        <div className="text-[10px] text-muted-foreground">Win Rate</div>
+    <Card>
+      <CardContent className="py-4">
+        <div className="label-xs">{label}</div>
+        <div className={cn("num mt-2 text-lg font-bold", color)}>{value}</div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function ChartCard({ title, description, className, children }: { title: string; description: string; className?: string; children: ReactNode }) {
+  return (
+    <Card className={className}>
+      <CardHeader className="pb-3">
+        <CardTitle>{title}</CardTitle>
+        <CardDescription>{description}</CardDescription>
+      </CardHeader>
+      <CardContent className="pt-0">{children}</CardContent>
+    </Card>
+  )
+}
+
+function ChartWrap({ children }: { children: ReactNode }) {
+  return <div className="h-[320px]">{children}</div>
+}
+
+function BreakdownTable({ title, subtitle, headers, rows }: { title: string; subtitle: string; headers: string[]; rows: string[][] }) {
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle>{title}</CardTitle>
+        <CardDescription>{subtitle}</CardDescription>
+      </CardHeader>
+      <CardContent className="pt-0">
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="border-b border-ap-border">
+                {headers.map((header) => <th key={header} className="px-3 py-2 text-left label-xs">{header}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, idx) => (
+                <tr key={`${title}-${idx}`} className="border-b border-ap-border/50 last:border-0">
+                  {row.map((value, valueIdx) => <td key={`${title}-${idx}-${valueIdx}`} className="px-3 py-3 text-[11px] text-foreground">{value}</td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function ChartTooltip({ active, payload, label }: { active?: boolean; payload?: Array<{ name?: string; value?: string | number; color?: string }>; label?: string }) {
+  if (!active || !payload?.length) return null
+  return (
+    <div className="rounded-lg border border-ap-border bg-ap-card px-3 py-2 shadow-card">
+      <div className="text-[11px] font-semibold text-foreground">{label}</div>
+      <div className="mt-2 space-y-1">
+        {payload.map((entry, index) => (
+          <div key={`${entry.name}-${index}`} className="flex items-center gap-2 text-[11px] text-muted-foreground">
+            <span className="h-2 w-2 rounded-full" style={{ backgroundColor: entry.color }} />
+            <span>{entry.name}</span>
+            <span className="num font-semibold text-foreground">{entry.value}</span>
+          </div>
+        ))}
       </div>
     </div>
+  )
+}
+
+function State({ label, tone = "muted" }: { label: string; tone?: "muted" | "error" }) {
+  return (
+    <Card>
+      <CardContent className="py-12 text-center">
+        <p className={cn("text-sm", tone === "error" ? "text-sell" : "text-muted-foreground")}>{label}</p>
+      </CardContent>
+    </Card>
   )
 }

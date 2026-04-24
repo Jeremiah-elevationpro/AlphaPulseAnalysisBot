@@ -1,149 +1,240 @@
-import { ArrowUpRight, ArrowDownRight } from "lucide-react"
-import { motion } from "framer-motion"
-import { cn } from "@/lib/utils"
-import { Card, CardContent } from "@/components/ui/card"
+import { useMemo, useState } from "react"
+import { ChevronRight, Target } from "lucide-react"
+
 import { Badge } from "@/components/ui/badge"
-
-const TRADES = [
-  { id: "T-001", dir: "BUY", type: "V", entry: 2245.3, sl: 2238.0, tp: 2280.0, close: 2278.5, pnl: 132.4, pips: 33.2, rr: "1:4.4", status: "closed", opened: "Apr 23, 09:14", closed: "Apr 23, 11:52" },
-  { id: "T-002", dir: "SELL", type: "A", entry: 2287.5, sl: 2294.0, tp: 2252.0, close: 2265.0, pnl: 224.8, pips: 22.5, rr: "1:3.5", status: "closed", opened: "Apr 23, 07:30", closed: "Apr 23, 10:18" },
-  { id: "T-003", dir: "BUY", type: "Gap", entry: 2271.0, sl: 2263.0, tp: 2295.0, close: null, pnl: null, pips: null, rr: "1:3.0", status: "open", opened: "Apr 23, 12:05", closed: null },
-  { id: "T-004", dir: "SELL", type: "A", entry: 2295.0, sl: 2301.0, tp: 2265.0, close: 2301.5, pnl: -63.2, pips: -6.5, rr: "1:5.0", status: "closed", opened: "Apr 22, 16:00", closed: "Apr 22, 18:30" },
-  { id: "T-005", dir: "BUY", type: "V", entry: 2238.75, sl: 2231.0, tp: 2270.0, close: 2270.0, pnl: 313.0, pips: 31.25, rr: "1:4.0", status: "closed", opened: "Apr 22, 11:00", closed: "Apr 22, 15:45" },
-] as const
-
-const STATS = [
-  { label: "Total Trades", value: "5", sub: "This week" },
-  { label: "Win Rate", value: "75%", sub: "3 of 4 closed", color: "text-buy" },
-  { label: "Net P&L", value: "+$607.0", sub: "Closed trades", color: "text-buy" },
-  { label: "Avg R:R", value: "1:4.0", sub: "Realized", color: "text-gold-400" },
-]
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import type { TradeRow } from "@/lib/api"
+import { useTrades } from "@/hooks/use-data"
+import { cn } from "@/lib/utils"
 
 export default function Trades() {
-  const closed = TRADES.filter((t) => t.status === "closed")
-  const open = TRADES.filter((t) => t.status === "open")
+  const activeQuery = useTrades("active", 100)
+  const closedQuery = useTrades("closed", 100)
+  const [selectedUuid, setSelectedUuid] = useState<string | null>(null)
+
+  const activeTrades = activeQuery.data?.trades ?? []
+  const closedTrades = closedQuery.data?.trades ?? []
+  const selectedTrade =
+    [...activeTrades, ...closedTrades].find((trade) => trade.uuid === selectedUuid) ??
+    activeTrades[0] ??
+    closedTrades[0] ??
+    null
+
+  const stats = useMemo(() => {
+    const closed = closedTrades
+    const wins = closed.filter((trade) => String(trade.result ?? trade.status).toLowerCase().includes("win") || trade.status === "COMPLETED").length
+    const netPips = closed.reduce((sum, trade) => sum + (trade.realized_pips ?? 0), 0)
+    return {
+      active: activeTrades.length,
+      history: closed.length,
+      winRate: closed.length ? `${Math.round((wins / closed.length) * 100)}%` : "0%",
+      netPips: `${netPips >= 0 ? "+" : ""}${netPips.toFixed(1)}`,
+    }
+  }, [activeTrades.length, closedTrades])
 
   return (
     <div className="p-4 md:p-6 space-y-5">
-      <div>
-        <h2 className="text-lg font-bold text-foreground">Trades</h2>
-        <p className="text-sm text-muted-foreground">Live and closed trade history</p>
-      </div>
+      <div className="fixed inset-x-0 top-0 h-44 bg-glow-gold-top pointer-events-none" />
 
-      {/* Stats */}
-      <motion.div
-        className="grid grid-cols-2 xl:grid-cols-4 gap-3"
-        initial={{ opacity: 0, y: 10 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.3 }}
-      >
-        {STATS.map((s) => (
-          <Card key={s.label}>
-            <CardContent className="pt-4 pb-4">
-              <div className="label-xs mb-2">{s.label}</div>
-              <div className={cn("num text-xl font-bold text-foreground", s.color)}>{s.value}</div>
-              <div className="text-xs text-muted-foreground mt-0.5">{s.sub}</div>
-            </CardContent>
-          </Card>
-        ))}
-      </motion.div>
-
-      {/* Open trades */}
-      {open.length > 0 && (
-        <div className="space-y-2">
-          <h3 className="text-sm font-semibold text-foreground flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-buy animate-pulse" />
-            Open Trades ({open.length})
-          </h3>
-          {open.map((t) => (
-            <TradeRow key={t.id} trade={t} />
-          ))}
-        </div>
-      )}
-
-      {/* Closed trades */}
-      <div className="space-y-2">
-        <h3 className="text-sm font-semibold text-foreground">Closed Trades ({closed.length})</h3>
-        <Card>
-          {/* Table header */}
-          <div className="grid grid-cols-[2fr_1fr_1fr_1fr_1fr_1fr_1fr] gap-2 px-4 py-2.5 border-b border-ap-border">
-            {["ID", "Type", "Dir", "Entry", "Close", "P&L", "Status"].map((h) => (
-              <div key={h} className="label-xs">{h}</div>
-            ))}
+      <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+        <div className="space-y-1">
+          <div className="inline-flex items-center gap-2 rounded-full border border-gold-500/20 bg-gold-500/8 px-3 py-1 text-[11px] font-semibold text-gold-400">
+            <Target className="h-3.5 w-3.5" />
+            Trade Tracking Console
           </div>
-          {/* Rows */}
-          {closed.map((t, i) => (
-            <motion.div
-              key={t.id}
-              initial={{ opacity: 0, x: -8 }}
-              animate={{ opacity: 1, x: 0 }}
-              transition={{ delay: i * 0.04 }}
-              className="grid grid-cols-[2fr_1fr_1fr_1fr_1fr_1fr_1fr] gap-2 px-4 py-3 border-b border-ap-border/50 last:border-0 hover:bg-ap-surface transition-colors items-center"
-            >
-              <div className="num text-xs text-muted-foreground">{t.id}</div>
-              <div>
-                <span className={cn("inline-flex items-center justify-center px-1.5 py-0.5 rounded text-[10px] font-bold border", t.type === "A" ? "badge-a" : t.type === "V" ? "badge-v" : "badge-gap")}>
-                  {t.type}
-                </span>
-              </div>
-              <div className={cn("flex items-center gap-0.5 text-xs font-semibold", t.dir === "BUY" ? "text-buy" : "text-sell")}>
-                {t.dir === "BUY" ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
-                {t.dir}
-              </div>
-              <div className="num text-xs text-foreground">{t.entry.toFixed(2)}</div>
-              <div className="num text-xs text-foreground">{t.close?.toFixed(2) ?? "—"}</div>
-              <div className={cn("num text-xs font-semibold", t.pnl != null ? (t.pnl >= 0 ? "text-buy" : "text-sell") : "text-muted-foreground")}>
-                {t.pnl != null ? `${t.pnl >= 0 ? "+" : ""}$${Math.abs(t.pnl).toFixed(0)}` : "—"}
-              </div>
-              <div>
-                <Badge variant={t.pnl != null && t.pnl >= 0 ? "buy" : "sell"} className="text-[10px]">
-                  {t.pnl != null && t.pnl >= 0 ? "Win" : "Loss"}
-                </Badge>
-              </div>
-            </motion.div>
-          ))}
-        </Card>
+          <h1 className="text-xl font-bold text-foreground md:text-2xl">Trades</h1>
+          <p className="max-w-2xl text-sm text-muted-foreground">Track active and historical trades from the real bot data flow.</p>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+          <Metric label="Active" value={String(stats.active)} accent="gold" />
+          <Metric label="History" value={String(stats.history)} accent="muted" />
+          <Metric label="Win Rate" value={stats.winRate} accent="buy" />
+          <Metric label="Net Pips" value={stats.netPips} accent={stats.netPips.startsWith("-") ? "sell" : "buy"} />
+        </div>
       </div>
+
+      <Section
+        title="Active Trades"
+        subtitle="Open positions and managed runners."
+        loading={activeQuery.isLoading}
+        error={activeQuery.error instanceof Error ? activeQuery.error.message : null}
+        empty={!activeTrades.length}
+      >
+        <TradeTable trades={activeTrades} selectedUuid={selectedTrade?.uuid ?? null} onSelect={setSelectedUuid} />
+      </Section>
+
+      <Section
+        title="Trade History"
+        subtitle="Closed trades, results, and realized pip outcomes."
+        loading={closedQuery.isLoading}
+        error={closedQuery.error instanceof Error ? closedQuery.error.message : null}
+        empty={!closedTrades.length}
+      >
+        <TradeTable trades={closedTrades} selectedUuid={selectedTrade?.uuid ?? null} onSelect={setSelectedUuid} history />
+      </Section>
+
+      <Card className="sticky top-5">
+        <CardHeader className="pb-3">
+          <CardTitle>Trade Detail</CardTitle>
+          <CardDescription>Timeline-style summary using the fields already stored by the bot.</CardDescription>
+        </CardHeader>
+        <CardContent className="pt-0">
+          {!selectedTrade ? (
+            <State label="Select a trade to inspect its details." />
+          ) : (
+            <div className="space-y-4">
+              <div className="rounded-xl border border-ap-border bg-ap-surface/35 p-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="num text-lg font-bold text-foreground">{selectedTrade.pair}</span>
+                      <Badge variant={selectedTrade.direction === "BUY" ? "buy" : "sell"} className="text-[10px]">
+                        {selectedTrade.direction}
+                      </Badge>
+                    </div>
+                    <div className="mt-1 text-[11px] text-muted-foreground">
+                      {selectedTrade.higher_tf ?? "--"} {"->"} {selectedTrade.lower_tf ?? "--"} | {selectedTrade.confirmation_type ?? "manual"}
+                    </div>
+                  </div>
+                  <Badge variant="gold" className="text-[10px]">{selectedTrade.status}</Badge>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+                <Meta label="Entry" value={selectedTrade.entry_price?.toFixed(2) ?? "--"} mono />
+                <Meta label="SL" value={selectedTrade.sl_price?.toFixed(2) ?? "--"} mono tone="sell" />
+                <Meta label="TP1" value={selectedTrade.tp1?.toFixed(2) ?? "--"} mono tone="buy" />
+                <Meta label="TP2 / TP3" value={`${selectedTrade.tp2?.toFixed(2) ?? "--"} / ${selectedTrade.tp3?.toFixed(2) ?? "--"}`} mono />
+              </div>
+
+              <div className="rounded-xl border border-ap-border bg-ap-surface/35 p-4">
+                <div className="flex items-center justify-between">
+                  <span className="label-xs">TP Progress</span>
+                  <span className="num text-xs font-semibold text-gold-400">{selectedTrade.tp_progress_reached ?? 0}/3</span>
+                </div>
+                <div className="mt-2 h-2 rounded-full bg-ap-border overflow-hidden">
+                  <div className="h-full rounded-full bg-gold-500" style={{ width: `${Math.min(((selectedTrade.tp_progress_reached ?? 0) / 3) * 100, 100)}%` }} />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <Meta label="Activated" value={selectedTrade.activated_at ? new Date(selectedTrade.activated_at).toLocaleString() : "--"} />
+                <Meta label="Closed" value={selectedTrade.closed_at ? new Date(selectedTrade.closed_at).toLocaleString() : "Still active"} />
+                <Meta label="Realized / Unrealized" value={`${selectedTrade.realized_pips?.toFixed(1) ?? "--"}p`} mono tone={(selectedTrade.realized_pips ?? 0) >= 0 ? "buy" : "sell"} />
+                <Meta label="Final Result" value={selectedTrade.result ?? selectedTrade.status} />
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
     </div>
   )
 }
 
-function TradeRow({ trade }: { trade: (typeof TRADES)[number] }) {
+function Section({
+  title,
+  subtitle,
+  loading,
+  error,
+  empty,
+  children,
+}: {
+  title: string
+  subtitle: string
+  loading: boolean
+  error: string | null
+  empty: boolean
+  children: React.ReactNode
+}) {
   return (
-    <Card className="border-buy-border bg-buy-dim/30">
-      <CardContent className="pt-3 pb-3">
-        <div className="flex items-center justify-between gap-4 flex-wrap">
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full bg-buy animate-pulse" />
-              <span className="text-xs font-semibold text-buy">LIVE</span>
-            </div>
-            <span className={cn("inline-flex items-center justify-center px-1.5 py-0.5 rounded text-[10px] font-bold border", trade.type === "V" ? "badge-v" : "badge-a")}>
-              {trade.type}
-            </span>
-            <div className={cn("flex items-center gap-0.5 text-xs font-semibold", trade.dir === "BUY" ? "text-buy" : "text-sell")}>
-              {trade.dir === "BUY" ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
-              {trade.dir}
-            </div>
-          </div>
-          <div className="flex items-center gap-6">
-            <MetaItem label="Entry" value={trade.entry.toFixed(2)} />
-            <MetaItem label="SL" value={trade.sl.toFixed(2)} valueClass="text-sell" />
-            <MetaItem label="TP" value={trade.tp.toFixed(2)} valueClass="text-buy" />
-            <MetaItem label="R:R" value={trade.rr} valueClass="text-gold-400" />
-          </div>
-          <span className="text-[10px] text-muted-foreground">{trade.opened}</span>
-        </div>
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle>{title}</CardTitle>
+        <CardDescription>{subtitle}</CardDescription>
+      </CardHeader>
+      <CardContent className="pt-0">
+        {loading ? <State label="Loading trades..." /> : null}
+        {!loading && error ? <State label={error} tone="error" /> : null}
+        {!loading && !error && empty ? <State label="No trades available in this section." /> : null}
+        {!loading && !error && !empty ? children : null}
       </CardContent>
     </Card>
   )
 }
 
-function MetaItem({ label, value, valueClass = "text-foreground" }: { label: string; value: string; valueClass?: string }) {
+function TradeTable({
+  trades,
+  selectedUuid,
+  onSelect,
+  history = false,
+}: {
+  trades: TradeRow[]
+  selectedUuid: string | null
+  onSelect: (uuid: string | null) => void
+  history?: boolean
+}) {
   return (
-    <div>
+    <div className="space-y-3">
+      {trades.map((trade) => (
+        <button
+          key={trade.uuid ?? trade.id}
+          type="button"
+          onClick={() => onSelect(trade.uuid ?? null)}
+          className={cn(
+            "w-full rounded-xl border p-4 text-left transition-all",
+            selectedUuid === trade.uuid ? "border-gold-500/35 bg-gold-500/5" : "border-ap-border bg-ap-surface/35 hover:bg-ap-surface/55"
+          )}
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="num text-sm font-bold text-foreground">{trade.pair}</span>
+                <Badge variant={trade.direction === "BUY" ? "buy" : "sell"} className="text-[10px]">
+                  {trade.direction}
+                </Badge>
+                <Badge variant="gold" className="text-[10px]">{trade.status}</Badge>
+              </div>
+              <div className="grid grid-cols-2 gap-2 text-[11px] text-muted-foreground sm:grid-cols-4">
+                <span>Entry <span className="num text-foreground">{trade.entry_price?.toFixed(2) ?? "--"}</span></span>
+                <span>TP1 <span className="num text-buy">{trade.tp1?.toFixed(2) ?? "--"}</span></span>
+                <span>{history ? "Result" : "Progress"} <span className="text-foreground">{history ? trade.result ?? trade.status : `${trade.tp_progress_reached ?? 0}/3`}</span></span>
+                <span>Pips <span className={cn("num", (trade.realized_pips ?? 0) >= 0 ? "text-buy" : "text-sell")}>{trade.realized_pips?.toFixed(1) ?? "--"}</span></span>
+              </div>
+            </div>
+            <ChevronRight className="h-4 w-4 text-muted-foreground/40" />
+          </div>
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function Metric({ label, value, accent }: { label: string; value: string; accent: "gold" | "buy" | "sell" | "muted" }) {
+  const color = accent === "buy" ? "text-buy" : accent === "sell" ? "text-sell" : accent === "gold" ? "text-gold-400" : "text-foreground"
+  return (
+    <Card>
+      <CardContent className="py-4">
+        <div className="label-xs">{label}</div>
+        <div className={cn("num mt-2 text-lg font-bold", color)}>{value}</div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function Meta({ label, value, mono, tone }: { label: string; value: string; mono?: boolean; tone?: "buy" | "sell" }) {
+  return (
+    <div className="rounded-lg border border-ap-border bg-ap-surface/35 px-3 py-2">
       <div className="label-xs">{label}</div>
-      <div className={cn("num text-xs font-semibold mt-0.5", valueClass)}>{value}</div>
+      <div className={cn("mt-1 text-xs font-semibold text-foreground", mono && "num", tone === "buy" && "text-buy", tone === "sell" && "text-sell")}>{value}</div>
+    </div>
+  )
+}
+
+function State({ label, tone = "muted" }: { label: string; tone?: "muted" | "error" }) {
+  return (
+    <div className="rounded-xl border border-ap-border bg-ap-surface/35 px-4 py-10 text-center">
+      <p className={cn("text-sm", tone === "error" ? "text-sell" : "text-muted-foreground")}>{label}</p>
     </div>
   )
 }

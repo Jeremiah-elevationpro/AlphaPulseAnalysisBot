@@ -25,9 +25,10 @@ from config.settings import (
 )
 from db.models import Trade
 from utils.helpers import price_to_pips, trade_direction_emoji
-from utils.logger import get_logger
+from utils.logger import get_logger, get_runtime_logger
 
 logger = get_logger(__name__)
+runtime_logger = get_runtime_logger()
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -114,6 +115,20 @@ class TelegramBot:
             logger.error("Telegram send failed: %s", e)
             return False
 
+    def _send_logged(self, event_label: str, message: str, parse_mode: str = "Markdown") -> bool:
+        runtime_logger.info("TELEGRAM %s SEND ATTEMPT", event_label)
+        try:
+            ok = self.send(message, parse_mode=parse_mode)
+        except Exception as exc:
+            runtime_logger.info("TELEGRAM %s SEND FAILED: error=%s", event_label, exc)
+            return False
+
+        if ok:
+            runtime_logger.info("TELEGRAM %s SEND SUCCESS", event_label)
+        else:
+            runtime_logger.info("TELEGRAM %s SEND FAILED: error=send_returned_false", event_label)
+        return ok
+
     @staticmethod
     def _strip_markdown(message: str) -> str:
         cleaned = message
@@ -163,7 +178,7 @@ class TelegramBot:
             f"Confidence: `{trade.confidence * 100:.0f}%` | Score: {score_str}\n\n"
             f"_Price reacting at high-probability zone. Waiting for confirmation._"
         )
-        return self.send(msg)
+        return self._send_logged("SETUP ALERT", msg)
 
     # ─────────────────────────────────────────────────────
     # ALERT TYPE 3 — WATCH LEVEL (price approaching)
@@ -232,7 +247,7 @@ class TelegramBot:
             f"Why: {reason_line}\n\n"
             f"_No entry yet. Waiting for price to reach the zone and complete confirmation._"
         )
-        return self.send(msg)
+        return self._send_logged("WATCHLIST", msg)
 
     def send_watchlist_setup(
         self,
@@ -368,7 +383,7 @@ class TelegramBot:
             f"Bias: {bias}\n\n"
             f"Status: Waiting for retest entry"
         )
-        return self.send(msg, parse_mode=None)
+        return self._send_logged("PENDING ORDER ALERT", msg, parse_mode=None)
 
     # ─────────────────────────────────────────────────────
     # INTERNAL — trade registered for simulated tracking
@@ -384,6 +399,12 @@ class TelegramBot:
         logger.debug(
             "Trade activated for tracking: %s %s @ %.2f (no Telegram — pending alert already sent)",
             trade.direction, trade.pair, trade.entry_price,
+        )
+        runtime_logger.info(
+            "TELEGRAM TRADE ACTIVATED ALERT SEND SUCCESS: tracking only | %s %s @ %.2f",
+            trade.direction,
+            trade.pair,
+            trade.entry_price,
         )
         return True
 
@@ -434,7 +455,7 @@ class TelegramBot:
                 f"Entry: {trade.entry_price:.2f}\n"
                 f"Current Price: {price_line:.2f}"
             )
-            return self.send(msg, parse_mode=None)
+            return self._send_logged("TP ALERT", msg, parse_mode=None)
         else:
             result_line = "STRONG WIN ✅✅"
             be_note     = ""
@@ -449,7 +470,7 @@ class TelegramBot:
             f"{rem_note}\n"
             f"🆔 `{trade.trade_uuid[:8]}`"
         )
-        return self.send(msg)
+        return self._send_logged("TP ALERT", msg)
 
     def _send_sl_hit(self, trade: Trade) -> bool:
         pips_lost  = price_to_pips(abs(trade.sl_price - trade.entry_price))
@@ -462,7 +483,7 @@ class TelegramBot:
                 f"TPs reached: `{tps_banked}/5`\n"
                 f"🆔 `{trade.trade_uuid[:8]}`"
             )
-            return self.send(msg)
+            return self._send_logged("SL ALERT", msg)
         be_note    = " _(BE — no monetary loss)_" if trade.be_moved else ""
 
         msg = (
@@ -472,7 +493,7 @@ class TelegramBot:
             f"TPs banked: `{tps_banked}/5`\n"
             f"🆔 `{trade.trade_uuid[:8]}`"
         )
-        return self.send(msg)
+        return self._send_logged("SL ALERT", msg)
 
     def _send_completed(self, trade: Trade) -> bool:
         dir_emoji = trade_direction_emoji(trade.direction)
@@ -481,7 +502,7 @@ class TelegramBot:
             f"All 5 targets reached\n"
             f"🆔 `{trade.trade_uuid[:8]}`"
         )
-        return self.send(msg)
+        return self._send_logged("TP ALERT", msg)
 
     # ─────────────────────────────────────────────────────
     # ALERT TYPE 1 — STARTUP  /  ALERT TYPE 6 — SHUTDOWN
@@ -491,28 +512,70 @@ class TelegramBot:
     def send_startup(self) -> bool:
         """Send two messages: bot online, then analysis phase notice."""
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-        self.send(
+        ok1 = self.send(
             f"🚀 *AlphaPulse started successfully* — `{now}`\n"
             f"XAUUSD | Manual execution mode\n"
             f"_Analysis engine online._"
         )
-        return self.send(
+        ok2 = self.send(
             f"🔍 *Analyzing charts...* please wait for setups.\n"
             f"_Running multi-timeframe scan — first alerts in ~5 minutes._"
         )
+        if ok1 and ok2:
+            runtime_logger.info("TELEGRAM SEND SUCCESS: STARTUP")
+        else:
+            runtime_logger.info("TELEGRAM SEND FAILED: STARTUP")
+        return ok2
 
     def send_shutdown(self) -> bool:
         now = datetime.utcnow().strftime("%H:%M UTC")
-        return self.send(
+        ok = self.send(
             f"🔴 *AlphaPulse stopped* — `{now}`\n"
             f"_No further alerts until restart._"
         )
+        if ok:
+            runtime_logger.info("TELEGRAM SEND SUCCESS: SHUTDOWN")
+        else:
+            runtime_logger.info("TELEGRAM SEND FAILED: SHUTDOWN")
+        return ok
+
+    def send_bot_stopped_alert(self) -> bool:
+        """API safety-net stop alert — fires even if bot process was hard-killed."""
+        now = datetime.utcnow().strftime("%H:%M UTC")
+        ok = self.send(
+            f"🔴 *Spencer stopped successfully* — `{now}`\n"
+            f"_AlphaPulse engine offline._"
+        )
+        if ok:
+            runtime_logger.info("TELEGRAM SEND SUCCESS: BOT STOPPED ALERT")
+        else:
+            runtime_logger.info("TELEGRAM SEND FAILED: BOT STOPPED ALERT")
+        return ok
+
+    def send_bot_error_alert(self, reason: str = "") -> bool:
+        """Alert when the bot process exits unexpectedly."""
+        now = datetime.utcnow().strftime("%H:%M UTC")
+        detail = f"\n_Reason: {reason}_" if reason else ""
+        ok = self.send(
+            f"⚠️ *Spencer encountered an error* — `{now}`\n"
+            f"_AlphaPulse engine requires attention._{detail}"
+        )
+        if ok:
+            runtime_logger.info("TELEGRAM SEND SUCCESS: BOT ERROR ALERT")
+        else:
+            runtime_logger.info("TELEGRAM SEND FAILED: BOT ERROR ALERT")
+        return ok
 
     def send_system_alert(self, message: str) -> bool:
         now = datetime.utcnow().strftime("%H:%M UTC")
-        return self.send(
+        ok = self.send(
             f"⚠️ *System Alert* `{now}`\n{message}"
         )
+        if ok:
+            runtime_logger.info("TELEGRAM SEND SUCCESS: SYSTEM ALERT")
+        else:
+            runtime_logger.info("TELEGRAM SEND FAILED: SYSTEM ALERT")
+        return ok
 
     # ─────────────────────────────────────────────────────
     # HELPERS
