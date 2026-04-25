@@ -108,6 +108,7 @@ class LearningEngine:
         bias_gate_result: str = "",
         pd_location: str = "",
         realized_pips: float = 0.0,
+        strategy_type: str = "gap_sweep",
     ):
         """
         Update all reward dimensions for a closed trade, then recompute
@@ -164,7 +165,7 @@ class LearningEngine:
             session_name=session_name,
         )
 
-        strategy_key  = "lsd" if setup_type in ("lsd_swing", "lsd_scalp") else "default"
+        strategy_key  = strategy_type or ("lsd" if setup_type in ("lsd_swing", "lsd_scalp") else "gap_sweep")
 
         self._primary.update(primary_key, reward)
         self._secondary.update(secondary_key, reward)
@@ -215,8 +216,9 @@ class LearningEngine:
 
         logger.info(
             "Learning update [%s|%s] result=%s setup=%s session=%s "
-            "| micro=%s bias_gate=%s pd=%s | reward=%+.2f | ema=%.2f (n=%d) | confidence → %.0f%%",
+            "| strategy=%s micro=%s bias_gate=%s pd=%s | reward=%+.2f | ema=%.2f (n=%d) | confidence → %.0f%%",
             level_type, tf_pair, result, setup_type, session_name or "off",
+            strategy_key,
             micro_confirmation_type or "unknown",
             bias_gate_result or "unknown",
             pd_location or "unknown",

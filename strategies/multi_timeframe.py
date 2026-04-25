@@ -217,6 +217,17 @@ class SetupResult:
     engulfing_bonus: float = 0.0
     high_quality_trade: bool = False
     micro_strength: str = "normal"
+    strategy_type: str = "gap_sweep"
+    source: str = "live_bot"
+    dominant_bias: str = "neutral"
+    quality_rejection_count: int = 0
+    structure_break_count: int = 0
+    confirmation_score: float = 0.0
+    confirmation_path: str = ""
+    revisit_time: Optional[datetime] = None
+    confirmation_time: Optional[datetime] = None
+    confirmation_candles_used: int = 0
+    confluence_with: List[str] = field(default_factory=list)
 
     # Opposing structural levels — used by signal_gen for TP clearance check (Filter 5)
     opposing_levels: List[LevelInfo] = field(default_factory=list)
@@ -881,6 +892,7 @@ class MultiTimeframeAnalyzer:
                         session_name=ctx.session_name,
                         h4_bias=dominant_bias,
                         bias_strength=bias_strength,
+                        dominant_bias=dominant_bias,
                         trend_aligned=trend_aligned,
                         opposing_levels=opp,
                     )

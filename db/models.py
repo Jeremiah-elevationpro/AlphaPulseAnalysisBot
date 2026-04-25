@@ -76,6 +76,16 @@ class Trade:
     pd_location: str = ""
     high_quality_trade: bool = False
     micro_strength: str = "normal"
+    strategy_type: str = "gap_sweep"
+    source: str = "live_bot"
+    dominant_bias: str = ""
+    bias_strength: str = "weak"
+    confirmation_score: float = 0.0
+    confirmation_path: str = ""
+    quality_rejection_count: int = 0
+    structure_break_count: int = 0
+    level_timeframe: str = ""
+    confluence_with: List[str] = field(default_factory=list)
     realized_pips: float = 0.0
 
     # Auto-generated
@@ -152,6 +162,16 @@ class Trade:
             "h4_bias": self.h4_bias,
             "trend_aligned": self.trend_aligned,
             "confirmation_type": self.confirmation_type,
+            "strategy_type": self.strategy_type,
+            "source": self.source,
+            "dominant_bias": self.dominant_bias,
+            "bias_strength": self.bias_strength,
+            "confirmation_score": self.confirmation_score,
+            "confirmation_path": self.confirmation_path,
+            "quality_rejection_count": self.quality_rejection_count,
+            "structure_break_count": self.structure_break_count,
+            "level_timeframe": self.level_timeframe,
+            "confluence_with": ",".join(self.confluence_with) if self.confluence_with else "",
             "tp_progress_reached": self.hit_count,
             "protected_after_tp1": self.protected_after_tp1,
             "tp1_alert_sent": self.tp1_alert_sent,

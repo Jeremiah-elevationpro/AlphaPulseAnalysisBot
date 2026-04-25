@@ -473,6 +473,7 @@ class TradeManager:
                 bias_gate_result=getattr(trade, "bias_gate_result", ""),
                 pd_location=getattr(trade, "pd_location", ""),
                 realized_pips=getattr(trade, "realized_pips", 0.0),
+                strategy_type=getattr(trade, "strategy_type", "gap_sweep"),
             )
             logger.info("Learning engine updated: %s %s|%s → %s (%d TPs)",
                         trade.level_type, trade.higher_tf, trade.lower_tf,

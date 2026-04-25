@@ -89,12 +89,13 @@ export default function Trades() {
                   <div>
                     <div className="flex items-center gap-2">
                       <span className="num text-lg font-bold text-foreground">{selectedTrade.pair}</span>
+                      <Badge variant="purple" className="text-[10px]">{formatStrategy(selectedTrade.strategy_type)}</Badge>
                       <Badge variant={selectedTrade.direction === "BUY" ? "buy" : "sell"} className="text-[10px]">
                         {selectedTrade.direction}
                       </Badge>
                     </div>
                     <div className="mt-1 text-[11px] text-muted-foreground">
-                      {selectedTrade.higher_tf ?? "--"} {"->"} {selectedTrade.lower_tf ?? "--"} | {selectedTrade.confirmation_type ?? "manual"}
+                      {selectedTrade.higher_tf ?? "--"} {"->"} {selectedTrade.lower_tf ?? "--"} | {selectedTrade.confirmation_type ?? "manual"} | {selectedTrade.session_name ?? "--"}
                     </div>
                   </div>
                   <Badge variant="gold" className="text-[10px]">{selectedTrade.status}</Badge>
@@ -123,6 +124,10 @@ export default function Trades() {
                 <Meta label="Closed" value={selectedTrade.closed_at ? new Date(selectedTrade.closed_at).toLocaleString() : "Still active"} />
                 <Meta label="Realized / Unrealized" value={`${selectedTrade.realized_pips?.toFixed(1) ?? "--"}p`} mono tone={(selectedTrade.realized_pips ?? 0) >= 0 ? "buy" : "sell"} />
                 <Meta label="Final Result" value={selectedTrade.result ?? selectedTrade.status} />
+                <Meta label="Bias" value={`${selectedTrade.dominant_bias ?? selectedTrade.h4_bias ?? "--"} / ${selectedTrade.bias_strength ?? "--"}`} />
+                <Meta label="Conf Score" value={selectedTrade.confirmation_score != null ? `${selectedTrade.confirmation_score}` : "--"} />
+                <Meta label="Quality Rejects" value={selectedTrade.quality_rejection_count != null ? `${selectedTrade.quality_rejection_count}` : "--"} />
+                <Meta label="Structure Breaks" value={selectedTrade.structure_break_count != null ? `${selectedTrade.structure_break_count}` : "--"} />
               </div>
             </div>
           )}
@@ -190,6 +195,7 @@ function TradeTable({
             <div className="space-y-2">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="num text-sm font-bold text-foreground">{trade.pair}</span>
+                <Badge variant="purple" className="text-[10px]">{formatStrategy(trade.strategy_type)}</Badge>
                 <Badge variant={trade.direction === "BUY" ? "buy" : "sell"} className="text-[10px]">
                   {trade.direction}
                 </Badge>
@@ -208,6 +214,10 @@ function TradeTable({
       ))}
     </div>
   )
+}
+
+function formatStrategy(value?: string | null) {
+  return (value ?? "gap_sweep").replace(/_/g, " ")
 }
 
 function Metric({ label, value, accent }: { label: string; value: string; accent: "gold" | "buy" | "sell" | "muted" }) {

@@ -11,5 +11,7 @@ import os
 os.environ.setdefault("ALPHAPULSE_REPLAY_MODE", "1")
 
 from historical_replay.engine import HistoricalReplayEngine
+from historical_replay.engulfing_research import EngulfingResearchEngine
+from historical_replay.break_retest_research import BreakRetestResearchEngine
 
-__all__ = ["HistoricalReplayEngine"]
+__all__ = ["HistoricalReplayEngine", "EngulfingResearchEngine", "BreakRetestResearchEngine"]

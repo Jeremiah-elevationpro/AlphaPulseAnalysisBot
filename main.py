@@ -40,6 +40,7 @@ from config.settings import (
     ACTIVE_TIMEFRAME_PAIR_LABELS, DISABLED_TIMEFRAME_PAIRS,
     SEND_NO_SETUP_STATUS_ALERT, NO_SETUP_STATUS_INTERVAL_MINUTES,
     BOT_ACTIVE_START_HOUR, BOT_ACTIVE_END_HOUR,
+    ENGULF_ALLOWED_LIVE_TIMEFRAMES, LIVE_ENABLED_STRATEGIES,
 )
 from data.mt5_client import MT5Client
 from strategies.strategy_manager import StrategyManager
@@ -437,9 +438,10 @@ class AlphaPulse:
                         _strat_score   = _sig_score_obj.raw_score / 100.0 if _sig_score_obj else 0.5
 
                         logger.info(
-                            "FIRST REJECTION CONFIRMED: %s %s | level=%.2f | %s rejection closed correctly | pending order ready",
+                            "FIRST REJECTION CONFIRMED: %s %s | strategy=%s | level=%.2f | %s rejection closed correctly | pending order ready",
                             trade.direction,
                             trade.pair,
+                            getattr(trade, "strategy_type", "gap_sweep"),
                             trade.entry_price,
                             trade.lower_tf,
                         )
@@ -449,9 +451,10 @@ class AlphaPulse:
                         alert_sent = self.telegram.send_confirmation(trade, strategy_score=_strat_score)
                         if alert_sent:
                             logger.info(
-                                "PENDING ORDER ALERT SENT: %s %s | entry=%.2f | SL=%.2f | TP1=%.2f",
+                                "PENDING ORDER ALERT SENT: %s %s | strategy=%s | entry=%.2f | SL=%.2f | TP1=%.2f",
                                 trade.direction,
                                 trade.pair,
+                                getattr(trade, "strategy_type", "gap_sweep"),
                                 trade.entry_price,
                                 trade.sl_price,
                                 trade.tp1,
@@ -461,8 +464,9 @@ class AlphaPulse:
                         self.trade_mgr.register_trade(trade)
 
                         logger.info(
-                            "Pending order dispatched: %s %s @ %.2f | SL %.2f (%dp) | Conf %.0f%%",
+                            "Pending order dispatched: %s %s @ %.2f | strategy=%s | SL %.2f (%dp) | Conf %.0f%%",
                             trade.direction, trade.pair, trade.entry_price,
+                            getattr(trade, "strategy_type", "gap_sweep"),
                             trade.sl_price,
                             int(abs(trade.entry_price - trade.sl_price)),
                             trade.confidence * 100,
@@ -610,6 +614,7 @@ class AlphaPulse:
                 "local_time":           getattr(ctx, "local_time", "") if ctx else "",
                 "active_until":         getattr(ctx, "active_until", f"{BOT_ACTIVE_END_HOUR:02d}:00") if ctx else f"{BOT_ACTIVE_END_HOUR:02d}:00",
                 "last_market_update_at": datetime.now(timezone.utc).isoformat(),
+                "live_enabled_strategies": list(LIVE_ENABLED_STRATEGIES),
             }
             self._heartbeat_file.write_text(json.dumps(data), encoding="utf-8")
         except Exception as exc:
@@ -1222,14 +1227,16 @@ class AlphaPulse:
 
     @staticmethod
     def _is_active_tf_pair(tf_pair: str) -> bool:
-        return (
+        normalized = (
             str(tf_pair)
             .replace("->", "-")
             .replace("→", "-")
             .replace("â†’", "-")
             .replace(" ", "")
-            in ACTIVE_TIMEFRAME_PAIR_LABELS
         )
+        if normalized in ACTIVE_TIMEFRAME_PAIR_LABELS:
+            return True
+        return normalized in {f"{tf}-{tf}" for tf in ENGULF_ALLOWED_LIVE_TIMEFRAMES}
 
     @staticmethod
     def _watchlist_horizon(tf_pair: str) -> str:

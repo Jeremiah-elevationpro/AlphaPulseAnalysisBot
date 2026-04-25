@@ -77,6 +77,11 @@ from config.settings import (
     AV_TOUCH_COUNT_PENALTY_PER,
     AV_ORIGIN_DISPLACEMENT_STRONG_PIPS,
     AV_ORIGIN_DISPLACEMENT_BONUS,
+    GAP_REJECTION_WICK_TO_BODY_MIN,
+    GAP_REJECTION_WICK_RANGE_PCT_MIN,
+    GAP_REJECTION_MIN_BODY_PIPS,
+    GAP_REJECTION_PUSH_AWAY_PIPS,
+    DEBUG_REJECTION_TRACE,
 )
 from utils.logger import get_logger
 
@@ -119,6 +124,15 @@ class LevelInfo:
     accepted_reasons: List[str] = field(default_factory=list)
     rejected_reasons: List[str] = field(default_factory=list)
     origin_index: int = -1
+    historical_rejection_count: int = 0
+    quality_rejection_count: int = 0
+    avg_rejection_wick_ratio: float = 0.0
+    avg_push_away_pips: float = 0.0
+    strongest_rejection_pips: float = 0.0
+    rejection_quality_score: float = 0.0
+    wick_ratio_pass_count: int = 0
+    wick_percent_pass_count: int = 0
+    strong_push_pass_count: int = 0
 
     def __repr__(self):
         return (
@@ -153,6 +167,10 @@ class LevelDetector:
         # Reset at the start of each detect_recent_legs call; appended by
         # detect_previous_leg. MultiTimeframeAnalyzer reads this for diversity selection.
         self._rejected_av_candidates: List[LevelInfo] = []
+
+    @staticmethod
+    def _gap_push_min_pips(timeframe: str) -> float:
+        return float(GAP_REJECTION_PUSH_AWAY_PIPS.get(timeframe, 20.0))
 
     # ─────────────────────────────────────────────────────
     # PUBLIC API
@@ -910,8 +928,22 @@ class LevelDetector:
                 if not self._is_range_extreme(df, midpoint, i):
                     continue
 
-                touch_count, break_count, retested, return_dist = self._gap_state(
-                    df, midpoint, zone_low, zone_high, "BUY", i, tol
+                (
+                    touch_count,
+                    break_count,
+                    retested,
+                    return_dist,
+                    historical_rejection_count,
+                    quality_rejection_count,
+                    avg_rejection_wick_ratio,
+                    avg_push_away_pips,
+                    strongest_rejection_pips,
+                    rejection_quality_score,
+                    wick_ratio_pass_count,
+                    wick_percent_pass_count,
+                    strong_push_pass_count,
+                ) = self._gap_state(
+                    df, timeframe, midpoint, zone_low, zone_high, "BUY", i, tol
                 )
                 if break_count > MAX_LEVEL_BREAKS or touch_count > MAX_LEVEL_TOUCHES:
                     continue
@@ -923,6 +955,8 @@ class LevelDetector:
                     touch_count=touch_count,
                     retested=retested,
                     return_distance_pips=return_dist,
+                    quality_rejection_count=quality_rejection_count,
+                    rejection_quality_score=rejection_quality_score,
                     is_psychological=_quick_psych_check(midpoint)[0],
                     psych_strength=_quick_psych_check(midpoint)[1],
                     h4_aligned=h4_bias in ("bullish", "neutral"),
@@ -959,8 +993,18 @@ class LevelDetector:
                     accepted_reasons=[
                         "clean bullish imbalance",
                         f"gap {gap_pips:.0f}p / impulse {impulse_pips:.0f}p",
+                        f"quality rejections {quality_rejection_count}",
                     ],
                     origin_index=i,
+                    historical_rejection_count=historical_rejection_count,
+                    quality_rejection_count=quality_rejection_count,
+                    avg_rejection_wick_ratio=round(avg_rejection_wick_ratio, 2),
+                    avg_push_away_pips=round(avg_push_away_pips, 1),
+                    strongest_rejection_pips=round(strongest_rejection_pips, 1),
+                    rejection_quality_score=round(rejection_quality_score, 1),
+                    wick_ratio_pass_count=wick_ratio_pass_count,
+                    wick_percent_pass_count=wick_percent_pass_count,
+                    strong_push_pass_count=strong_push_pass_count,
                 )
                 levels.append(lvl)
                 logger.info(
@@ -984,8 +1028,22 @@ class LevelDetector:
                 if not self._is_range_extreme(df, midpoint, i):
                     continue
 
-                touch_count, break_count, retested, return_dist = self._gap_state(
-                    df, midpoint, zone_low, zone_high, "SELL", i, tol
+                (
+                    touch_count,
+                    break_count,
+                    retested,
+                    return_dist,
+                    historical_rejection_count,
+                    quality_rejection_count,
+                    avg_rejection_wick_ratio,
+                    avg_push_away_pips,
+                    strongest_rejection_pips,
+                    rejection_quality_score,
+                    wick_ratio_pass_count,
+                    wick_percent_pass_count,
+                    strong_push_pass_count,
+                ) = self._gap_state(
+                    df, timeframe, midpoint, zone_low, zone_high, "SELL", i, tol
                 )
                 if break_count > MAX_LEVEL_BREAKS or touch_count > MAX_LEVEL_TOUCHES:
                     continue
@@ -997,6 +1055,8 @@ class LevelDetector:
                     touch_count=touch_count,
                     retested=retested,
                     return_distance_pips=return_dist,
+                    quality_rejection_count=quality_rejection_count,
+                    rejection_quality_score=rejection_quality_score,
                     is_psychological=_quick_psych_check(midpoint)[0],
                     psych_strength=_quick_psych_check(midpoint)[1],
                     h4_aligned=h4_bias in ("bearish", "neutral"),
@@ -1033,8 +1093,18 @@ class LevelDetector:
                     accepted_reasons=[
                         "clean bearish imbalance",
                         f"gap {gap_pips:.0f}p / impulse {impulse_pips:.0f}p",
+                        f"quality rejections {quality_rejection_count}",
                     ],
                     origin_index=i,
+                    historical_rejection_count=historical_rejection_count,
+                    quality_rejection_count=quality_rejection_count,
+                    avg_rejection_wick_ratio=round(avg_rejection_wick_ratio, 2),
+                    avg_push_away_pips=round(avg_push_away_pips, 1),
+                    strongest_rejection_pips=round(strongest_rejection_pips, 1),
+                    rejection_quality_score=round(rejection_quality_score, 1),
+                    wick_ratio_pass_count=wick_ratio_pass_count,
+                    wick_percent_pass_count=wick_percent_pass_count,
+                    strong_push_pass_count=strong_push_pass_count,
                 )
                 levels.append(lvl)
                 logger.info(
@@ -1139,6 +1209,8 @@ class LevelDetector:
         touch_count: int,
         retested: bool,
         return_distance_pips: float,
+        quality_rejection_count: int,
+        rejection_quality_score: float,
         is_psychological: bool,
         psych_strength: str,
         h4_aligned: bool,
@@ -1206,6 +1278,24 @@ class LevelDetector:
             b["trend"] = 3
         else:
             b["trend"] = 0
+
+        if quality_rejection_count >= 5:
+            b["rejection"] = 10
+        elif quality_rejection_count == 4:
+            b["rejection"] = 8
+        elif quality_rejection_count == 3:
+            b["rejection"] = 6
+        elif quality_rejection_count == 2:
+            b["rejection"] = 3
+        elif quality_rejection_count == 1:
+            b["rejection"] = 1
+        else:
+            b["rejection"] = 0
+
+        if rejection_quality_score >= 80:
+            b["rej_q"] = 2
+        elif rejection_quality_score >= 60:
+            b["rej_q"] = 1
 
         total = float(sum(b.values()))
         return min(100.0, total), b
@@ -1304,26 +1394,29 @@ class LevelDetector:
     @staticmethod
     def _gap_state(
         df: pd.DataFrame,
+        timeframe: str,
         midpoint: float,
         zone_low: float,
         zone_high: float,
         trade_direction: str,
         formation_idx: int,
         tol: float,
-    ) -> Tuple[int, int, bool, float]:
+    ) -> Tuple[int, int, bool, float, int, int, float, float, float, float, int, int, int]:
         """
         Estimate freshness, break count, and return distance for a gap level.
         """
         post = df.iloc[formation_idx + 1:].copy()
         if post.empty:
-            return 1, 0, False, 0.0
+            return 1, 0, False, 0.0, 0, 0, 0.0, 0.0, 0.0, 0.0
 
+        opens = post["open"].values.astype(float)
         highs = post["high"].values.astype(float)
         lows = post["low"].values.astype(float)
         closes = post["close"].values.astype(float)
 
         touch_mask = (highs >= zone_low - tol) & (lows <= zone_high + tol)
-        touch_count = max(1, int(np.sum(touch_mask)))
+        touch_indices = np.where(touch_mask)[0]
+        historical_rejection_count = int(len(touch_indices))
 
         if trade_direction == "BUY":
             wrong_side = closes < (zone_low - tol)
@@ -1341,7 +1434,143 @@ class LevelDetector:
                 in_break = False
 
         retested = bool(np.any(touch_mask))
-        return touch_count, episodes, retested, return_dist
+        push_min_pips = LevelDetector._gap_push_min_pips(timeframe)
+        wick_ratios: List[float] = []
+        push_aways: List[float] = []
+        weak_count = 0
+        broke_count = 0
+        wick_ratio_pass_count = 0
+        wick_percent_pass_count = 0
+        strong_push_pass_count = 0
+
+        for pos, idx in enumerate(touch_indices):
+            o, h, l, c = opens[idx], highs[idx], lows[idx], closes[idx]
+            candle_range = max(h - l, 1e-9)
+            body = abs(c - o)
+
+            if trade_direction == "SELL":
+                wick = h - max(o, c)
+                wick_pct = wick / candle_range
+                broke_through = c > (zone_high + tol)
+                close_deep_inside = zone_low <= c <= zone_high and c > midpoint
+            else:
+                wick = min(o, c) - l
+                wick_pct = wick / candle_range
+                broke_through = c < (zone_low - tol)
+                close_deep_inside = zone_low <= c <= zone_high and c < midpoint
+
+            wick_ratio = wick / body if body > 0 else 0.0
+            next_touch = int(touch_indices[pos + 1]) if pos + 1 < len(touch_indices) else len(post)
+            follow_slice_highs = highs[idx + 1:next_touch]
+            follow_slice_lows = lows[idx + 1:next_touch]
+
+            if trade_direction == "SELL":
+                push_away = max(0.0, (zone_low - float(np.min(follow_slice_lows))) / PIP_SIZE) if len(follow_slice_lows) > 0 else 0.0
+                close_away_from_zone = c < zone_low
+            else:
+                push_away = max(0.0, (float(np.max(follow_slice_highs)) - zone_high) / PIP_SIZE) if len(follow_slice_highs) > 0 else 0.0
+                close_away_from_zone = c > zone_high
+
+            wick_ratio_pass = wick_ratio >= GAP_REJECTION_WICK_TO_BODY_MIN and push_away >= push_min_pips
+            wick_percent_pass = wick_pct >= GAP_REJECTION_WICK_RANGE_PCT_MIN and push_away >= push_min_pips
+            strong_push_pass = push_away >= (2.0 * push_min_pips) and close_away_from_zone
+
+            if broke_through:
+                broke_count += 1
+                if DEBUG_REJECTION_TRACE:
+                    logger.info("REJECTION IGNORED: price broke through zone")
+                continue
+            if body < GAP_REJECTION_MIN_BODY_PIPS * PIP_SIZE:
+                weak_count += 1
+                if DEBUG_REJECTION_TRACE:
+                    logger.info(
+                        "REJECTION IGNORED: weak touch | wick=%.1fx | push=%.0fp",
+                        wick_ratio,
+                        push_away,
+                    )
+                continue
+            if close_deep_inside:
+                weak_count += 1
+                if DEBUG_REJECTION_TRACE:
+                    logger.info(
+                        "REJECTION IGNORED: weak touch | wick=%.1fx | push=%.0fp",
+                        wick_ratio,
+                        push_away,
+                    )
+                continue
+            if not (wick_ratio_pass or wick_percent_pass or strong_push_pass):
+                weak_count += 1
+                if DEBUG_REJECTION_TRACE:
+                    logger.info(
+                        "REJECTION IGNORED: weak touch | wick=%.1fx | push=%.0fp",
+                        wick_ratio,
+                        push_away,
+                    )
+                continue
+
+            wick_ratios.append(wick_ratio)
+            push_aways.append(push_away)
+            if wick_ratio_pass:
+                wick_ratio_pass_count += 1
+            if wick_percent_pass:
+                wick_percent_pass_count += 1
+            if strong_push_pass:
+                strong_push_pass_count += 1
+            if DEBUG_REJECTION_TRACE:
+                logger.info(
+                    "QUALITY REJECTION COUNTED: %s zone | wick=%.1fx | push=%.0fp",
+                    trade_direction,
+                    wick_ratio,
+                    push_away,
+                )
+
+        quality_rejection_count = len(wick_ratios)
+        avg_rejection_wick_ratio = float(np.mean(wick_ratios)) if wick_ratios else 0.0
+        avg_push_away_pips = float(np.mean(push_aways)) if push_aways else 0.0
+        strongest_rejection_pips = float(np.max(push_aways)) if push_aways else 0.0
+
+        if quality_rejection_count >= 5:
+            rejection_quality_score = 100.0
+        elif quality_rejection_count == 4:
+            rejection_quality_score = 85.0
+        elif quality_rejection_count == 3:
+            rejection_quality_score = 70.0
+        elif quality_rejection_count == 2:
+            rejection_quality_score = 45.0
+        elif quality_rejection_count == 1:
+            rejection_quality_score = 20.0
+        else:
+            rejection_quality_score = 0.0
+
+        if historical_rejection_count > 0:
+            logger.info(
+                "REJECTION SUMMARY: zone=%s %.2f | touches=%d | quality=%d | weak=%d | broke=%d | avg_wick=%.1fx | avg_push=%.0fp",
+                trade_direction,
+                midpoint,
+                historical_rejection_count,
+                quality_rejection_count,
+                weak_count,
+                broke_count,
+                avg_rejection_wick_ratio,
+                avg_push_away_pips,
+            )
+
+        touch_count = max(1, quality_rejection_count) if retested else 1
+        return (
+            touch_count,
+            episodes,
+            retested,
+            return_dist,
+            historical_rejection_count,
+            quality_rejection_count,
+            avg_rejection_wick_ratio,
+            avg_push_away_pips,
+            strongest_rejection_pips,
+            rejection_quality_score,
+            wick_ratio_pass_count,
+            wick_percent_pass_count,
+            strong_push_pass_count,
+        )
 
     # ─────────────────────────────────────────────────────
     # BREAK COUNT

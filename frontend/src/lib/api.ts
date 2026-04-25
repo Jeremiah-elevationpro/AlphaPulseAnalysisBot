@@ -41,12 +41,22 @@ export interface TradeRow {
   status: string
   result: string | null
   confidence: number | null
+  strategy_type?: string | null
+  source?: string | null
   setup_type?: string | null
   is_qm?: boolean
   is_psychological?: boolean
   h4_bias?: string | null
+  dominant_bias?: string | null
+  bias_strength?: string | null
   session_name?: string | null
   confirmation_type?: string | null
+  confirmation_score?: number | null
+  confirmation_path?: string | null
+  quality_rejection_count?: number
+  structure_break_count?: number
+  level_timeframe?: string | null
+  confluence_with?: string | null
   tp_progress_reached?: number
   realized_pips?: number | null
   created_at: string
@@ -67,6 +77,8 @@ export interface SignalRow {
   price: number | null
   level_price: number | null
   direction: string
+  strategy_type?: string | null
+  setup_type?: string | null
   quality: number
   displacement: number
   touch_count: number
@@ -77,6 +89,10 @@ export interface SignalRow {
   is_qm: boolean
   is_psych: boolean
   h4_bias: string | null
+  bias_strength?: string | null
+  session_name?: string | null
+  confirmation_score?: number | null
+  quality_rejection_count?: number | null
   created_at: string
 }
 
@@ -193,6 +209,7 @@ export interface BotStatusResponse {
     dominantBias?: string | null
     biasStrength?: string | null
     lastMarketUpdateAt?: string | null
+    liveEnabledStrategies?: string[] | null
   } | null
 }
 

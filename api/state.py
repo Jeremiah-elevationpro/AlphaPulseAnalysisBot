@@ -59,6 +59,7 @@ bot_state: dict = {
     "dominant_bias":          None,
     "bias_strength":          None,
     "last_market_update_at":  None,
+    "live_enabled_strategies": ["gap_sweep"],
 }
 
 replay_runs: dict[int, dict] = {}

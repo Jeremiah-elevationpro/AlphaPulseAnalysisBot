@@ -109,6 +109,71 @@ AV_TOUCH_COUNT_PENALTY_PER = float(os.getenv("AV_TOUCH_COUNT_PENALTY_PER", "2"))
 AV_ORIGIN_DISPLACEMENT_STRONG_PIPS = float(os.getenv("AV_ORIGIN_DISPLACEMENT_STRONG_PIPS", "50"))
 AV_ORIGIN_DISPLACEMENT_BONUS = int(os.getenv("AV_ORIGIN_DISPLACEMENT_BONUS", "8"))
 
+# Gap / engulf-zone historical rejection quality
+GAP_REJECTION_WICK_TO_BODY_MIN = float(os.getenv("GAP_REJECTION_WICK_TO_BODY_MIN", "1.2"))
+GAP_REJECTION_WICK_RANGE_PCT_MIN = float(os.getenv("GAP_REJECTION_WICK_RANGE_PCT_MIN", "0.35"))
+GAP_REJECTION_MIN_BODY_PIPS = float(os.getenv("GAP_REJECTION_MIN_BODY_PIPS", "1.5"))
+GAP_REJECTION_PUSH_AWAY_PIPS = {
+    "H1": float(os.getenv("GAP_REJECTION_PUSH_H1", "30")),
+    "M30": float(os.getenv("GAP_REJECTION_PUSH_M30", "20")),
+    "M15": float(os.getenv("GAP_REJECTION_PUSH_M15", "15")),
+}
+DEBUG_REJECTION_TRACE = os.getenv("DEBUG_REJECTION_TRACE", "false").lower() == "true"
+DEBUG_ENGULF_TRACE = os.getenv("DEBUG_ENGULF_TRACE", "false").lower() == "true"
+
+# Engulfing research-only replay tuning
+ENGULF_MIN_QUALITY_SCORE = float(os.getenv("ENGULF_MIN_QUALITY_SCORE", "68"))
+ENGULF_H1_RELAXED_QUALITY_SCORE = float(os.getenv("ENGULF_H1_RELAXED_QUALITY_SCORE", "64"))
+ENGULF_MIN_QUALITY_REJECTIONS = int(os.getenv("ENGULF_MIN_QUALITY_REJECTIONS", "3"))
+BEARISH_ENGULF_BIAS_BONUS = int(os.getenv("BEARISH_ENGULF_BIAS_BONUS", "8"))
+ENGULF_BULLISH_DIRECTION_BONUS = int(os.getenv("ENGULF_BULLISH_DIRECTION_BONUS", "4"))
+ENGULF_MAX_PER_TIMEFRAME_DIRECTION_SESSION = int(os.getenv("ENGULF_MAX_PER_TIMEFRAME_DIRECTION_SESSION", "2"))
+ENGULF_MAX_ACTIVE_CANDIDATES_PER_SYMBOL = int(os.getenv("ENGULF_MAX_ACTIVE_CANDIDATES_PER_SYMBOL", "6"))
+ENGULF_ALLOWED_RESEARCH_TIMEFRAMES = tuple(
+    part.strip() for part in os.getenv("ENGULF_ALLOWED_RESEARCH_TIMEFRAMES", "H1,M30").split(",") if part.strip()
+)
+ENGULF_STRONG_BIAS_BONUS = int(os.getenv("ENGULF_STRONG_BIAS_BONUS", "8"))
+ENGULF_MODERATE_BIAS_BONUS = int(os.getenv("ENGULF_MODERATE_BIAS_BONUS", "3"))
+
+# Live strategy registry / forward-testing controls
+LIVE_ENABLED_STRATEGIES = [
+    part.strip()
+    for part in os.getenv("LIVE_ENABLED_STRATEGIES", "gap_sweep,engulfing_rejection").split(",")
+    if part.strip()
+]
+ENGULF_ALLOWED_LIVE_TIMEFRAMES = tuple(
+    part.strip()
+    for part in os.getenv("ENGULF_ALLOWED_LIVE_TIMEFRAMES", "H1,M30").split(",")
+    if part.strip()
+)
+ENGULF_LIVE_SETUP_TYPE = os.getenv("ENGULF_LIVE_SETUP_TYPE", "engulfing_rejection")
+ENGULF_LIVE_CONFIRMATION_TYPE = os.getenv("ENGULF_LIVE_CONFIRMATION_TYPE", "engulfing_reversal")
+ENGULF_LIVE_ALERT_ONLY = os.getenv("ENGULF_LIVE_ALERT_ONLY", "true").lower() == "true"
+ENGULF_LIVE_MIN_QUALITY_SCORE = float(os.getenv("ENGULF_LIVE_MIN_QUALITY_SCORE", str(ENGULF_MIN_QUALITY_SCORE)))
+ENGULF_LIVE_H1_RELAXED_QUALITY_SCORE = float(
+    os.getenv("ENGULF_LIVE_H1_RELAXED_QUALITY_SCORE", str(ENGULF_H1_RELAXED_QUALITY_SCORE))
+)
+ENGULF_LIVE_MIN_QUALITY_REJECTIONS = int(
+    os.getenv("ENGULF_LIVE_MIN_QUALITY_REJECTIONS", str(ENGULF_MIN_QUALITY_REJECTIONS))
+)
+ENGULF_LIVE_TIMEFRAME_SCORE = {
+    "H1": int(os.getenv("ENGULF_LIVE_H1_SCORE", "8")),
+    "M30": int(os.getenv("ENGULF_LIVE_M30_SCORE", "6")),
+    "M15": int(os.getenv("ENGULF_LIVE_M15_SCORE", "-99")),
+}
+ENGULF_LIVE_SESSION_SCORE = {
+    "london": int(os.getenv("ENGULF_LIVE_SESSION_LONDON", "10")),
+    "asia": int(os.getenv("ENGULF_LIVE_SESSION_ASIA", "4")),
+    "new_york": int(os.getenv("ENGULF_LIVE_SESSION_NEW_YORK", "-8")),
+    "off_session": int(os.getenv("ENGULF_LIVE_SESSION_OFF", "2")),
+    "overlap": int(os.getenv("ENGULF_LIVE_SESSION_OVERLAP", "6")),
+}
+ENGULF_LIVE_NEW_YORK_STRONG_QUALITY = float(os.getenv("ENGULF_LIVE_NEW_YORK_STRONG_QUALITY", "78"))
+ENGULF_LIVE_MAX_PER_TIMEFRAME_DIRECTION_SESSION = int(
+    os.getenv("ENGULF_LIVE_MAX_PER_TIMEFRAME_DIRECTION_SESSION", "2")
+)
+ENGULF_LIVE_MAX_CANDIDATES_PER_SCAN = int(os.getenv("ENGULF_LIVE_MAX_CANDIDATES_PER_SCAN", "4"))
+
 # A/V quality scoring bonuses (selector + final scoring layers only)
 AV_STRONG_ORIGIN_BONUS = int(os.getenv("AV_STRONG_ORIGIN_BONUS", "8"))
 AV_DISPLACEMENT_BONUS = int(os.getenv("AV_DISPLACEMENT_BONUS", "6"))

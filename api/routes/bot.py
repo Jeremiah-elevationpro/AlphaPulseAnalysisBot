@@ -108,6 +108,7 @@ def _sync_process_state() -> None:
             state.bot_state["dominant_bias"]         = hb.get("dominant_bias")
             state.bot_state["bias_strength"]         = hb.get("bias_strength")
             state.bot_state["last_market_update_at"] = hb.get("last_market_update_at")
+            state.bot_state["live_enabled_strategies"] = hb.get("live_enabled_strategies", state.bot_state.get("live_enabled_strategies"))
             state.bot_state["process_id"]            = hb.get("process_id", state.bot_state.get("process_id"))
             if hb.get("last_error"):
                 state.bot_state["last_error"] = hb["last_error"]
@@ -184,6 +185,7 @@ def _payload(message: str) -> dict:
             "lastScanNumber":      s["last_scan_number"],
             "sessionBlocking":     s["session_blocking"],
             "instanceId":          s["instance_id"],
+            "liveEnabledStrategies": s.get("live_enabled_strategies"),
         },
     }
 

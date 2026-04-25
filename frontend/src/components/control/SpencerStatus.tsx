@@ -83,6 +83,11 @@ export function SpencerStatus({ status }: { status?: BotStatusResponse }) {
             {STATUS_LABELS[status?.status ?? "offline"] ?? "Spencer Offline"}
           </Badge>
           <Badge variant="gold" className="text-[10px]">Powered by AlphaPulse</Badge>
+          {status?.data?.liveEnabledStrategies?.map((strategy) => (
+            <Badge key={strategy} variant="purple" className="text-[10px]">
+              {strategy.replace(/_/g, " ")}
+            </Badge>
+          ))}
           <Badge variant="outline" className="text-[10px]">Current Symbol: {status?.symbol ?? "XAUUSD"}</Badge>
           {isActive && hb.isStale && (
             <Badge variant="sell" className="text-[10px]">

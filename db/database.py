@@ -9,6 +9,8 @@ are translated to Supabase REST calls.
 """
 
 import json
+import re
+import time
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
@@ -101,6 +103,8 @@ class SupabaseDB:
     def __init__(self):
         self._url: str = ""
         self._headers: Dict = {}
+        self._request_timeout = (10, 45)
+        self._retry_delays = (1.0, 2.5, 5.0)
 
     def init(self):
         if not SUPABASE_URL or not SUPABASE_KEY:
@@ -130,28 +134,77 @@ class SupabaseDB:
 
     # ── Low-level helpers ────────────────────────────────
 
+    def _request(
+        self,
+        method: str,
+        table: str,
+        *,
+        params: Optional[Dict] = None,
+        data: Optional[Dict] = None,
+        headers: Optional[Dict] = None,
+    ):
+        import requests
+
+        url = f"{self._url}/{table}"
+        request_headers = headers or self._headers
+        last_exc: Optional[Exception] = None
+
+        for attempt, delay in enumerate((0.0, *self._retry_delays), start=1):
+            if delay > 0:
+                time.sleep(delay)
+            try:
+                return requests.request(
+                    method=method,
+                    url=url,
+                    headers=request_headers,
+                    params=params,
+                    data=json.dumps(data, default=str) if data is not None else None,
+                    timeout=self._request_timeout,
+                )
+            except requests.exceptions.Timeout as exc:
+                last_exc = exc
+                logger.warning(
+                    "Supabase %s %s timed out on attempt %d/%d; retrying...",
+                    method,
+                    table,
+                    attempt,
+                    len(self._retry_delays) + 1,
+                )
+            except requests.exceptions.ConnectionError as exc:
+                last_exc = exc
+                logger.warning(
+                    "Supabase %s %s connection error on attempt %d/%d: %s",
+                    method,
+                    table,
+                    attempt,
+                    len(self._retry_delays) + 1,
+                    exc,
+                )
+            except requests.exceptions.SSLError as exc:
+                last_exc = exc
+                logger.warning(
+                    "Supabase %s %s SSL error on attempt %d/%d: %s",
+                    method,
+                    table,
+                    attempt,
+                    len(self._retry_delays) + 1,
+                    exc,
+                )
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"Supabase {method} {table} failed without a captured exception")
+
     def _get(self, table: str, params: Optional[Dict] = None,
              limit: int = 1000) -> List[Dict]:
-        import requests
         p = params or {}
         p["limit"] = limit
-        r = requests.get(
-            f"{self._url}/{table}",
-            headers=self._headers,
-            params=p,
-            timeout=15,
-        )
+        r = self._request("GET", table, params=p)
         r.raise_for_status()
         return r.json()
 
     def _post(self, table: str, data: Dict) -> Optional[Dict]:
-        import requests
-        r = requests.post(
-            f"{self._url}/{table}",
-            headers=self._headers,
-            data=json.dumps(data, default=str),
-            timeout=15,
-        )
+        r = self._request("POST", table, data=data)
         if not r.ok:
             # Log the Supabase error body before raising — this tells you exactly
             # which column is invalid/missing (e.g. "column X does not exist").
@@ -174,27 +227,13 @@ class SupabaseDB:
         return rows[0] if rows else None
 
     def _patch(self, table: str, filters: Dict, data: Dict):
-        import requests
         params = {k: f"eq.{v}" for k, v in filters.items()}
-        r = requests.patch(
-            f"{self._url}/{table}",
-            headers=self._headers,
-            params=params,
-            data=json.dumps(data, default=str),
-            timeout=15,
-        )
+        r = self._request("PATCH", table, params=params, data=data)
         r.raise_for_status()
 
     def _upsert(self, table: str, data: Dict, on_conflict: str):
-        import requests
         headers = {**self._headers, "Prefer": f"resolution=merge-duplicates,return=representation"}
-        r = requests.post(
-            f"{self._url}/{table}",
-            headers=headers,
-            params={"on_conflict": on_conflict},
-            data=json.dumps(data, default=str),
-            timeout=15,
-        )
+        r = self._request("POST", table, params={"on_conflict": on_conflict}, data=data, headers=headers)
         r.raise_for_status()
 
 
@@ -211,6 +250,7 @@ class Database:
     def __init__(self):
         self._pg: Optional[PostgresDB] = None
         self._sb: Optional[SupabaseDB] = None
+        self._schema_warnings_seen: set[tuple[str, str]] = set()
 
     def init(self):
         if USE_SUPABASE:
@@ -367,8 +407,40 @@ class Database:
                 "protected_after_tp1": trade.get("protected_after_tp1", False),
                 "tp1_alert_sent": trade.get("tp1_alert_sent", False),
                 "breakeven_exit": trade.get("breakeven_exit", False),
+                "setup_type": trade.get("setup_type"),
+                "is_qm": trade.get("is_qm", False),
+                "is_psychological": trade.get("is_psychological", False),
+                "is_liquidity_sweep": trade.get("is_liquidity_sweep", False),
+                "session_name": trade.get("session_name"),
+                "h4_bias": trade.get("h4_bias"),
+                "trend_aligned": trade.get("trend_aligned", True),
+                "confirmation_type": trade.get("confirmation_type"),
+                "strategy_type": trade.get("strategy_type"),
+                "source": trade.get("source"),
+                "dominant_bias": trade.get("dominant_bias"),
+                "bias_strength": trade.get("bias_strength"),
+                "confirmation_score": trade.get("confirmation_score"),
+                "confirmation_path": trade.get("confirmation_path"),
+                "quality_rejection_count": trade.get("quality_rejection_count"),
+                "structure_break_count": trade.get("structure_break_count"),
+                "level_timeframe": trade.get("level_timeframe"),
+                "confluence_with": trade.get("confluence_with"),
             }
-            row = self._sb._post("trades", payload)
+            try:
+                row = self._sb._post("trades", payload)
+            except Exception as exc:
+                if not self._is_400(exc):
+                    raise
+                missing = [
+                    col for col in self._extract_missing_columns(exc)
+                    if col in payload and col in self._OPTIONAL_LIVE_TRADE_COLUMNS
+                ]
+                if not missing:
+                    raise
+                for col in missing:
+                    payload.pop(col, None)
+                    self._warn_missing_schema_once("trades", col)
+                row = self._sb._post("trades", payload)
             return row.get("id") if row else None
 
         if self._pg:
@@ -540,6 +612,132 @@ class Database:
         "performance_by_h1_sweep", "performance_by_pd_location", "performance_by_bias_gate",
     })
 
+    _OPTIONAL_STRATEGY_RESEARCH_TRADE_COLUMNS: frozenset = frozenset({
+        "research_run_id",
+        "source",
+        "strategy_type",
+        "symbol",
+        "direction",
+        "timeframe",
+        "timeframe_pair",
+        "session_name",
+        "market_condition",
+        "dominant_bias",
+        "bias_strength",
+        "engulf_high",
+        "engulf_low",
+        "engulf_mid",
+        "engulf_time",
+        "engulf_body_pips",
+        "engulf_range_pips",
+        "engulf_type",
+        "historical_rejection_count",
+        "quality_rejection_count",
+        "avg_rejection_wick_ratio",
+        "avg_push_away_pips",
+        "strongest_rejection_pips",
+        "rejection_quality_score",
+        "structure_break_count",
+        "quality_score",
+        "entry",
+        "sl",
+        "tp1",
+        "tp2",
+        "tp3",
+        "activated_at",
+        "closed_at",
+        "completed_at",
+        "final_result",
+        "final_pips",
+        "reward_score",
+        "failure_reason",
+        "run_id",
+        "created_at",
+        "status",
+        "level_high",
+        "level_low",
+        "level_mid",
+        "confirmation_path",
+        "confirmation_score",
+        "revisit_time",
+        "confirmation_time",
+        "confirmation_candles_used",
+        "notes",
+        # break+retest research columns
+        "break_level",
+        "break_time",
+        "break_close",
+        "break_distance_pips",
+        "source_level_type",
+        "source_strategy_type",
+        "retest_level",
+        "retest_time",
+        "retest_confirmation_type",
+        "retest_confirmation_score",
+        "original_engulf_high",
+        "original_engulf_low",
+        "original_engulf_mid",
+        "original_engulf_direction",
+        "original_engulf_time",
+        "original_quality_rejection_count",
+        "original_structure_break_count",
+        "original_quality_score",
+    })
+
+    _REQUIRED_STRATEGY_RESEARCH_TRADE_COLUMNS: frozenset = frozenset({
+        "symbol",
+        "strategy_type",
+        "direction",
+        "entry",
+        "final_result",
+    })
+
+    _OPTIONAL_STRATEGY_RESEARCH_RUN_COLUMNS: frozenset = frozenset({
+        "strategy_type",
+        "started_at",
+        "finished_at",
+        "notes",
+        "replay_start",
+        "replay_end",
+        "status",
+        "funnel_summary",
+        "reject_summary",
+        "created_at",
+        "updated_at",
+    })
+
+    _OPTIONAL_STRATEGY_RESEARCH_STATS_COLUMNS: frozenset = frozenset({
+        "run_id",
+        "strategy_type",
+        "symbol",
+        "stats_key",
+        "stats_value",
+        "payload",
+        "funnel_summary",
+        "reject_summary",
+    })
+
+    _OPTIONAL_LIVE_TRADE_COLUMNS: frozenset = frozenset({
+        "setup_type",
+        "is_qm",
+        "is_psychological",
+        "is_liquidity_sweep",
+        "session_name",
+        "h4_bias",
+        "trend_aligned",
+        "confirmation_type",
+        "strategy_type",
+        "source",
+        "dominant_bias",
+        "bias_strength",
+        "confirmation_score",
+        "confirmation_path",
+        "quality_rejection_count",
+        "structure_break_count",
+        "level_timeframe",
+        "confluence_with",
+    })
+
     def insert_replay_trade(self, payload: Dict[str, Any]) -> Optional[int]:
         if not self._sb:
             raise RuntimeError("Historical replay persistence requires USE_SUPABASE=true")
@@ -583,6 +781,116 @@ class Database:
         return row.get("id") if row else None
 
     @staticmethod
+    def _extract_missing_columns(exc: Exception) -> List[str]:
+        message = str(exc)
+        patterns = [
+            r"Could not find the '([^']+)' column",
+            r'column "([^"]+)" does not exist',
+            r"'([^']+)' column",
+        ]
+        found: List[str] = []
+        for pattern in patterns:
+            found.extend(re.findall(pattern, message))
+        return list(dict.fromkeys(found))
+
+    def _post_with_missing_column_fallback(
+        self,
+        table: str,
+        payload: Dict[str, Any],
+        optional_columns: frozenset[str],
+        context_label: str,
+        required_columns: Optional[frozenset[str]] = None,
+    ) -> Optional[int]:
+        if not self._sb:
+            raise RuntimeError(f"{context_label} persistence requires USE_SUPABASE=true")
+
+        attempt_payload = dict(payload)
+        removed: List[str] = []
+        required_columns = required_columns or frozenset()
+        while True:
+            try:
+                row = self._sb._post(table, attempt_payload)
+                if removed:
+                    logger.warning(
+                        "%s insert succeeded after dropping missing columns %s",
+                        context_label,
+                        removed,
+                    )
+                return row.get("id") if row else None
+            except Exception as exc:
+                if not self._is_400(exc):
+                    raise
+                extracted_missing = [col for col in self._extract_missing_columns(exc) if col in attempt_payload]
+                required_missing = [col for col in extracted_missing if col in required_columns]
+                if required_missing:
+                    raise RuntimeError(
+                        f"{context_label} requires DB migration: missing required column(s) {required_missing} in {table}"
+                    ) from exc
+                missing = [
+                    col for col in extracted_missing
+                    if col in attempt_payload and col in optional_columns
+                ]
+                if not missing:
+                    fallback = {k: v for k, v in attempt_payload.items() if k not in optional_columns}
+                    stripped = sorted(set(attempt_payload) & optional_columns)
+                    logger.warning(
+                        "%s insert hit schema mismatch; retrying without optional columns %s",
+                        context_label,
+                        stripped,
+                    )
+                    row = self._sb._post(table, fallback)
+                    return row.get("id") if row else None
+                for col in missing:
+                    removed.append(col)
+                    attempt_payload.pop(col, None)
+                    self._warn_missing_schema_once(table, col)
+
+    def _patch_with_missing_column_fallback(
+        self,
+        table: str,
+        filters: Dict[str, Any],
+        payload: Dict[str, Any],
+        optional_columns: frozenset[str],
+        context_label: str,
+    ) -> None:
+        if not self._sb:
+            raise RuntimeError(f"{context_label} persistence requires USE_SUPABASE=true")
+
+        attempt_payload = dict(payload)
+        removed: List[str] = []
+        while True:
+            try:
+                self._sb._patch(table, filters, attempt_payload)
+                if removed:
+                    logger.warning(
+                        "%s update succeeded after dropping missing columns %s",
+                        context_label,
+                        removed,
+                    )
+                return
+            except Exception as exc:
+                if not self._is_400(exc):
+                    raise
+                missing = [
+                    col for col in self._extract_missing_columns(exc)
+                    if col in attempt_payload and col in optional_columns
+                ]
+                if not missing:
+                    fallback = {k: v for k, v in attempt_payload.items() if k not in optional_columns}
+                    stripped = sorted(set(attempt_payload) & optional_columns)
+                    logger.warning(
+                        "%s update hit schema mismatch; retrying without optional columns %s",
+                        context_label,
+                        stripped,
+                    )
+                    self._sb._patch(table, filters, fallback)
+                    return
+                for col in missing:
+                    removed.append(col)
+                    attempt_payload.pop(col, None)
+                    self._warn_missing_schema_once(table, col)
+
+    @staticmethod
     def _is_400(exc: Exception) -> bool:
         """Return True when exc is an HTTP 400 from the Supabase client.
 
@@ -612,6 +920,17 @@ class Database:
             "Could not find the",
         )
         return any(marker in message for marker in retryable_markers)
+
+    def _warn_missing_schema_once(self, table: str, column: str) -> None:
+        key = (table, column)
+        if key in self._schema_warnings_seen:
+            return
+        self._schema_warnings_seen.add(key)
+        logger.warning(
+            "SCHEMA WARNING: missing column %s on %s — run migration",
+            column,
+            table,
+        )
 
     def get_replay_trades_for_learning(
         self,
@@ -684,6 +1003,153 @@ class Database:
             limit=1,
         )
         return rows[0] if rows else None
+
+    def create_strategy_research_run(self, payload: Dict[str, Any]) -> Optional[int]:
+        """Create a strategy research run row in Supabase."""
+        return self._post_with_missing_column_fallback(
+            "strategy_research_runs",
+            payload,
+            self._OPTIONAL_STRATEGY_RESEARCH_RUN_COLUMNS,
+            "strategy research run",
+        )
+
+    def update_strategy_research_run(self, run_id: int, payload: Dict[str, Any]):
+        """Update a strategy research run row."""
+        self._patch_with_missing_column_fallback(
+            "strategy_research_runs",
+            {"id": run_id},
+            payload,
+            self._OPTIONAL_STRATEGY_RESEARCH_RUN_COLUMNS,
+            "strategy research run",
+        )
+
+    def insert_strategy_research_trade(self, payload: Dict[str, Any]) -> Optional[int]:
+        """Insert one strategy research trade row without touching live/replay trade tables."""
+        return self._post_with_missing_column_fallback(
+            "strategy_research_trades",
+            payload,
+            self._OPTIONAL_STRATEGY_RESEARCH_TRADE_COLUMNS,
+            "strategy research trade",
+            self._REQUIRED_STRATEGY_RESEARCH_TRADE_COLUMNS,
+        )
+
+    def insert_strategy_research_stats(self, payload: Dict[str, Any]) -> Optional[int]:
+        """Insert aggregate strategy research stats payloads."""
+        return self._post_with_missing_column_fallback(
+            "strategy_research_stats",
+            payload,
+            self._OPTIONAL_STRATEGY_RESEARCH_STATS_COLUMNS,
+            "strategy research stats",
+        )
+
+    def get_strategy_research_run(self, run_id: int) -> Optional[Dict]:
+        if not self._sb:
+            raise RuntimeError("Strategy research persistence requires USE_SUPABASE=true")
+        runs = self._sb._get(
+            "strategy_research_runs",
+            {"id": f"eq.{run_id}"},
+            limit=1,
+        )
+        return runs[0] if runs else None
+
+    def _get_strategy_research_related_rows(
+        self,
+        table: str,
+        run_id: int,
+        *,
+        limit: int,
+    ) -> List[Dict]:
+        """Fetch strategy research child rows with schema-tolerant run filtering.
+
+        Some local Supabase schemas expose `run_id`, others `research_run_id`,
+        and some PostgREST schema caches may temporarily reject one or both as
+        query params. Try server-side filters first, then fall back to a broader
+        fetch plus client-side filtering so evaluation does not crash.
+        """
+        if not self._sb:
+            raise RuntimeError("Strategy research persistence requires USE_SUPABASE=true")
+
+        filter_options = (
+            {"run_id": f"eq.{run_id}", "order": "id.asc"},
+            {"research_run_id": f"eq.{run_id}", "order": "id.asc"},
+        )
+        for params in filter_options:
+            try:
+                return self._sb._get(table, params, limit=limit)
+            except Exception as exc:
+                if not self._is_400(exc):
+                    raise
+                filter_name = next((k for k in ("run_id", "research_run_id") if k in params), "unknown")
+                logger.warning(
+                    "strategy research %s filter fallback: %s not queryable in Supabase schema cache; retrying",
+                    table,
+                    filter_name,
+                )
+
+        rows = self._sb._get(table, {"order": "id.asc"}, limit=limit)
+        filtered = [
+            row for row in rows
+            if row.get("run_id") == run_id or row.get("research_run_id") == run_id
+        ]
+        logger.warning(
+            "strategy research %s using client-side run filter for run_id=%s (%d/%d rows matched)",
+            table,
+            run_id,
+            len(filtered),
+            len(rows),
+        )
+        return filtered
+
+    def get_latest_strategy_research_results(self, strategy_type: Optional[str] = None) -> Optional[Dict]:
+        """Return the latest strategy research run plus its stats and trades."""
+        if not self._sb:
+            raise RuntimeError("Strategy research persistence requires USE_SUPABASE=true")
+        params = {"order": "id.desc"}
+        if strategy_type:
+            params["strategy_group"] = f"eq.{strategy_type}"
+        runs = self._sb._get("strategy_research_runs", params, limit=1)
+        if not runs:
+            return None
+        run = runs[0]
+        run_id = run.get("id")
+        stats = self._get_strategy_research_related_rows(
+            "strategy_research_stats",
+            run_id,
+            limit=5000,
+        )
+        trades = self._get_strategy_research_related_rows(
+            "strategy_research_trades",
+            run_id,
+            limit=10000,
+        )
+        return {
+            "run": run,
+            "stats": stats,
+            "trades": trades,
+        }
+
+    def get_strategy_research_results(self, run_id: int) -> Optional[Dict]:
+        """Return one strategy research run plus its stats and trades."""
+        if not self._sb:
+            raise RuntimeError("Strategy research persistence requires USE_SUPABASE=true")
+        run = self.get_strategy_research_run(run_id)
+        if not run:
+            return None
+        stats = self._get_strategy_research_related_rows(
+            "strategy_research_stats",
+            run_id,
+            limit=5000,
+        )
+        trades = self._get_strategy_research_related_rows(
+            "strategy_research_trades",
+            run_id,
+            limit=10000,
+        )
+        return {
+            "run": run,
+            "stats": stats,
+            "trades": trades,
+        }
 
     def upsert_performance(self, level_type: str, tf_pair: str,
                            wins: int, losses: int, reward: float):
@@ -935,13 +1401,10 @@ class Database:
 
     def delete_manual_setup(self, setup_id: int) -> bool:
         if self._sb:
-            import requests
-
-            r = requests.delete(
-                f"{self._sb._url}/manual_setups",
-                headers=self._sb._headers,
+            r = self._sb._request(
+                "DELETE",
+                "manual_setups",
                 params={"id": f"eq.{setup_id}"},
-                timeout=15,
             )
             r.raise_for_status()
             return True

@@ -8,6 +8,7 @@ import {
   Globe2,
   Layers,
 } from "lucide-react"
+import { useMemo } from "react"
 import { Link } from "react-router-dom"
 
 import { BotControlPanel } from "@/components/control/BotControlPanel"
@@ -26,6 +27,7 @@ import {
   useHealth,
   useMarketContext,
   useSignals,
+  useTrades,
 } from "@/hooks/use-data"
 import { cn } from "@/lib/utils"
 
@@ -34,6 +36,7 @@ export default function Dashboard() {
   const analytics = useAnalytics()
   const signals = useSignals(6)
   const trades = useActiveTrades(6)
+  const allTrades = useTrades("all", 200)
   const alerts = useAlerts(6)
   const botStatus = useBotStatus()
   const isBotOnline = ["online", "analyzing", "watching", "starting"].includes(botStatus.data?.status ?? "")
@@ -43,6 +46,7 @@ export default function Dashboard() {
   const marketContext = market.data
   const dominantBias = marketContext?.bias?.dominant ?? "neutral"
   const botWindowActive = Boolean(marketContext?.session?.botWindowActive)
+  const strategyStats = useMemo(() => buildStrategyStats(allTrades.data?.trades ?? []), [allTrades.data?.trades])
 
   return (
     <div className="space-y-5 p-4 md:p-6">
@@ -166,6 +170,11 @@ export default function Dashboard() {
         <MetricCard label="Replay Trades" value={String(metrics?.total_trades ?? 0)} accent="gold" />
       </div>
 
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+        <StrategySummaryCard title="Gap Sweep" stats={strategyStats.gap_sweep} />
+        <StrategySummaryCard title="Engulfing Rejection" stats={strategyStats.engulfing_rejection} />
+      </div>
+
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
         <FeedCard
           title="Recent Signals"
@@ -180,14 +189,15 @@ export default function Dashboard() {
             <div key={signal.id} className="flex items-center justify-between rounded-lg border border-ap-border bg-ap-surface/35 px-3 py-2.5">
               <div className="space-y-1">
                 <div className="flex items-center gap-2">
-                  <Badge variant={signal.type === "Gap" ? "gold" : "outline"} className="text-[10px]">{signal.type}</Badge>
-                  <span className={cn("flex items-center gap-1 text-xs font-semibold", signal.direction === "BUY" ? "text-buy" : "text-sell")}>
+                      <Badge variant={signal.type === "Gap" ? "gold" : "outline"} className="text-[10px]">{signal.type}</Badge>
+                      <Badge variant="purple" className="text-[10px]">{formatStrategy(signal.strategy_type)}</Badge>
+                      <span className={cn("flex items-center gap-1 text-xs font-semibold", signal.direction === "BUY" ? "text-buy" : "text-sell")}>
                     {signal.direction === "BUY" ? <ArrowUpRight className="h-3.5 w-3.5" /> : <ArrowDownRight className="h-3.5 w-3.5" />}
                     {signal.direction}
                   </span>
                 </div>
                 <div className="num text-xs text-foreground">{signal.price?.toFixed(2) ?? "--"}</div>
-                <div className="text-[10px] text-muted-foreground">{signal.basis} | {signal.timeframe}</div>
+                <div className="text-[10px] text-muted-foreground">{signal.basis} | {signal.timeframe} | {signal.session_name ?? "session n/a"}</div>
               </div>
               <div className="text-right">
                 <div className="num text-sm font-bold text-gold-300">Q{signal.quality}</div>
@@ -215,6 +225,7 @@ export default function Dashboard() {
                     {trade.direction === "BUY" ? <ArrowUpRight className="h-3.5 w-3.5" /> : <ArrowDownRight className="h-3.5 w-3.5" />}
                     {trade.direction}
                   </span>
+                  <Badge variant="purple" className="text-[10px]">{formatStrategy(trade.strategy_type)}</Badge>
                 </div>
                 <Badge variant="gold" className="text-[10px]">{trade.status}</Badge>
               </div>
@@ -304,6 +315,28 @@ function MetricCard({ label, value, accent }: { label: string; value: string; ac
   )
 }
 
+function StrategySummaryCard({
+  title,
+  stats,
+}: {
+  title: string
+  stats: { live: number; closed: number; wins: number; losses: number; netPips: number; winRate: string }
+}) {
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <CardTitle>{title}</CardTitle>
+      </CardHeader>
+      <CardContent className="grid grid-cols-2 gap-2 pt-0 md:grid-cols-4">
+        <MetaBox label="Live Setups" value={String(stats.live)} tone="gold" />
+        <MetaBox label="Wins / Losses" value={`${stats.wins}/${stats.losses}`} tone={stats.wins >= stats.losses ? "buy" : "sell"} />
+        <MetaBox label="Net Pips" value={`${stats.netPips >= 0 ? "+" : ""}${stats.netPips.toFixed(1)}`} tone={stats.netPips >= 0 ? "buy" : "sell"} />
+        <MetaBox label="Win Rate" value={stats.winRate} tone="gold" />
+      </CardContent>
+    </Card>
+  )
+}
+
 function FeedCard({
   title,
   actionLabel,
@@ -364,6 +397,16 @@ function InfoRow({ label, value, mono, valueClass }: { label: string; value: str
   )
 }
 
+function MetaBox({ label, value, tone }: { label: string; value: string; tone: "gold" | "buy" | "sell" }) {
+  const color = tone === "buy" ? "text-buy" : tone === "sell" ? "text-sell" : "text-gold-300"
+  return (
+    <div className="rounded-lg border border-ap-border bg-ap-surface/35 px-3 py-3">
+      <div className="label-xs">{label}</div>
+      <div className={cn("num mt-2 text-sm font-bold", color)}>{value}</div>
+    </div>
+  )
+}
+
 function formatMaybeNumber(value?: number | null) {
   return value != null ? value.toFixed(2) : "Unavailable"
 }
@@ -375,6 +418,37 @@ function formatBiasLabel(value?: string | null) {
 function formatSessionName(value?: string | null) {
   if (!value) return "Off-session"
   return value.replace(/_/g, " ")
+}
+
+function formatStrategy(value?: string | null) {
+  return (value ?? "gap_sweep").replace(/_/g, " ")
+}
+
+function buildStrategyStats(trades: Array<{ strategy_type?: string | null; status: string; result: string | null; realized_pips?: number | null }>) {
+  const seed = {
+    gap_sweep: { live: 0, closed: 0, wins: 0, losses: 0, netPips: 0 },
+    engulfing_rejection: { live: 0, closed: 0, wins: 0, losses: 0, netPips: 0 },
+  }
+  for (const trade of trades) {
+    const key = trade.strategy_type === "engulfing_rejection" ? "engulfing_rejection" : "gap_sweep"
+    const bucket = seed[key]
+    const closed = ["COMPLETED", "STOP_LOSS_HIT", "CANCELLED"].includes(trade.status) || Boolean(trade.result)
+    if (closed) {
+      bucket.closed += 1
+      if (String(trade.result ?? trade.status).toLowerCase().includes("win") || trade.status === "COMPLETED") bucket.wins += 1
+      if (String(trade.result ?? trade.status).toLowerCase().includes("loss") || trade.status === "STOP_LOSS_HIT") bucket.losses += 1
+      bucket.netPips += trade.realized_pips ?? 0
+    } else {
+      bucket.live += 1
+    }
+  }
+  return {
+    gap_sweep: { ...seed.gap_sweep, winRate: seed.gap_sweep.closed ? `${Math.round((seed.gap_sweep.wins / seed.gap_sweep.closed) * 100)}%` : "0%" },
+    engulfing_rejection: {
+      ...seed.engulfing_rejection,
+      winRate: seed.engulfing_rejection.closed ? `${Math.round((seed.engulfing_rejection.wins / seed.engulfing_rejection.closed) * 100)}%` : "0%",
+    },
+  }
 }
 
 function biasColor(value?: string | null) {

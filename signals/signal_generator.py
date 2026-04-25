@@ -26,6 +26,7 @@ from config.settings import (
     ACTIVE_TIMEFRAME_PAIR_LABELS,
     BIAS_STRONG_BLOCK_COUNTER_TREND,
     SESSION_TP1_MIN_PIPS,
+    ENGULF_ALLOWED_LIVE_TIMEFRAMES,
 )
 from utils.helpers import price_to_pips
 from utils.logger import get_logger
@@ -60,8 +61,11 @@ class SignalGenerator:
         entry = conf.entry_price
         sl    = conf.sl_price
         tf_pair = f"{setup.higher_tf}-{setup.lower_tf}"
+        strategy_name = getattr(setup, "strategy_type", "gap_sweep") or "gap_sweep"
 
-        if tf_pair not in ACTIVE_TIMEFRAME_PAIR_LABELS:
+        if tf_pair not in ACTIVE_TIMEFRAME_PAIR_LABELS and not (
+            strategy_name == "engulfing_rejection" and setup.lower_tf in ENGULF_ALLOWED_LIVE_TIMEFRAMES
+        ):
             reason = f"Timeframe pair disabled: {tf_pair}"
             logger.info("Signal rejected - %s", reason)
             return None, reason
@@ -138,7 +142,7 @@ class SignalGenerator:
         confidence = self._get_confidence(setup)
 
         # ── 7b. Apply strategy performance multiplier ────────────────────────
-        confidence, strategy_skip = self._apply_strategy_score(confidence, "default")
+        confidence, strategy_skip = self._apply_strategy_score(confidence, strategy_name)
         if strategy_skip:
             return None, strategy_skip
 
@@ -178,6 +182,16 @@ class SignalGenerator:
             pd_location=getattr(setup, "pd_location", ""),
             high_quality_trade=getattr(setup, "high_quality_trade", False),
             micro_strength=getattr(setup, "micro_strength", "normal"),
+            strategy_type=strategy_name,
+            source=getattr(setup, "source", "live_bot"),
+            dominant_bias=getattr(setup, "dominant_bias", setup.h4_bias),
+            bias_strength=getattr(setup, "bias_strength", "weak"),
+            confirmation_score=float(getattr(setup, "confirmation_score", 0.0) or 0.0),
+            confirmation_path=getattr(setup, "confirmation_path", ""),
+            quality_rejection_count=int(getattr(setup, "quality_rejection_count", 0) or 0),
+            structure_break_count=int(getattr(setup, "structure_break_count", 0) or 0),
+            level_timeframe=getattr(setup.level, "timeframe", setup.lower_tf),
+            confluence_with=list(getattr(setup, "confluence_with", []) or []),
         )
 
         tp1_pips = price_to_pips(tp1_dist)
@@ -464,5 +478,13 @@ class SignalGenerator:
         # Boost for high-performing strategies
         if score > 0.70:
             adjusted = min(1.0, adjusted * 1.1)
+
+        logger.info(
+            "SPENCER LEARNING WEIGHT APPLIED: strategy=%s | weight=%.2f | base=%.0f%% -> %.0f%%",
+            strategy_name,
+            score,
+            base_confidence * 100,
+            adjusted * 100,
+        )
 
         return round(adjusted, 3), ""

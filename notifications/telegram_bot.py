@@ -364,14 +364,30 @@ class TelegramBot:
         action = trade.direction
         model_tag = self._model_tag(trade)
         tf_pair = f"{trade.higher_tf} → {trade.lower_tf}"
+        strategy_title = model_tag.upper()
         if action == "BUY":
             confirmation = f"First bearish rejection closed above support ({trade.lower_tf})"
         else:
             confirmation = f"First bullish rejection closed below resistance ({trade.lower_tf})"
         bias = self._bias_storyline_label(trade.h4_bias)
+        extra = ""
+        if getattr(trade, "strategy_type", "") == "engulfing_rejection":
+            extra = (
+                f"\nStrategy: Engulfing Rejection"
+                f"\nBias: {getattr(trade, 'dominant_bias', trade.h4_bias)}/{getattr(trade, 'bias_strength', 'weak')}"
+                f"\nSession: {trade.session_name or 'off_session'}"
+                f"\nQuality Rejections: {getattr(trade, 'quality_rejection_count', 0)}"
+                f"\nStructure Breaks: {getattr(trade, 'structure_break_count', 0)}"
+                f"\nConfirmation Path: {getattr(trade, 'confirmation_path', 'combined') or 'combined'}"
+                f"\nConfirmation Score: {float(getattr(trade, 'confirmation_score', 0.0) or 0.0):.0f}"
+            )
+        if getattr(trade, "confluence_with", None):
+            extra += f"\nConfluence: {model_tag} + {', '.join(trade.confluence_with).replace('_', ' ').title()}"
 
         msg = (
-            f"🚀 {action} {trade.pair}\n\n"
+            f"🚀 SPENCER LIVE SETUP — {strategy_title}\n\n"
+            f"Symbol: {trade.pair}\n"
+            f"Direction: {action}\n"
             f"Set Pending Order: {trade.entry_price:.2f}\n"
             f"Stop Loss: {trade.sl_price:.2f}\n\n"
             f"TP1: {trade.tp1:.2f}\n"
@@ -380,7 +396,8 @@ class TelegramBot:
             f"Timeframes: {tf_pair}\n"
             f"Setup Type: {model_tag}\n"
             f"Confirmation: {confirmation}\n"
-            f"Bias: {bias}\n\n"
+            f"Bias Storyline: {bias}\n"
+            f"{extra}\n\n"
             f"Status: Waiting for retest entry"
         )
         return self._send_logged("PENDING ORDER ALERT", msg, parse_mode=None)
@@ -584,6 +601,11 @@ class TelegramBot:
     @staticmethod
     def _model_tag(trade: Trade) -> str:
         """Return a human-readable model label for the trade."""
+        strategy_type = getattr(trade, "strategy_type", "")
+        if strategy_type == "gap_sweep":
+            return "Gap Sweep"
+        if strategy_type == "engulfing_rejection":
+            return "Engulfing Rejection"
         setup = getattr(trade, "setup_type", "major")
         _LABELS = {
             "lsd_swing":               "LSD Swing",

@@ -18,13 +18,15 @@ Per-scan flow
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
+from config.settings import LEVEL_TOLERANCE_PIPS, LIVE_ENABLED_STRATEGIES, PIP_SIZE
+from strategies.engulfing_live import LiveEngulfingAnalyzer
 from strategies.multi_timeframe import MultiTimeframeAnalyzer, SetupResult, MarketOutlook
 from utils.logger import get_logger
 
@@ -69,6 +71,7 @@ class StrategySignal:
     direction: str           # "BUY" | "SELL"
     pair: str
     setup: Optional[SetupResult] = None
+    confluence_strategies: List[str] = field(default_factory=list)
 
     # ── Convenience properties ────────────────────────────────────────────────
 
@@ -118,10 +121,10 @@ class StrategySignal:
         if self.setup:
             s = self.setup
             return (
-                f"default:{s.setup_type}:{s.direction}:{s.level.level_type}:"
+                f"{self.strategy_name}:{s.setup_type}:{s.direction}:{s.level.level_type}:"
                 f"{s.confirmation.entry_price:.2f}:{s.higher_tf}-{s.lower_tf}"
             )
-        return f"default:unknown:{self.direction}:{self.level_price:.2f}"
+        return f"{self.strategy_name}:unknown:{self.direction}:{self.level_price:.2f}"
 
 
 @dataclass
@@ -149,9 +152,10 @@ class StrategyManager:
 
     def __init__(self, learning_engine=None):
         self._analyzer = MultiTimeframeAnalyzer()
+        self._engulfing = LiveEngulfingAnalyzer()
         self._learning = learning_engine
-
-        logger.info("StrategyManager initialised — DEFAULT strategy active.")
+        self._enabled = list(LIVE_ENABLED_STRATEGIES)
+        logger.info("StrategyManager initialised — enabled live strategies: %s", ", ".join(self._enabled))
 
     # ─────────────────────────────────────────────────────
     # TIMEFRAMES
@@ -159,7 +163,10 @@ class StrategyManager:
 
     def get_required_timeframes(self) -> List[str]:
         """All timeframes needed by the DEFAULT strategy."""
-        return self._analyzer.get_required_timeframes()
+        required = set(self._analyzer.get_required_timeframes())
+        if "engulfing_rejection" in self._enabled:
+            required.update({"D1", "H4", "H1", "M30"})
+        return sorted(required)
 
     # ─────────────────────────────────────────────────────
     # MAIN ENTRY POINT
@@ -179,25 +186,35 @@ class StrategyManager:
 
         # ── DEFAULT strategy ──────────────────────────────────────────────────
         self._analyzer.learning_engine = self._learning
-        outlook, default_setups = self._analyzer.analyze(
+        outlook, gap_setups = self._analyzer.analyze(
             data, current_price=current_price, analysis_time=analysis_time
         )
-        signals: List[StrategySignal] = [_wrap_setup(s) for s in default_setups]
+        signals: List[StrategySignal] = []
+        if "gap_sweep" in self._enabled:
+            signals.extend(_wrap_setups(gap_setups, "gap_sweep"))
+        if "engulfing_rejection" in self._enabled:
+            engulf_setups = self._engulfing.analyze(
+                data,
+                pair=outlook.pair,
+                current_price=current_price,
+                context=outlook.context,
+            )
+            signals.extend(_wrap_setups(engulf_setups, "engulfing_rejection"))
+        signals = self._merge_confluence(signals)
 
         # ── Market condition (classification only — no gating) ────────────────
         condition = self._detect_condition(data)
 
         # ── Strategy score (learning transparency — does NOT gate execution) ──
         scores: Dict[str, StrategyScore] = {
-            "default": self._score_strategy("default"),
+            "gap_sweep": self._score_strategy("gap_sweep"),
         }
+        if "engulfing_rejection" in self._enabled:
+            scores["engulfing_rejection"] = self._score_strategy("engulfing_rejection")
 
         # ── Logging ───────────────────────────────────────────────────────────
-        score = scores["default"]
-        logger.info(
-            "Market Condition: %s | DEFAULT score: %.0fpts (%dT) | %d signal(s)",
-            condition, score.raw_score, score.trades_seen, len(signals),
-        )
+        score_parts = [f"{name}={score.raw_score:.0f}pts/{score.trades_seen}T" for name, score in scores.items()]
+        logger.info("Market Condition: %s | %s | %d signal(s)", condition, " | ".join(score_parts), len(signals))
 
         return StrategyRunResult(
             outlook=outlook,
@@ -278,17 +295,54 @@ class StrategyManager:
             logger.warning("Score lookup failed for '%s': %s", name, exc)
             return StrategyScore(name=name, raw_score=50.0, trades_seen=0)
 
+    @staticmethod
+    def _merge_confluence(signals: List[StrategySignal]) -> List[StrategySignal]:
+        if not signals:
+            return signals
+        tolerance = LEVEL_TOLERANCE_PIPS * PIP_SIZE * 2.0
+        merged: List[StrategySignal] = []
+        for signal in sorted(signals, key=lambda s: s.confidence, reverse=True):
+            existing = next(
+                (
+                    item for item in merged
+                    if item.pair == signal.pair
+                    and item.direction == signal.direction
+                    and abs(item.level_price - signal.level_price) <= tolerance
+                ),
+                None,
+            )
+            if existing is None:
+                merged.append(signal)
+                continue
+            combined = {existing.strategy_name, signal.strategy_name, *existing.confluence_strategies, *signal.confluence_strategies}
+            if signal.confidence > existing.confidence:
+                signal.confluence_strategies = sorted(s for s in combined if s != signal.strategy_name)
+                if signal.setup is not None:
+                    signal.setup.confluence_with = list(signal.confluence_strategies)
+                merged[merged.index(existing)] = signal
+            else:
+                existing.confluence_strategies = sorted(s for s in combined if s != existing.strategy_name)
+                if existing.setup is not None:
+                    existing.setup.confluence_with = list(existing.confluence_strategies)
+        return merged
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODULE-LEVEL HELPER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _wrap_setup(setup: SetupResult) -> StrategySignal:
-    return StrategySignal(
-        strategy_name="default",
-        signal_type="setup",
-        confidence=setup.confidence,
-        direction=setup.direction,
-        pair=setup.pair,
-        setup=setup,
-    )
+def _wrap_setups(setups: List[SetupResult], strategy_name: str) -> List[StrategySignal]:
+    wrapped: List[StrategySignal] = []
+    for setup in setups:
+        setup.strategy_type = strategy_name
+        wrapped.append(
+            StrategySignal(
+                strategy_name=strategy_name,
+                signal_type="setup",
+                confidence=setup.confidence,
+                direction=setup.direction,
+                pair=setup.pair,
+                setup=setup,
+            )
+        )
+    return wrapped

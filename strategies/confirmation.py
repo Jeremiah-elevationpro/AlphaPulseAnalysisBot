@@ -30,7 +30,7 @@ is extended by one bar automatically in check_confirmations().
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional
 import pandas as pd
 
 from strategies.level_detector import LevelInfo
@@ -125,6 +125,7 @@ class ConfirmationEngine:
         levels: list[LevelInfo],
         timeframe: str,
         lookback: int = 1,
+        allowed_confirmation_types: Optional[Iterable[str]] = None,
     ) -> list[ConfirmationResult]:
         """
         Check the last `lookback` closed candles for confirmation signals.
@@ -140,6 +141,8 @@ class ConfirmationEngine:
         self.last_rejections = []
         results: list[ConfirmationResult] = []
         seen: set = set()
+        allowed_types = set(allowed_confirmation_types or [])
+        use_all_types = not allowed_types
 
         # One extra bar beyond the lookback window supplies the "previous" candle
         # for two-bar patterns; the final bar is excluded (still open).
@@ -157,44 +160,47 @@ class ConfirmationEngine:
             for level in levels:
 
                 # ── 1. Standard rejection (single-candle) ─────────────
-                result = self._check_sell(o, h, l, c, t, idx, level, timeframe)
-                if result and result.confirmed:
-                    key = (idx, "SELL")
-                    if key not in seen:
-                        seen.add(key)
-                        results.append(result)
-                    continue
+                if use_all_types or "rejection" in allowed_types:
+                    result = self._check_sell(o, h, l, c, t, idx, level, timeframe)
+                    if result and result.confirmed:
+                        key = (idx, "SELL")
+                        if key not in seen:
+                            seen.add(key)
+                            results.append(result)
+                        continue
 
-                result = self._check_buy(o, h, l, c, t, idx, level, timeframe)
-                if result and result.confirmed:
-                    key = (idx, "BUY")
-                    if key not in seen:
-                        seen.add(key)
-                        results.append(result)
-                    continue
+                    result = self._check_buy(o, h, l, c, t, idx, level, timeframe)
+                    if result and result.confirmed:
+                        key = (idx, "BUY")
+                        if key not in seen:
+                            seen.add(key)
+                            results.append(result)
+                        continue
 
                 if prev is None:
                     continue
 
                 # ── 2. Liquidity sweep + reclaim (two-bar) ────────────
-                result = self._check_sweep_reclaim(prev, row, idx, level, timeframe)
-                if result and result.confirmed:
-                    key = (idx, result.direction)
-                    if key not in seen:
-                        seen.add(key)
-                        results.append(result)
-                    continue
+                if use_all_types or "liquidity_sweep_reclaim" in allowed_types:
+                    result = self._check_sweep_reclaim(prev, row, idx, level, timeframe)
+                    if result and result.confirmed:
+                        key = (idx, result.direction)
+                        if key not in seen:
+                            seen.add(key)
+                            results.append(result)
+                        continue
 
                 # ── 3. Engulfing reversal (two-bar) ───────────────────
-                result = self._check_engulfing(prev, row, idx, level, timeframe)
-                if result and result.confirmed:
-                    key = (idx, result.direction)
-                    if key not in seen:
-                        seen.add(key)
-                        results.append(result)
+                if use_all_types or "engulfing_reversal" in allowed_types:
+                    result = self._check_engulfing(prev, row, idx, level, timeframe)
+                    if result and result.confirmed:
+                        key = (idx, result.direction)
+                        if key not in seen:
+                            seen.add(key)
+                            results.append(result)
 
         # ── 4. Double-pattern upgrade (post-process) ──────────────────
-        if "double_pattern" in _ACTIVE_MICRO_TYPES:
+        if (use_all_types or "double_pattern" in allowed_types) and "double_pattern" in _ACTIVE_MICRO_TYPES:
             self._upgrade_double_patterns(results, window)
 
         return results

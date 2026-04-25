@@ -21,7 +21,7 @@ export default function Signals() {
       if (direction !== "all" && signal.direction !== direction) return false
       if (
         q &&
-        !`${signal.type} ${signal.price ?? ""} ${signal.basis} ${signal.timeframe} ${signal.direction}`
+        !`${signal.type} ${signal.strategy_type ?? ""} ${signal.price ?? ""} ${signal.basis} ${signal.timeframe} ${signal.direction}`
           .toLowerCase()
           .includes(q)
       ) {
@@ -65,7 +65,7 @@ export default function Signals() {
         <Card>
           <CardHeader className="pb-3">
             <CardTitle>Signal List</CardTitle>
-            <CardDescription>Gap-based active-path signals flowing in from the API.</CardDescription>
+            <CardDescription>Live forward-test signals flowing in from the API by strategy.</CardDescription>
           </CardHeader>
           <CardContent className="pt-0 space-y-3">
             {isLoading ? <State label="Loading signals..." /> : null}
@@ -85,6 +85,7 @@ export default function Signals() {
                   <div className="space-y-2">
                     <div className="flex flex-wrap items-center gap-2">
                       <Badge variant={signal.type === "Gap" ? "gold" : "outline"} className="text-[10px]">{signal.type}</Badge>
+                      <Badge variant="purple" className="text-[10px]">{formatStrategy(signal.strategy_type)}</Badge>
                       <Badge variant={signal.direction === "BUY" ? "buy" : "sell"} className="text-[10px]">
                         {signal.direction}
                       </Badge>
@@ -93,10 +94,10 @@ export default function Signals() {
                       </Badge>
                     </div>
                     <div className="num text-base font-bold text-foreground">{signal.price?.toFixed(2) ?? "--"}</div>
-                    <div className="text-[11px] text-muted-foreground">{signal.basis} | {signal.timeframe}</div>
+                    <div className="text-[11px] text-muted-foreground">{signal.basis} | {signal.timeframe} | {signal.session_name ?? "--"}</div>
                     <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
                       <span>Quality <span className="num text-gold-400">Q{signal.quality}</span></span>
-                      <span>Bias {signal.h4_bias ?? "--"}</span>
+                      <span>Bias {signal.h4_bias ?? "--"} / {signal.bias_strength ?? "--"}</span>
                     </div>
                   </div>
                   <ChevronRight className="h-4 w-4 text-muted-foreground/40" />
@@ -131,10 +132,13 @@ export default function Signals() {
 
                 <div className="grid grid-cols-2 gap-2">
                   <Meta label="Type" value={selected.type} />
+                  <Meta label="Strategy" value={formatStrategy(selected.strategy_type)} />
                   <Meta label="Status" value={selected.status} />
                   <Meta label="Quality" value={`Q${selected.quality}`} />
                   <Meta label="Bias" value={selected.h4_bias ?? "--"} />
+                  <Meta label="Bias Strength" value={selected.bias_strength ?? "--"} />
                   <Meta label="Displacement" value={selected.displacement.toFixed(1)} />
+                  <Meta label="Session" value={selected.session_name ?? "--"} />
                   <Meta label="Created" value={new Date(selected.created_at).toLocaleString()} />
                 </div>
 
@@ -147,6 +151,8 @@ export default function Signals() {
                     <p>Level price: <span className="num text-foreground">{selected.level_price?.toFixed(2) ?? "--"}</span></p>
                     <p>Touch count: <span className="num text-foreground">{selected.touch_count}</span></p>
                     <p>Break count: <span className="num text-foreground">{selected.break_count}</span></p>
+                    <p>Confirmation score: <span className="num text-foreground">{selected.confirmation_score ?? "--"}</span></p>
+                    <p>Quality rejections: <span className="num text-foreground">{selected.quality_rejection_count ?? "--"}</span></p>
                   </div>
                 </div>
               </div>
@@ -156,6 +162,10 @@ export default function Signals() {
       </div>
     </div>
   )
+}
+
+function formatStrategy(value?: string | null) {
+  return (value ?? "gap_sweep").replace(/_/g, " ")
 }
 
 function Pill({ options, active, onChange }: { options: string[]; active: string; onChange: (value: string) => void }) {
