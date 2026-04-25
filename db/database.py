@@ -717,6 +717,46 @@ class Database:
         "reject_summary",
     })
 
+    _OPTIONAL_MULTI_STRATEGY_RUN_COLUMNS: frozenset = frozenset({
+        "symbol", "strategies", "months_tested", "replay_start", "replay_end",
+        "status", "total_trades", "wins", "losses", "win_rate",
+        "tp1_rate", "tp2_rate", "tp3_rate", "net_pips", "avg_pips",
+        "strategy_summary", "session_summary", "confluence_summary",
+        "learning_summary", "notes", "created_at", "completed_at",
+    })
+
+    _OPTIONAL_MULTI_STRATEGY_TRADE_COLUMNS: frozenset = frozenset({
+        "multi_run_id", "source", "symbol", "strategy_type", "setup_type",
+        "confirmation_type", "confirmation_score",
+        "direction", "timeframe", "timeframe_pair", "session_name", "market_condition",
+        "dominant_bias", "bias_strength", "d1_bias", "h4_bias", "h1_bias",
+        "level_type", "level_price", "level_high", "level_low", "level_mid",
+        "quality_score", "quality_rejection_count", "structure_break_count",
+        "confluence", "confluence_strategy_types", "confluence_level_distance_pips",
+        "entry", "sl", "tp1", "tp2", "tp3",
+        "sl_pips", "tp1_pips", "tp2_pips", "tp3_pips",
+        "activated_at", "closed_at",
+        "final_result", "tp_progress", "protected_after_tp1",
+        "final_pips", "reward_score",
+        "learning_feature_key", "learning_weight", "failure_reason", "created_at",
+    })
+
+    _REQUIRED_MULTI_STRATEGY_TRADE_COLUMNS: frozenset = frozenset({
+        "strategy_type", "direction", "entry", "final_result",
+    })
+
+    _OPTIONAL_STRATEGY_LEARNING_PROFILE_COLUMNS: frozenset = frozenset({
+        "strategy_type", "symbol", "session_name", "timeframe", "direction",
+        "dominant_bias", "bias_strength", "confirmation_type", "level_type",
+        "sample_size", "wins", "losses", "win_rate",
+        "tp1_rate", "tp2_rate", "tp3_rate",
+        "net_pips", "avg_pips", "reward_score_avg",
+        "confidence_tier", "recommended_weight",
+        "best_session", "worst_session",
+        "last_replay_run_id", "last_multi_run_id",
+        "profile_key", "created_at", "updated_at",
+    })
+
     _OPTIONAL_LIVE_TRADE_COLUMNS: frozenset = frozenset({
         "setup_type",
         "is_qm",
@@ -1150,6 +1190,92 @@ class Database:
             "stats": stats,
             "trades": trades,
         }
+
+    # ─────────────────────────────────────────────────────────────────────
+    # MULTI-STRATEGY REPLAY
+    # ─────────────────────────────────────────────────────────────────────
+
+    def create_multi_strategy_replay_run(self, payload: Dict[str, Any]) -> Optional[int]:
+        return self._post_with_missing_column_fallback(
+            "multi_strategy_replay_runs",
+            payload,
+            self._OPTIONAL_MULTI_STRATEGY_RUN_COLUMNS,
+            "multi strategy replay run",
+        )
+
+    def update_multi_strategy_replay_run(self, run_id: int, payload: Dict[str, Any]) -> None:
+        self._patch_with_missing_column_fallback(
+            "multi_strategy_replay_runs",
+            {"id": run_id},
+            payload,
+            self._OPTIONAL_MULTI_STRATEGY_RUN_COLUMNS,
+            "multi strategy replay run",
+        )
+
+    def insert_multi_strategy_replay_trade(self, payload: Dict[str, Any]) -> Optional[int]:
+        return self._post_with_missing_column_fallback(
+            "multi_strategy_replay_trades",
+            payload,
+            self._OPTIONAL_MULTI_STRATEGY_TRADE_COLUMNS,
+            "multi strategy replay trade",
+            self._REQUIRED_MULTI_STRATEGY_TRADE_COLUMNS,
+        )
+
+    def get_latest_multi_strategy_replay_run(self) -> Optional[Dict]:
+        if not self._sb:
+            raise RuntimeError("Multi-strategy replay persistence requires USE_SUPABASE=true")
+        rows = self._sb._get(
+            "multi_strategy_replay_runs",
+            {"order": "id.desc"},
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    def get_multi_strategy_replay_run(self, run_id: int) -> Optional[Dict]:
+        if not self._sb:
+            raise RuntimeError("Multi-strategy replay persistence requires USE_SUPABASE=true")
+        rows = self._sb._get(
+            "multi_strategy_replay_runs",
+            {"id": f"eq.{run_id}"},
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    def get_multi_strategy_replay_trades(self, run_id: int, limit: int = 10000) -> List[Dict]:
+        if not self._sb:
+            raise RuntimeError("Multi-strategy replay persistence requires USE_SUPABASE=true")
+        return self._sb._get(
+            "multi_strategy_replay_trades",
+            {"multi_run_id": f"eq.{run_id}", "order": "id.asc"},
+            limit=limit,
+        )
+
+    def upsert_strategy_learning_profile(self, profile_key: str, payload: Dict[str, Any]) -> None:
+        if not self._sb:
+            return
+        payload = dict(payload)
+        payload["profile_key"] = profile_key
+        try:
+            self._sb._upsert(
+                "strategy_learning_profiles",
+                payload,
+                on_conflict="profile_key",
+            )
+        except Exception as exc:
+            # Strip unknown columns and retry bare minimum
+            minimal = {
+                k: payload[k] for k in (
+                    "profile_key", "strategy_type", "symbol", "session_name",
+                    "direction", "dominant_bias", "sample_size", "wins", "losses",
+                    "win_rate", "net_pips", "avg_pips", "confidence_tier",
+                    "recommended_weight", "last_multi_run_id",
+                )
+                if k in payload
+            }
+            try:
+                self._sb._upsert("strategy_learning_profiles", minimal, on_conflict="profile_key")
+            except Exception:
+                logger.warning("strategy_learning_profiles upsert failed: %s", exc)
 
     def upsert_performance(self, level_type: str, tf_pair: str,
                            wins: int, losses: int, reward: float):
