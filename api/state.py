@@ -108,3 +108,10 @@ def clear_heartbeat() -> None:
             HEARTBEAT_FILE.unlink()
     except Exception:
         pass
+
+
+def mark_db_failure() -> None:
+    """Call when a DB query fails at request time — resets the healthy flag so
+    subsequent endpoint guards skip DB calls instead of raising 500."""
+    global db_ready
+    db_ready = False

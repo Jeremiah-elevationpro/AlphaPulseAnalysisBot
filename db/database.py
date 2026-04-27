@@ -118,7 +118,12 @@ class SupabaseDB:
             "Content-Type": "application/json",
             "Prefer": "return=representation",
         }
-        # Verify connectivity and that tables exist
+        # Quick connectivity probe — use a short timeout so the API starts fast
+        # even when Supabase is temporarily unavailable.
+        saved_timeout = self._request_timeout
+        saved_retries = self._retry_delays
+        self._request_timeout = (5, 10)   # 5 s connect, 10 s read
+        self._retry_delays = ()            # no retries during startup probe
         try:
             self._get("trades", limit=1)
         except Exception as e:
@@ -130,6 +135,10 @@ class SupabaseDB:
                     "  Dashboard -> SQL Editor -> New query -> paste setup_supabase.sql -> Run"
                 ) from e
             raise
+        finally:
+            # Restore full timeouts + retries for normal operations
+            self._request_timeout = saved_timeout
+            self._retry_delays = saved_retries
         logger.info("Supabase REST client ready — %s", SUPABASE_URL)
 
     # ── Low-level helpers ────────────────────────────────

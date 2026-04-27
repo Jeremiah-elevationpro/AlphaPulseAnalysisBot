@@ -122,8 +122,9 @@ def list_setups():
         rows = state.db.get_manual_setups(limit=500)
         setups = [_shape_setup(row) for row in rows]
         return {"setups": setups, "total": len(setups), "db_ready": True}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception:
+        state.mark_db_failure()
+        return {"setups": [], "total": 0, "db_ready": False}
 
 
 @router.post("/setups", status_code=201)
@@ -150,7 +151,8 @@ def create_setup(body: SetupCreate):
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        state.mark_db_failure()
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {exc}")
 
     # Send Telegram saved alert (non-blocking — failure does not break the response)
     tg_sent = False
@@ -196,7 +198,8 @@ def update_setup(setup_id: int, body: SetupUpdate):
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        state.mark_db_failure()
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {exc}")
 
 
 @router.delete("/setups/{setup_id}")
@@ -212,4 +215,5 @@ def delete_setup(setup_id: int):
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+        state.mark_db_failure()
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {exc}")
