@@ -266,13 +266,18 @@ def start_bot():
         else [sys.executable, "main.py"]
     )
 
-    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    creationflags = (
+        getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    )
     try:
         state.bot_process = subprocess.Popen(
             command,
             cwd=state.ROOT_DIR,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            close_fds=True,          # prevent inheriting uvicorn's port-8000 socket on Windows
             creationflags=creationflags,
         )
     except Exception as exc:
