@@ -60,10 +60,14 @@ class HistoricalReplayEngine:
     ):
         self.db = db or Database()
         self.mt5 = mt5 or MT5Client()
-        self.strategy_manager = strategy_manager or StrategyManager(learning_engine=None)
+        self.strategy_manager = strategy_manager or StrategyManager(
+            learning_engine=None,
+            enabled_strategies=["gap_sweep"],
+        )
         self.signal_generator = signal_generator or SignalGenerator(learning_engine=None)
         self.session_filter = SessionFilter()
         self.storage = ReplayStorage(self.db)
+        self._enabled_replay_strategies = list(getattr(self.strategy_manager, "enabled_strategies", ["gap_sweep"]))
         if DISABLED_TIMEFRAME_PAIRS:
             disabled = ", ".join(f"{high}->{low}" for high, low in DISABLED_TIMEFRAME_PAIRS)
             logger.info("Historical replay disabled timeframe pair(s): %s", disabled)
@@ -96,6 +100,7 @@ class HistoricalReplayEngine:
                 raise RuntimeError(f"No {REPLAY_STEP_TIMEFRAME} data available for replay")
 
             result = self._replay(replay_run_id, history, start, end)
+            result["replay_run_id"] = replay_run_id
             self.storage.finish_run(replay_run_id, status="completed", counters=result)
             logger.info("Historical replay completed: %s", result)
             return result
@@ -134,11 +139,13 @@ class HistoricalReplayEngine:
         end: datetime,
     ) -> Dict:
         counters = ReplayCounters()
+        strategy_balance = self._init_strategy_balance()
         seen_watchlists = set()
         seen_pending = set()
         pending: Dict[str, PendingReplayTrade] = {}
         activated_or_closed: Dict[str, PendingReplayTrade] = {}
         _snapshot_micro_logged = False
+        logged_strategy_skip_reasons: set[tuple[str, str]] = set()
 
         step_df = history[REPLAY_STEP_TIMEFRAME]
         step_delta = timedelta(minutes=_TF_MINUTES.get(REPLAY_STEP_TIMEFRAME, 15))
@@ -150,6 +157,12 @@ class HistoricalReplayEngine:
             current_price = float(row["close"])
             snapshot = self._snapshot(history, bar_close_time)
             if not self._snapshot_ready(snapshot):
+                for strategy_name in self._enabled_replay_strategies:
+                    self._log_strategy_skipped_once(
+                        logged_strategy_skip_reasons,
+                        strategy_name,
+                        "missing data",
+                    )
                 continue
 
             session_label = self.session_filter.get_session(bar_close_time)
@@ -178,17 +191,36 @@ class HistoricalReplayEngine:
                 row=row,
                 bar_time=bar_close_time,
                 counters=counters,
+                strategy_balance=strategy_balance,
             )
 
             if not replay_allowed:
                 logger.info("REPLAY SCAN SKIPPED: outside bot operating window | %s", local_time)
+                for strategy_name in self._enabled_replay_strategies:
+                    self._log_strategy_skipped_once(
+                        logged_strategy_skip_reasons,
+                        strategy_name,
+                        "outside replay window",
+                    )
                 continue
+
+            for strategy_name in self._enabled_replay_strategies:
+                strategy_balance[strategy_name]["scans_run"] += 1
 
             run_result = self.strategy_manager.run(
                 snapshot,
                 current_price=current_price,
                 analysis_time=bar_close_time,
             )
+            signal_counts = defaultdict(int)
+            for signal in run_result.signals:
+                signal_counts[signal.strategy_name] += 1
+            for strategy_name in self._enabled_replay_strategies:
+                count = int(signal_counts.get(strategy_name, 0))
+                strategy_balance[strategy_name]["candidates_found"] += count
+                if strategy_name == "engulfing_rejection":
+                    strategy_balance[strategy_name]["shortlisted"] += count
+                    strategy_balance[strategy_name]["revisited"] += count
             self._count_watchlists(
                 run_result.outlook,
                 current_price,
@@ -199,6 +231,11 @@ class HistoricalReplayEngine:
             for signal in run_result.signals:
                 if not self._is_active_tf_pair(signal.tf_pair_str):
                     logger.info("REPLAY SIGNAL SKIPPED: disabled timeframe pair %s", signal.tf_pair_str)
+                    self._log_strategy_skipped_once(
+                        logged_strategy_skip_reasons,
+                        signal.strategy_name,
+                        "unsupported timeframe",
+                    )
                     continue
                 key = signal.fingerprint()
                 if key in seen_pending or key in pending or key in activated_or_closed:
@@ -220,6 +257,7 @@ class HistoricalReplayEngine:
                 pending[key] = pending_trade
                 seen_pending.add(key)
                 counters.total_pending_order_ready += 1
+                strategy_balance[signal.strategy_name]["pending_ready"] += 1
                 level_type = getattr(getattr(signal.setup, "level", None), "level_type", "?")
                 logger.info(
                     "REPLAY PENDING ORDER READY: %s %s %.2f | %s | %s",
@@ -245,13 +283,28 @@ class HistoricalReplayEngine:
                     counters.total_losses += 1
                 elif replay_trade.final_result != "OPEN":
                     counters.total_wins += 1
+                self._record_closed_trade(strategy_balance, replay_trade)
                 self._store_replay_trade(replay_run_id, replay_trade)
                 activated_or_closed[key] = replay_trade
             else:
                 logger.info("LEARNING SKIPPED: replay pending order was never filled | %s", key)
             pending.pop(key, None)
 
-        stats_payload = self._build_stats_payload(counters, activated_or_closed.values())
+        stats_payload = self._build_stats_payload(
+            counters,
+            activated_or_closed.values(),
+            strategy_balance=strategy_balance,
+        )
+        logger.info(
+            "MULTI STRATEGY SCAN BALANCE: gap_sweep scans_run=%d candidates=%d activated=%d | "
+            "engulfing_rejection scans_run=%d candidates=%d activated=%d",
+            strategy_balance["gap_sweep"]["scans_run"],
+            strategy_balance["gap_sweep"]["candidates_found"],
+            strategy_balance["gap_sweep"]["activated_trades"],
+            strategy_balance["engulfing_rejection"]["scans_run"],
+            strategy_balance["engulfing_rejection"]["candidates_found"],
+            strategy_balance["engulfing_rejection"]["activated_trades"],
+        )
         self.storage.insert_stats(replay_run_id, stats_payload)
         return stats_payload
 
@@ -264,6 +317,7 @@ class HistoricalReplayEngine:
         row: pd.Series,
         bar_time: datetime,
         counters: ReplayCounters,
+        strategy_balance: Dict[str, Dict[str, float]],
     ):
         high = float(row["high"])
         low = float(row["low"])
@@ -279,6 +333,7 @@ class HistoricalReplayEngine:
                     trade.status = TradeStatus.ACTIVE
                     trade.activated_at = bar_time
                     counters.total_activated_trades += 1
+                    strategy_balance[trade.strategy_type]["activated_trades"] += 1
                     _activated_level = getattr(getattr(replay_trade.setup, "level", None), "level_type", "?")
                     logger.info(
                         "REPLAY ACTIVATED: %s %s | entry=%.2f | time=%s",
@@ -307,6 +362,7 @@ class HistoricalReplayEngine:
                     counters.total_losses += 1
                 else:
                     counters.total_wins += 1
+                self._record_closed_trade(strategy_balance, replay_trade)
                 self._store_replay_trade(replay_run_id, replay_trade)
                 activated_or_closed[key] = replay_trade
                 pending.pop(key, None)
@@ -331,6 +387,7 @@ class HistoricalReplayEngine:
                 replay_trade.closed = True
                 replay_trade.closed_time = bar_time
                 counters.total_wins += 1
+                self._record_closed_trade(strategy_balance, replay_trade)
                 self._store_replay_trade(replay_run_id, replay_trade)
                 activated_or_closed[key] = replay_trade
                 pending.pop(key, None)
@@ -421,7 +478,12 @@ class HistoricalReplayEngine:
                     counters.total_watchlists += 1
 
     @staticmethod
-    def _build_stats_payload(counters: ReplayCounters, replay_trades: Iterable[PendingReplayTrade]) -> Dict:
+    def _build_stats_payload(
+        counters: ReplayCounters,
+        replay_trades: Iterable[PendingReplayTrade],
+        *,
+        strategy_balance: Optional[Dict[str, Dict[str, float]]] = None,
+    ) -> Dict:
         trades = list(replay_trades)
         activated = counters.total_activated_trades
         by_tf = HistoricalReplayEngine._group_performance(trades, "timeframe_pair")
@@ -454,7 +516,66 @@ class HistoricalReplayEngine:
             "pip_by_timeframe_pair": by_tf,
             "pip_by_bias": by_bias,
             "pip_by_session": by_session,
+            "strategy_scan_balance": strategy_balance or {},
         }
+
+    @staticmethod
+    def _init_strategy_balance() -> Dict[str, Dict[str, float]]:
+        return {
+            "gap_sweep": {
+                "scans_run": 0,
+                "candidates_found": 0,
+                "pending_ready": 0,
+                "activated_trades": 0,
+                "closed_trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "final_pips_total": 0.0,
+                "missing_pips_count": 0,
+            },
+            "engulfing_rejection": {
+                "scans_run": 0,
+                "candidates_found": 0,
+                "shortlisted": 0,
+                "revisited": 0,
+                "pending_ready": 0,
+                "activated_trades": 0,
+                "closed_trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "final_pips_total": 0.0,
+                "missing_pips_count": 0,
+            },
+        }
+
+    @staticmethod
+    def _record_closed_trade(strategy_balance: Dict[str, Dict[str, float]], replay_trade: PendingReplayTrade) -> None:
+        strategy_name = getattr(replay_trade.trade, "strategy_type", "gap_sweep") or "gap_sweep"
+        if strategy_name not in strategy_balance:
+            return
+        bucket = strategy_balance[strategy_name]
+        bucket["closed_trades"] += 1
+        if replay_trade.final_result == "LOSS":
+            bucket["losses"] += 1
+        else:
+            bucket["wins"] += 1
+        final_pips = replay_trade.final_pips
+        if final_pips is None:
+            bucket["missing_pips_count"] += 1
+            return
+        bucket["final_pips_total"] += round(float(final_pips), 2)
+
+    @staticmethod
+    def _log_strategy_skipped_once(
+        logged: set[tuple[str, str]],
+        strategy_name: str,
+        reason: str,
+    ) -> None:
+        key = (strategy_name, reason)
+        if key in logged:
+            return
+        logged.add(key)
+        logger.info("STRATEGY SKIPPED: strategy=%s | reason=%s", strategy_name, reason)
 
     @staticmethod
     def _group_performance(trades: Iterable[PendingReplayTrade], attr: str) -> Dict:

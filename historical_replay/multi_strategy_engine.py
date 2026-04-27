@@ -1,13 +1,12 @@
 """
 AlphaPulse — Multi-Strategy Replay Engine
 ==========================================
-Runs multiple research strategies in sequence, collects all trades into the
-unified multi_strategy_replay_runs / multi_strategy_replay_trades tables,
-detects confluence between strategies, and upserts strategy_learning_profiles.
+Runs multiple strategies in a shared candle-by-candle replay window so every
+strategy is evaluated on the same market path without suppressing the others.
 
 Supported strategy names:
-    gap_sweep             → HistoricalReplayEngine
-    engulfing_rejection   → EngulfingResearchEngine
+    gap_sweep             → HistoricalReplayEngine gap path
+    engulfing_rejection   → StrategyManager live-forward-test engulfing path
 
 Do NOT import this from live-bot code. Research + learning only.
 """
@@ -16,9 +15,11 @@ from __future__ import annotations
 
 import json
 import os
+import traceback
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 os.environ.setdefault("ALPHAPULSE_REPLAY_MODE", "1")
 
@@ -30,24 +31,23 @@ logger = get_logger("alphapulse.multi_strategy_engine")
 
 SUPPORTED_STRATEGIES = {"gap_sweep", "engulfing_rejection"}
 
-# Two trades from different strategies are "confluent" if they fired within
-# this many hours of each other AND their entry levels are within CONFLUENCE_PIPS.
 CONFLUENCE_WINDOW_HOURS = 4
 CONFLUENCE_PIPS         = 15.0
 
-_RESULTS_RESULTS = {"LOSS", "BREAKEVEN_WIN", "PARTIAL_WIN", "WIN", "STRONG_WIN"}
+_CLOSED_RESULTS = {"LOSS", "BREAKEVEN_WIN", "PARTIAL_WIN", "WIN", "STRONG_WIN"}
+
+_ERROR_LOG = Path("logs/multi_strategy_replay_error.log")
 
 
 class MultiStrategyReplayEngine:
-    """
-    Wrapper that runs each sub-engine, collects all trades in a unified
-    Supabase table, detects confluence, and upserts learning profiles.
-    """
+    """Shared replay wrapper for strict per-candle multi-strategy execution."""
 
     def __init__(self, strategies: List[str]):
         unknown = set(strategies) - SUPPORTED_STRATEGIES
         if unknown:
-            raise ValueError(f"Unsupported strategies: {unknown}. Supported: {SUPPORTED_STRATEGIES}")
+            raise ValueError(
+                f"Unsupported strategies: {unknown}. Supported: {SUPPORTED_STRATEGIES}"
+            )
         self.strategies = strategies
         self.db = Database()
 
@@ -98,67 +98,115 @@ class MultiStrategyReplayEngine:
             start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
         )
 
-        strategy_results: Dict[str, dict] = {}
-        all_multi_trades: List[dict] = []
+        self.db.close()
 
-        self.db.close()  # sub-engines will open their own connections
+        # ── Step 1: run shared replay ─────────────────────────────────────────
+        try:
+            result, raw_trades = self._run_shared_replay(start, end, symbol)
+        except Exception as exc:
+            tb = traceback.format_exc()
+            _write_error_log(tb)
+            logger.error("Shared replay failed: %s", exc, exc_info=True)
+            self._mark_failed(multi_run_id, exc)
+            print(
+                f"\nMULTI STRATEGY REPLAY FAILED during replay: {exc}\n"
+                f"See {_ERROR_LOG}"
+            )
+            raise
 
-        for strategy_name in self.strategies:
-            logger.info("Running sub-strategy: %s", strategy_name)
-            try:
-                result, raw_trades = self._run_strategy(
-                    strategy_name, start, end, symbol, show_trades
-                )
-                strategy_results[strategy_name] = result
-
-                # Re-open our DB connection to write multi trades
-                self.db.init()
-                for raw in raw_trades:
-                    payload = self._to_multi_trade_payload(raw, strategy_name, multi_run_id)
-                    try:
-                        self.db.insert_multi_strategy_replay_trade(payload)
-                        all_multi_trades.append(payload)
-                    except Exception as exc:
-                        logger.warning("Multi trade insert failed: %s", exc)
-                self.db.close()
-
-            except Exception as exc:
-                logger.error("Sub-strategy %s failed: %s", strategy_name, exc, exc_info=True)
-                strategy_results[strategy_name] = {"error": str(exc)}
-
-        # Re-open for final writes
+        # ── Step 2: save trades ───────────────────────────────────────────────
         self.db.init()
+        all_multi_trades: List[dict] = []
+        missing_pips_by_strategy: Dict[str, int] = {s: 0 for s in self.strategies}
 
-        # Detect confluence between strategies
-        confluence_summary = self._detect_confluence(all_multi_trades, multi_run_id)
+        for raw in raw_trades:
+            payload = self._map_replay_trade(raw, multi_run_id)
+            if not payload:
+                continue
+            # Track missing final_pips per strategy
+            strat = payload.get("strategy_type", "")
+            if payload.get("final_pips") is None or payload.get("final_pips") == 0.0:
+                if (payload.get("final_result") or "") in _CLOSED_RESULTS:
+                    if strat in missing_pips_by_strategy:
+                        missing_pips_by_strategy[strat] += 1
+                        logger.warning(
+                            "GAP MULTI REPLAY WARNING: missing final_pips for %s trade; "
+                            "learning blocked for this trade",
+                            strat,
+                        )
+            try:
+                self.db.insert_multi_strategy_replay_trade(payload)
+                all_multi_trades.append(payload)
+            except Exception as exc:
+                logger.warning("Multi trade insert failed: %s", exc)
 
-        # Build combined summary stats
-        combined = self._build_combined_result(strategy_results, multi_run_id)
+        # ── Step 3: detect confluence ─────────────────────────────────────────
+        try:
+            confluence_summary = self._detect_confluence(all_multi_trades, multi_run_id)
+        except Exception as exc:
+            logger.warning("Confluence detection failed (non-fatal): %s", exc)
+            confluence_summary = {"confluence_pairs_detected": 0, "error": str(exc)}
+
+        # ── Step 4: build combined stats ──────────────────────────────────────
+        combined = self._build_combined_result(
+            trades=all_multi_trades,
+            multi_run_id=multi_run_id,
+            replay_result=result,
+            missing_pips_by_strategy=missing_pips_by_strategy,
+        )
         combined["confluence_summary"] = confluence_summary
 
-        # Upsert learning profiles
-        learning_summary = self._update_learning_profiles(strategy_results, multi_run_id, symbol)
+        # ── Step 5: upsert learning profiles (optional — never crashes run) ───
+        try:
+            learning_summary = self._update_learning_profiles(
+                trades=all_multi_trades,
+                multi_run_id=multi_run_id,
+                symbol=symbol,
+                replay_result=result,
+                missing_pips_by_strategy=missing_pips_by_strategy,
+            )
+        except Exception as exc:
+            logger.warning(
+                "MULTI STRATEGY WARNING: learning profile update failed, "
+                "replay results still saved: %s",
+                exc,
+            )
+            learning_summary = {"profiles_upserted": 0, "error": str(exc)}
         combined["learning_summary"] = learning_summary
 
-        # Finalize multi run row
-        self.db.update_multi_strategy_replay_run(multi_run_id, {
-            "status":             "completed",
-            "completed_at":       datetime.now(timezone.utc).isoformat(),
-            "total_trades":       combined.get("total_trades", 0),
-            "wins":               combined.get("wins", 0),
-            "losses":             combined.get("losses", 0),
-            "win_rate":           combined.get("win_rate", 0.0),
-            "tp1_rate":           combined.get("tp1_rate", 0.0),
-            "tp2_rate":           combined.get("tp2_rate", 0.0),
-            "tp3_rate":           combined.get("tp3_rate", 0.0),
-            "net_pips":           combined.get("net_pips", 0.0),
-            "avg_pips":           combined.get("avg_pips", 0.0),
-            "strategy_summary":   json.dumps(combined.get("by_strategy", {})),
-            "confluence_summary": json.dumps(confluence_summary),
-            "learning_summary":   json.dumps(learning_summary),
-        })
+        # ── Step 6: finalize multi run row ────────────────────────────────────
+        try:
+            self.db.update_multi_strategy_replay_run(multi_run_id, {
+                "status":             "completed",
+                "completed_at":       datetime.now(timezone.utc).isoformat(),
+                "total_trades":       combined.get("total_trades", 0),
+                "wins":               combined.get("wins", 0),
+                "losses":             combined.get("losses", 0),
+                "win_rate":           combined.get("win_rate", 0.0),
+                "tp1_rate":           combined.get("tp1_rate", 0.0),
+                "tp2_rate":           combined.get("tp2_rate", 0.0),
+                "tp3_rate":           combined.get("tp3_rate", 0.0),
+                "net_pips":           combined.get("net_pips", 0.0),
+                "avg_pips":           combined.get("avg_pips", 0.0),
+                "strategy_summary":   safe_json(combined.get("by_strategy", {})),
+                "confluence_summary": safe_json(confluence_summary),
+                "learning_summary":   safe_json(learning_summary),
+            })
+        except Exception as exc:
+            logger.warning("Run summary update failed, retrying minimal: %s", exc)
+            try:
+                self.db.update_multi_strategy_replay_run(multi_run_id, {
+                    "status":        "completed",
+                    "completed_at":  datetime.now(timezone.utc).isoformat(),
+                    "total_trades":  combined.get("total_trades", 0),
+                    "win_rate":      combined.get("win_rate", 0.0),
+                    "net_pips":      combined.get("net_pips", 0.0),
+                })
+            except Exception as exc2:
+                logger.warning("Minimal run update also failed: %s", exc2)
 
         self.db.close()
+
         logger.info(
             "Multi-strategy run %d done: %d trades | WR=%.1f%% | net=%.1f pips",
             multi_run_id,
@@ -169,71 +217,41 @@ class MultiStrategyReplayEngine:
         return combined
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Sub-strategy runners
+    # Shared replay runner
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _run_strategy(
-        self,
-        strategy_name: str,
-        start: datetime,
-        end: datetime,
-        symbol: str,
-        show_trades: int,
-    ) -> Tuple[dict, List[dict]]:
-        if strategy_name == "engulfing_rejection":
-            return self._run_engulfing(start, end, symbol, show_trades)
-        if strategy_name == "gap_sweep":
-            return self._run_gap_sweep(start, end, symbol)
-        raise ValueError(f"Unknown strategy: {strategy_name}")
-
-    def _run_engulfing(
+    def _run_shared_replay(
         self,
         start: datetime,
         end: datetime,
         symbol: str,
-        show_trades: int,
-    ) -> Tuple[dict, List[dict]]:
-        from historical_replay.engulfing_research import EngulfingResearchEngine
-
-        engine = EngulfingResearchEngine()
-        result = engine.run(start=start, end=end, symbol=symbol, show_trades=show_trades)
-
-        # Sub-engine closed its db. Open ours to fetch trades by run_id.
-        sub_run_id = result.get("run_id")
-        trades: List[dict] = []
-        if sub_run_id:
-            self.db.init()
-            try:
-                data = self.db.get_strategy_research_results(sub_run_id)
-                trades = data.get("trades", []) if data else []
-            finally:
-                self.db.close()
-        return result, trades
-
-    def _run_gap_sweep(
-        self,
-        start: datetime,
-        end: datetime,
-        symbol: str,
-    ) -> Tuple[dict, List[dict]]:
+    ) -> tuple[dict, List[dict]]:
         from historical_replay.engine import HistoricalReplayEngine
+        from signals.signal_generator import SignalGenerator
+        from strategies.strategy_manager import StrategyManager
 
-        engine = HistoricalReplayEngine()
+        strategy_manager = StrategyManager(
+            learning_engine=None,
+            enabled_strategies=self.strategies,
+            merge_confluence=False,
+        )
+        engine = HistoricalReplayEngine(
+            strategy_manager=strategy_manager,
+            signal_generator=SignalGenerator(learning_engine=None),
+        )
         result = engine.run(start=start, end=end, symbol=symbol)
-
-        # Sub-engine closed its db. Get latest replay run + trades.
         trades: List[dict] = []
         self.db.init()
         try:
-            latest_run = self.db.get_latest_replay_run()
-            if latest_run:
-                run_id = latest_run.get("id")
-                trades = self.db.get_replay_trades(run_id) if run_id else []
-                # Filter only activated/closed trades
+            run_id = result.get("replay_run_id")
+            if run_id:
+                trades = self.db.get_replay_trades(run_id)
                 trades = [
                     t for t in trades
-                    if (t.get("final_result") or "") in _RESULTS_RESULTS
+                    if (t.get("final_result") or "") in _CLOSED_RESULTS
                 ]
+            else:
+                logger.warning("replay_run_id not in result; trade fetch skipped")
         finally:
             self.db.close()
         return result, trades
@@ -242,103 +260,65 @@ class MultiStrategyReplayEngine:
     # Trade payload mapping
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _to_multi_trade_payload(
-        self,
-        raw: dict,
-        strategy_name: str,
-        multi_run_id: int,
-    ) -> dict:
-        if strategy_name == "engulfing_rejection":
-            return self._map_engulfing_trade(raw, multi_run_id)
-        if strategy_name == "gap_sweep":
-            return self._map_gap_sweep_trade(raw, multi_run_id)
-        return {}
+    def _map_replay_trade(self, t: dict, multi_run_id: int) -> dict:
+        entry     = _f(t.get("entry"))
+        sl        = _f(t.get("sl"))
+        tp1       = _f(t.get("tp1"))
+        direction = t.get("direction", "")
+        tf_pair   = t.get("timeframe_pair", "")
+        timeframe = (
+            tf_pair.split("->")[-1] if "->" in tf_pair
+            else tf_pair.split("-")[-1] if "-" in tf_pair
+            else None
+        )
+        # TEXT[] must be a Python list, not a comma-joined string
+        confluence_with: List[str] = _normalise_confluence(t.get("confluence_with"))
 
-    def _map_engulfing_trade(self, t: dict, multi_run_id: int) -> dict:
-        entry = _f(t.get("entry"))
-        sl    = _f(t.get("sl"))
-        tp1   = _f(t.get("tp1"))
         return {
-            "multi_run_id":        multi_run_id,
-            "source":              "multi_strategy_replay",
-            "symbol":              t.get("symbol", SYMBOL),
-            "strategy_type":       "engulfing_rejection",
-            "direction":           t.get("direction", ""),
-            "timeframe":           t.get("timeframe"),
-            "timeframe_pair":      t.get("timeframe_pair"),
-            "session_name":        t.get("session_name"),
-            "market_condition":    t.get("market_condition"),
-            "dominant_bias":       t.get("dominant_bias"),
-            "bias_strength":       t.get("bias_strength"),
-            "level_type":          t.get("level_type") or "Gap",
-            "level_high":          _f(t.get("level_high") or t.get("engulf_high")),
-            "level_low":           _f(t.get("level_low")  or t.get("engulf_low")),
-            "level_mid":           _f(t.get("level_mid")  or t.get("engulf_mid")),
-            "quality_score":       _f(t.get("quality_score")),
+            "multi_run_id":            multi_run_id,
+            "source":                  "multi_strategy_replay",
+            "symbol":                  t.get("symbol", SYMBOL),
+            "strategy_type":           t.get("strategy_type", "gap_sweep"),
+            "direction":               direction,
+            "timeframe":               timeframe,
+            "timeframe_pair":          tf_pair,
+            "session_name":            t.get("session_name") or t.get("session"),
+            "market_condition":        t.get("market_condition"),
+            "dominant_bias":           t.get("dominant_bias"),
+            "bias_strength":           t.get("bias_strength"),
+            "level_type":              t.get("level_type"),
+            "setup_type":              t.get("setup_type"),
+            "confirmation_type":       (
+                t.get("confirmation_path")
+                or t.get("micro_confirmation_type")
+                or t.get("confirmation_pattern")
+            ),
+            "confirmation_score":      _f(
+                t.get("confirmation_score") or t.get("micro_confirmation_score")
+            ),
+            "quality_score":           _f(t.get("quality_score")),
             "quality_rejection_count": t.get("quality_rejection_count"),
             "structure_break_count":   t.get("structure_break_count"),
-            "confirmation_type":   t.get("confirmation_path"),
-            "confirmation_score":  _f(t.get("confirmation_score")),
-            "entry":               entry,
-            "sl":                  sl,
-            "tp1":                 tp1,
-            "tp2":                 _f(t.get("tp2")),
-            "tp3":                 _f(t.get("tp3")),
-            "sl_pips":             _pips(entry, sl, t.get("direction", "")),
-            "tp1_pips":            _pips(entry, tp1, t.get("direction", "")),
-            "activated_at":        _ts(t.get("activated_at")),
-            "closed_at":           _ts(t.get("closed_at")),
-            "final_result":        t.get("final_result", "OPEN"),
-            "tp_progress":         t.get("tp_progress", 0),
-            "protected_after_tp1": bool(t.get("protected_after_tp1")),
-            "final_pips":          _f(t.get("final_pips")),
-            "reward_score":        _f(t.get("reward_score")),
-            "failure_reason":      t.get("failure_reason") or "",
-        }
-
-    def _map_gap_sweep_trade(self, t: dict, multi_run_id: int) -> dict:
-        entry = _f(t.get("entry"))
-        sl    = _f(t.get("sl"))
-        tp1   = _f(t.get("tp1"))
-        # historical_replay_trades: direction stored as "BUY"/"SELL"
-        direction = t.get("direction", "")
-        # timeframe_pair: "H4->H1" etc
-        tf_pair = t.get("timeframe_pair", "")
-        # lower_tf extracted from pair
-        timeframe = tf_pair.split("->")[-1] if "->" in tf_pair else None
-        return {
-            "multi_run_id":        multi_run_id,
-            "source":              "multi_strategy_replay",
-            "symbol":              t.get("symbol", SYMBOL),
-            "strategy_type":       "gap_sweep",
-            "direction":           direction,
-            "timeframe":           timeframe,
-            "timeframe_pair":      tf_pair,
-            "session_name":        t.get("session"),
-            "market_condition":    t.get("market_condition"),
-            "dominant_bias":       t.get("dominant_bias"),
-            "bias_strength":       t.get("bias_strength"),
-            "level_type":          t.get("level_type"),
-            "setup_type":          t.get("setup_type"),
-            "confirmation_type":   t.get("micro_confirmation_type") or t.get("confirmation_pattern"),
-            "confirmation_score":  _f(t.get("micro_confirmation_score")),
-            "entry":               entry,
-            "sl":                  sl,
-            "tp1":                 tp1,
-            "tp2":                 _f(t.get("tp2")),
-            "tp3":                 _f(t.get("tp3")),
-            "sl_pips":             _pips(entry, sl, direction),
-            "tp1_pips":            _f(t.get("pips_to_tp1")),
-            "tp2_pips":            _f(t.get("pips_to_tp2")),
-            "tp3_pips":            _f(t.get("pips_to_tp3")),
-            "activated_at":        _ts(t.get("activation_time")),
-            "closed_at":           _ts(t.get("timestamp")),
-            "final_result":        t.get("final_result", "OPEN"),
-            "tp_progress":         t.get("tp_progress", 0),
-            "protected_after_tp1": bool(t.get("protected_after_tp1")),
-            "final_pips":          _f(t.get("final_pips") or t.get("realized_pips")),
-            "reward_score":        _f(t.get("reward_score")),
-            "failure_reason":      t.get("failure_reason") or "",
+            "entry":                   entry,
+            "sl":                      sl,
+            "tp1":                     tp1,
+            "tp2":                     _f(t.get("tp2")),
+            "tp3":                     _f(t.get("tp3")),
+            "sl_pips":                 _pips(entry, sl, direction),
+            "tp1_pips":                _f(t.get("pips_to_tp1")),
+            "tp2_pips":                _f(t.get("pips_to_tp2")),
+            "tp3_pips":                _f(t.get("pips_to_tp3")),
+            "activated_at":            _ts(t.get("activation_time")),
+            "closed_at":               _ts(t.get("closed_time") or t.get("timestamp")),
+            "final_result":            t.get("final_result", "OPEN"),
+            "tp_progress":             t.get("tp_progress", 0),
+            "protected_after_tp1":     bool(t.get("protected_after_tp1")),
+            "final_pips":              _f(t.get("final_pips") or t.get("realized_pips")),
+            "reward_score":            _f(t.get("reward_score")),
+            "failure_reason":          t.get("failure_reason") or "",
+            # TEXT[] — must be a Python list for Supabase PostgREST
+            "confluence":              bool(confluence_with),
+            "confluence_strategy_types": confluence_with,
         }
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -350,12 +330,6 @@ class MultiStrategyReplayEngine:
         all_trades: List[dict],
         multi_run_id: int,
     ) -> dict:
-        """
-        Two trades are confluent when they fired from different strategies,
-        within CONFLUENCE_WINDOW_HOURS of each other, and their entries are
-        within CONFLUENCE_PIPS. Marks the multi_strategy_replay_trades rows
-        (best-effort PATCH) and returns a summary dict.
-        """
         by_strategy: Dict[str, List[dict]] = defaultdict(list)
         for t in all_trades:
             by_strategy[t.get("strategy_type", "unknown")].append(t)
@@ -378,7 +352,7 @@ class MultiStrategyReplayEngine:
                         t2_e  = _f(t2.get("entry"))
                         if t2_at is None or t2_e is None:
                             continue
-                        if abs((t1_at - t2_at)) <= window and abs(t1_e - t2_e) <= max_dist:
+                        if abs(t1_at - t2_at) <= window and abs(t1_e - t2_e) <= max_dist:
                             confluence_count += 1
 
         return {
@@ -392,63 +366,62 @@ class MultiStrategyReplayEngine:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _build_combined_result(
-        self, strategy_results: Dict[str, dict], multi_run_id: int
+        self,
+        *,
+        trades: List[dict],
+        multi_run_id: int,
+        replay_result: dict,
+        missing_pips_by_strategy: Dict[str, int],
     ) -> dict:
-        total = wins = losses = 0
-        tp1_hit = tp2_hit = tp3_hit = 0
-        net_pips = 0.0
-        by_strategy = {}
+        total    = len(trades)
+        wins     = sum(1 for t in trades if t.get("final_result") != "LOSS")
+        losses   = sum(1 for t in trades if t.get("final_result") == "LOSS")
+        tp1_hit  = sum(1 for t in trades if int(t.get("tp_progress") or 0) >= 1)
+        tp2_hit  = sum(1 for t in trades if int(t.get("tp_progress") or 0) >= 2)
+        tp3_hit  = sum(1 for t in trades if int(t.get("tp_progress") or 0) >= 3)
+        net_pips = sum(_f(t.get("final_pips")) or 0.0 for t in trades)
 
-        for name, res in strategy_results.items():
-            if "error" in res:
-                by_strategy[name] = {"error": res["error"]}
-                continue
-            # Both engines return keys with slightly different names
-            n   = int(res.get("activated_trades", res.get("total_activated_trades", 0)) or 0)
-            w   = int(res.get("wins", res.get("total_wins", 0)) or 0)
-            l   = int(res.get("losses", res.get("total_losses", 0)) or 0)
-            wr  = round((w / max(1, n)) * 100, 2)
-            np_ = float(res.get("net_pips", 0.0) or 0.0)
+        strategy_balance = replay_result.get("strategy_scan_balance", {})
+        by_strategy: Dict[str, dict] = {}
 
-            total    += n
-            wins     += w
-            losses   += l
-            net_pips += np_
-
-            # TP rates: engulfing result has tp1_rate; gap_sweep uses tp_hits
-            tp1 = int(res.get("tp1_hits", res.get("tp1_hit", 0)) or 0)
-            tp2 = int(res.get("tp2_hits", res.get("tp2_hit", 0)) or 0)
-            tp3 = int(res.get("tp3_hits", res.get("tp3_hit", 0)) or 0)
-            tp1_hit += tp1
-            tp2_hit += tp2
-            tp3_hit += tp3
-
-            by_strategy[name] = {
-                "trades":    n,
-                "wins":      w,
-                "losses":    l,
-                "win_rate":  wr,
-                "net_pips":  round(np_, 2),
-                "avg_pips":  round(np_ / n, 2) if n else 0.0,
-                "tp1_rate":  round(tp1 / n * 100, 2) if n else 0.0,
-            }
+        for name in self.strategies:
+            grp  = [t for t in trades if t.get("strategy_type") == name]
+            n    = len(grp)
+            w    = sum(1 for t in grp if t.get("final_result") != "LOSS")
+            l    = sum(1 for t in grp if t.get("final_result") == "LOSS")
+            np_  = sum(_f(t.get("final_pips")) or 0.0 for t in grp)
+            tp1  = sum(1 for t in grp if int(t.get("tp_progress") or 0) >= 1)
+            mpips = missing_pips_by_strategy.get(name, 0)
+            bucket = dict(strategy_balance.get(name, {}))
+            bucket.update({
+                "trades":              n,
+                "wins":                w,
+                "losses":              l,
+                "win_rate":            round((w / max(1, n)) * 100, 2),
+                "net_pips":            round(np_, 2),
+                "avg_pips":            round(np_ / n, 2) if n else 0.0,
+                "tp1_rate":            round((tp1 / n) * 100, 2) if n else 0.0,
+                "missing_pips_count":  mpips,
+            })
+            by_strategy[name] = bucket
 
         win_rate = round((wins / max(1, total)) * 100, 2)
         avg_pips = round(net_pips / total, 2) if total else 0.0
 
         return {
-            "run_id":       multi_run_id,
-            "strategies":   self.strategies,
-            "total_trades": total,
-            "wins":         wins,
-            "losses":       losses,
-            "win_rate":     win_rate,
-            "tp1_rate":     round((tp1_hit / total * 100) if total else 0.0, 2),
-            "tp2_rate":     round((tp2_hit / total * 100) if total else 0.0, 2),
-            "tp3_rate":     round((tp3_hit / total * 100) if total else 0.0, 2),
-            "net_pips":     round(net_pips, 2),
-            "avg_pips":     avg_pips,
-            "by_strategy":  by_strategy,
+            "run_id":                multi_run_id,
+            "strategies":            self.strategies,
+            "total_trades":          total,
+            "wins":                  wins,
+            "losses":                losses,
+            "win_rate":              win_rate,
+            "tp1_rate":              round((tp1_hit / total * 100) if total else 0.0, 2),
+            "tp2_rate":              round((tp2_hit / total * 100) if total else 0.0, 2),
+            "tp3_rate":              round((tp3_hit / total * 100) if total else 0.0, 2),
+            "net_pips":              round(net_pips, 2),
+            "avg_pips":              avg_pips,
+            "by_strategy":           by_strategy,
+            "strategy_scan_balance": strategy_balance,
         }
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -457,34 +430,42 @@ class MultiStrategyReplayEngine:
 
     def _update_learning_profiles(
         self,
-        strategy_results: Dict[str, dict],
+        *,
+        trades: List[dict],
         multi_run_id: int,
         symbol: str,
+        replay_result: dict,
+        missing_pips_by_strategy: Dict[str, int],
     ) -> dict:
-        """
-        For each strategy, group trades by (session × direction × bias) and
-        upsert a strategy_learning_profiles row. Returns a summary.
-        """
         updated_profiles = 0
+        skipped: List[str] = []
+        strategy_balance = replay_result.get("strategy_scan_balance", {})
 
-        for strategy_name, res in strategy_results.items():
-            if "error" in res:
+        for strategy_name in self.strategies:
+            balance   = strategy_balance.get(strategy_name, {})
+            scans_run = int(balance.get("scans_run", 0) or 0)
+            closed    = int(balance.get("closed_trades", 0) or 0)
+            mpips     = missing_pips_by_strategy.get(strategy_name, 0)
+
+            strategy_trades = [t for t in trades if t.get("strategy_type") == strategy_name]
+            n_trades = len(strategy_trades)
+
+            if scans_run <= 0 and n_trades == 0:
+                reason = "no scans recorded"
+                logger.warning("LEARNING SKIPPED: strategy=%s | reason=%s", strategy_name, reason)
+                skipped.append(f"{strategy_name}:{reason}")
                 continue
 
-            # Get per-session and per-bias breakdowns from the result dict
-            session_breakdown = (
-                res.get("performance_by_session")
-                or res.get("by_session")
-                or {}
-            )
-            bias_breakdown = (
-                res.get("performance_by_bias")
-                or res.get("by_bias")
-                or {}
-            )
+            if mpips > 0 and n_trades > 0 and mpips >= n_trades:
+                reason = "all trades missing final_pips"
+                logger.warning("LEARNING SKIPPED: strategy=%s | reason=%s", strategy_name, reason)
+                skipped.append(f"{strategy_name}:{reason}")
+                continue
+
+            session_breakdown = _group_for_learning(strategy_trades, "session_name")
 
             for session, stats in session_breakdown.items():
-                n  = int(stats.get("activated", stats.get("trades", 0)) or 0)
+                n  = int(stats.get("trades", 0) or 0)
                 w  = int(stats.get("wins", 0) or 0)
                 l  = int(stats.get("losses", 0) or 0)
                 np = float(stats.get("net_pips", 0.0) or 0.0)
@@ -495,29 +476,78 @@ class MultiStrategyReplayEngine:
 
                 try:
                     self.db.upsert_strategy_learning_profile(profile_key, {
-                        "strategy_type":       strategy_name,
-                        "symbol":              symbol,
-                        "session_name":        session,
-                        "sample_size":         n,
-                        "wins":                w,
-                        "losses":              l,
-                        "win_rate":            wr,
-                        "net_pips":            round(np, 2),
-                        "avg_pips":            round(np / n, 2) if n else 0.0,
-                        "confidence_tier":     tier,
-                        "recommended_weight":  _recommended_weight(wr, n),
-                        "last_multi_run_id":   multi_run_id,
+                        "strategy_type":      strategy_name,
+                        "symbol":             symbol,
+                        "session_name":       session,
+                        "sample_size":        n,
+                        "wins":               w,
+                        "losses":             l,
+                        "win_rate":           wr,
+                        "net_pips":           round(np, 2),
+                        "avg_pips":           round(np / n, 2) if n else 0.0,
+                        "confidence_tier":    tier,
+                        "recommended_weight": _recommended_weight(wr, n),
+                        "last_multi_run_id":  multi_run_id,
                     })
                     updated_profiles += 1
                 except Exception as exc:
                     logger.warning("Learning profile upsert failed (%s): %s", profile_key, exc)
 
-        return {"profiles_upserted": updated_profiles, "multi_run_id": multi_run_id}
+        return {
+            "profiles_upserted": updated_profiles,
+            "skipped":           skipped,
+            "multi_run_id":      multi_run_id,
+        }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Internal helpers
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _mark_failed(self, multi_run_id: int, exc: Exception) -> None:
+        try:
+            self.db.init()
+            self.db.update_multi_strategy_replay_run(multi_run_id, {
+                "status":        "failed",
+                "error_message": str(exc)[:500],
+                "completed_at":  datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception as inner:
+            logger.warning("Could not mark run %d as failed: %s", multi_run_id, inner)
+        finally:
+            try:
+                self.db.close()
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Module-level helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def safe_json(obj: Any) -> str:
+    """Convert obj to a JSON string, coercing non-serializable types safely."""
+    def _default(v):
+        if isinstance(v, datetime):
+            return v.isoformat()
+        if hasattr(v, "item"):          # numpy scalar
+            return v.item()
+        if hasattr(v, "__float__"):     # Decimal etc.
+            return float(v)
+        return str(v)
+    try:
+        return json.dumps(obj, default=_default)
+    except Exception:
+        return "{}"
+
+
+def _write_error_log(tb: str) -> None:
+    try:
+        _ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _ERROR_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n{'='*60}\n{datetime.now().isoformat()}\n{tb}\n")
+    except Exception:
+        pass
+
 
 def _f(v) -> Optional[float]:
     try:
@@ -542,8 +572,7 @@ def _parse_ts(v) -> Optional[datetime]:
     if isinstance(v, datetime):
         return v
     try:
-        from datetime import datetime as dt
-        return dt.fromisoformat(str(v).replace("Z", "+00:00"))
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
     except Exception:
         return None
 
@@ -577,3 +606,27 @@ def _recommended_weight(wr: float, n: int) -> float:
     if wr >= 40:
         return 0.8
     return 0.5
+
+
+def _group_for_learning(trades: List[dict], key: str) -> Dict[str, Dict[str, float]]:
+    grouped: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {"trades": 0, "wins": 0, "losses": 0, "net_pips": 0.0}
+    )
+    for trade in trades:
+        name = str(trade.get(key) or "unknown")
+        bucket = grouped[name]
+        bucket["trades"]   += 1
+        bucket["wins"]     += 1 if trade.get("final_result") != "LOSS" else 0
+        bucket["losses"]   += 1 if trade.get("final_result") == "LOSS" else 0
+        bucket["net_pips"] += _f(trade.get("final_pips")) or 0.0
+    return dict(grouped)
+
+
+def _normalise_confluence(value) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value if str(v)]
+    if isinstance(value, str):
+        return [p.strip() for p in value.split(",") if p.strip()]
+    return [str(value)]

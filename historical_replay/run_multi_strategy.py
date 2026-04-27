@@ -108,6 +108,7 @@ def _print_summary(result: dict) -> None:
     avg_pips  = result.get("avg_pips", 0.0)
     strategies = result.get("strategies", [])
     by_strat  = result.get("by_strategy", {})
+    scan_balance = result.get("strategy_scan_balance", {})
     confluence = result.get("confluence_summary", {})
     learning   = result.get("learning_summary", {})
 
@@ -136,6 +137,16 @@ def _print_summary(result: dict) -> None:
                 f"WR={stats.get('win_rate', 0.0):.1f}%  "
                 f"net={stats.get('net_pips', 0.0):.1f}p  "
                 f"avg={stats.get('avg_pips', 0.0):.1f}p"
+            )
+    if scan_balance:
+        print()
+        print("  STRATEGY SCAN BALANCE")
+        for name in strategies:
+            stats = scan_balance.get(name, {})
+            print(
+                f"  [{name}] scans={stats.get('scans_run', 0)} "
+                f"candidates={stats.get('candidates_found', 0)} "
+                f"activated={stats.get('activated_trades', 0)}"
             )
     print()
     print("  CONFLUENCE")

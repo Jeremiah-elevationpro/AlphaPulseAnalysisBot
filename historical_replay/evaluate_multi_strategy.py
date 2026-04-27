@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from collections import Counter, defaultdict
 from typing import Dict, Iterable, List, Optional
@@ -67,24 +68,44 @@ def main() -> None:
 
 def build_report(run: Dict, trades: List[Dict], *, show_trades: int = 20) -> str:
     all_closed = [t for t in trades if (t.get("final_result") or "") in _CLOSED_RESULTS]
-    strategies  = _unique_strategies(trades)
+    strategies  = _unique_strategies(trades) or _strategies_from_run(run)
+    status      = run.get("status") or "unknown"
+
+    header_warnings: List[str] = []
+    if status == "failed":
+        header_warnings.append(
+            "  !! WARNING: This run FAILED — results may be incomplete. !!"
+        )
+        err = run.get("error_message")
+        if err:
+            header_warnings.append(f"  !! Error   : {err[:120]}")
+    elif status not in ("completed", "unknown"):
+        header_warnings.append(
+            f"  !! WARNING: Evaluating a {status.upper()} run — results may be partial. !!"
+        )
 
     lines = [
         "",
         "=" * 56,
         "  AlphaPulse Multi-Strategy Replay Report",
         "=" * 56,
+    ]
+    lines.extend(header_warnings)
+    lines += [
         f"  Run ID     : {run.get('id')}",
         f"  Strategies : {', '.join(strategies)}",
         f"  Symbol     : {run.get('symbol', 'XAUUSD')}",
         f"  Period     : {run.get('replay_start')} → {run.get('replay_end')}",
-        f"  Status     : {run.get('status')}",
+        f"  Status     : {status}",
         "",
         _section("COMBINED RESULTS"),
-        _combined_stats(all_closed),
+        _combined_stats(all_closed, total_trades=len(trades)),
         "",
         _section("BY STRATEGY"),
         _by_strategy_report(all_closed, strategies),
+        "",
+        _section("STRATEGY SCAN BALANCE"),
+        _strategy_scan_balance_report(run, strategies),
         "",
         _section("SESSION PERFORMANCE"),
         _breakdown_per_strategy("Session", all_closed, "session_name", strategies),
@@ -142,9 +163,11 @@ def build_report(run: Dict, trades: List[Dict], *, show_trades: int = 20) -> str
 # Section builders
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _combined_stats(trades: List[Dict]) -> str:
+def _combined_stats(trades: List[Dict], *, total_trades: int = 0) -> str:
     n = len(trades)
     if not n:
+        if total_trades:
+            return f"  No closed trades.  ({total_trades} trade row(s) stored, none with a closed result)"
         return "  No closed trades."
     wins    = sum(1 for t in trades if t.get("final_result") != "LOSS")
     losses  = n - wins
@@ -179,6 +202,32 @@ def _by_strategy_report(trades: List[Dict], strategies: List[str]) -> str:
             f"trades={n}  wins={w}  losses={n-w}  "
             f"WR={w/n*100:.1f}%  net={np:.1f}p  avg={np/n:.1f}p"
         )
+    return "\n".join(lines)
+
+
+def _strategy_scan_balance_report(run: Dict, strategies: List[str]) -> str:
+    by_strategy = _read_strategy_summary(run)
+    if not by_strategy:
+        return "  no scan-balance data stored"
+
+    lines: List[str] = []
+    for strategy in strategies:
+        stats = by_strategy.get(strategy, {})
+        scans_run = int(stats.get("scans_run", 0) or 0)
+        candidates = int(stats.get("candidates_found", 0) or 0)
+        activated = int(stats.get("activated_trades", 0) or 0)
+        closed = int(stats.get("closed_trades", 0) or 0)
+        missing_pips = int(stats.get("missing_pips_count", 0) or 0)
+        lines.append(
+            f"  [{strategy}] scans_run={scans_run} candidates={candidates} "
+            f"activated={activated} closed={closed} missing_pips={missing_pips}"
+        )
+        if scans_run == 0:
+            lines.append("    !! WARNING: strategy was not executed in parallel")
+        if closed > 0 and abs(float(stats.get("final_pips_total", 0.0) or 0.0)) < 1e-9:
+            lines.append("    !! WARNING: strategy outcome/pips integration broken")
+        if missing_pips > 0:
+            lines.append(f"    !! WARNING: {missing_pips} trade(s) stored with missing pips data")
     return "\n".join(lines)
 
 
@@ -235,6 +284,17 @@ def _learning_report(run: Dict) -> str:
     )
 
 
+def _read_strategy_summary(run: Dict) -> Dict[str, Dict]:
+    raw = run.get("strategy_summary")
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Grouping / formatting helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -265,6 +325,24 @@ def _unique_strategies(trades: List[Dict]) -> List[str]:
         if s and s not in seen:
             seen.append(s)
     return seen
+
+
+def _strategies_from_run(run: Dict) -> List[str]:
+    raw = run.get("strategies")
+    if isinstance(raw, list):
+        return [str(item) for item in raw]
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed]
+        except Exception:
+            pass
+        return [part.strip() for part in text.split(",") if part.strip()]
+    return []
 
 
 def _section(title: str) -> str:

@@ -125,6 +125,7 @@ class PendingReplayTrade:
         return {
             "replay_run_id": replay_run_id,
             "source": "historical_replay",
+            "strategy_type": trade.strategy_type,
             "symbol": trade.pair,
             "timestamp": self.closed_time or self.activation_time or self.pending_order_ready_time,
             "direction": trade.direction,
@@ -175,6 +176,7 @@ class PendingReplayTrade:
             "session": trade.session_name,
             "reward_score": self.reward_score,
             "failure_reason": self.failure_reason,
+            "confluence_with": ",".join(trade.confluence_with) if trade.confluence_with else "",
         }
 
     @staticmethod

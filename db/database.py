@@ -719,7 +719,7 @@ class Database:
 
     _OPTIONAL_MULTI_STRATEGY_RUN_COLUMNS: frozenset = frozenset({
         "symbol", "strategies", "months_tested", "replay_start", "replay_end",
-        "status", "total_trades", "wins", "losses", "win_rate",
+        "status", "error_message", "total_trades", "wins", "losses", "win_rate",
         "tp1_rate", "tp2_rate", "tp3_rate", "net_pips", "avg_pips",
         "strategy_summary", "session_summary", "confluence_summary",
         "learning_summary", "notes", "created_at", "completed_at",

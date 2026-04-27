@@ -150,12 +150,17 @@ class StrategyManager:
         # result.signals contains DEFAULT signals
     """
 
-    def __init__(self, learning_engine=None):
+    def __init__(self, learning_engine=None, enabled_strategies: Optional[List[str]] = None, merge_confluence: bool = True):
         self._analyzer = MultiTimeframeAnalyzer()
         self._engulfing = LiveEngulfingAnalyzer()
         self._learning = learning_engine
-        self._enabled = list(LIVE_ENABLED_STRATEGIES)
+        self._enabled = list(enabled_strategies or LIVE_ENABLED_STRATEGIES)
+        self._merge_confluence_signals = merge_confluence
         logger.info("StrategyManager initialised — enabled live strategies: %s", ", ".join(self._enabled))
+
+    @property
+    def enabled_strategies(self) -> List[str]:
+        return list(self._enabled)
 
     # ─────────────────────────────────────────────────────
     # TIMEFRAMES
@@ -200,7 +205,10 @@ class StrategyManager:
                 context=outlook.context,
             )
             signals.extend(_wrap_setups(engulf_setups, "engulfing_rejection"))
-        signals = self._merge_confluence(signals)
+        if self._merge_confluence_signals:
+            signals = self._merge_confluence(signals)
+        else:
+            signals = self._annotate_confluence(signals)
 
         # ── Market condition (classification only — no gating) ────────────────
         condition = self._detect_condition(data)
@@ -325,6 +333,27 @@ class StrategyManager:
                 if existing.setup is not None:
                     existing.setup.confluence_with = list(existing.confluence_strategies)
         return merged
+
+    @staticmethod
+    def _annotate_confluence(signals: List[StrategySignal]) -> List[StrategySignal]:
+        if not signals:
+            return signals
+        tolerance = LEVEL_TOLERANCE_PIPS * PIP_SIZE * 2.0
+        for signal in signals:
+            confluence = sorted(
+                {
+                    other.strategy_name
+                    for other in signals
+                    if other is not signal
+                    and other.pair == signal.pair
+                    and other.direction == signal.direction
+                    and abs(other.level_price - signal.level_price) <= tolerance
+                }
+            )
+            signal.confluence_strategies = confluence
+            if signal.setup is not None:
+                signal.setup.confluence_with = list(confluence)
+        return signals
 
 
 # ─────────────────────────────────────────────────────────────────────────────
