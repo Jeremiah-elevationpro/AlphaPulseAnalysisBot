@@ -118,27 +118,50 @@ class MultiStrategyReplayEngine:
         self.db.init()
         all_multi_trades: List[dict] = []
         missing_pips_by_strategy: Dict[str, int] = {s: 0 for s in self.strategies}
+        rows_inserted = 0
 
         for raw in raw_trades:
             payload = self._map_replay_trade(raw, multi_run_id)
             if not payload:
                 continue
-            # Track missing final_pips per strategy
             strat = payload.get("strategy_type", "")
-            if payload.get("final_pips") is None or payload.get("final_pips") == 0.0:
-                if (payload.get("final_result") or "") in _CLOSED_RESULTS:
-                    if strat in missing_pips_by_strategy:
-                        missing_pips_by_strategy[strat] += 1
-                        logger.warning(
-                            "GAP MULTI REPLAY WARNING: missing final_pips for %s trade; "
-                            "learning blocked for this trade",
-                            strat,
-                        )
+            fp    = payload.get("final_pips")
+            if (fp is None or fp == 0.0) and (payload.get("final_result") or "") in _CLOSED_RESULTS:
+                if strat in missing_pips_by_strategy:
+                    missing_pips_by_strategy[strat] += 1
+                    logger.warning(
+                        "GAP MULTI REPLAY WARNING: missing final_pips for %s trade; "
+                        "learning blocked for this trade",
+                        strat,
+                    )
             try:
                 self.db.insert_multi_strategy_replay_trade(payload)
                 all_multi_trades.append(payload)
+                rows_inserted += 1
+                logger.info(
+                    "MULTI TRADE STORED: strategy=%s | result=%s | pips=%s",
+                    strat,
+                    payload.get("final_result", "?"),
+                    f"{fp:.2f}" if fp is not None else "None",
+                )
             except Exception as exc:
-                logger.warning("Multi trade insert failed: %s", exc)
+                logger.warning("Multi trade insert failed (strategy=%s result=%s): %s",
+                               strat, payload.get("final_result", "?"), exc)
+
+        # Aggregation mismatch guard — detect silent trade loss early
+        _sb_balance = result.get("strategy_scan_balance", {})
+        total_scan_closed = sum(
+            int((v or {}).get("closed_trades", 0) or 0)
+            for v in _sb_balance.values()
+            if isinstance(v, dict)
+        )
+        if total_scan_closed > 0 and len(all_multi_trades) == 0:
+            logger.error(
+                "MULTI AGGREGATION ERROR: scan balance reports %d closed trades but "
+                "normalized trade list is empty — check _run_shared_replay() return path "
+                "and _map_replay_trade() field mapping",
+                total_scan_closed,
+            )
 
         # ── Step 3: detect confluence ─────────────────────────────────────────
         try:
@@ -214,6 +237,23 @@ class MultiStrategyReplayEngine:
             combined.get("win_rate", 0.0),
             combined.get("net_pips", 0.0),
         )
+
+        # ── Aggregation debug output ──────────────────────────────────────────
+        sb = combined.get("strategy_scan_balance", {})
+        print("\nMULTI AGGREGATION CHECK:")
+        for name in self.strategies:
+            s_bucket    = (sb.get(name) or {})
+            scan_closed = int(s_bucket.get("closed_trades", 0) or 0)
+            norm_closed = sum(1 for t in all_multi_trades if t.get("strategy_type") == name)
+            print(f"  {name}: scan_closed={scan_closed} normalized_closed={norm_closed}")
+            if scan_closed != norm_closed:
+                print(
+                    f"  !! WARNING: {name} scan_closed({scan_closed}) != "
+                    f"normalized_closed({norm_closed})"
+                )
+        print(f"  all_closed_trades={len(all_multi_trades)}")
+        print(f"  rows_inserted={rows_inserted}")
+
         return combined
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -240,6 +280,27 @@ class MultiStrategyReplayEngine:
             signal_generator=SignalGenerator(learning_engine=None),
         )
         result = engine.run(start=start, end=end, symbol=symbol)
+
+        # PRIMARY: use in-memory closed trade payloads that the engine embedded in result.
+        # This avoids the Supabase round-trip that silently returns 0 rows when
+        # historical_replay_trades has schema mismatches or when _store_replay_trade()
+        # skipped a trade due to an optional-column insert error.
+        in_memory_trades: Optional[List[dict]] = result.pop("_closed_replay_trades", None)
+        if in_memory_trades is not None:
+            logger.info(
+                "MULTI STRATEGY: %d in-memory closed trades extracted from replay result "
+                "(replay_run_id=%s) — skipping Supabase round-trip",
+                len(in_memory_trades),
+                result.get("replay_run_id"),
+            )
+            return result, in_memory_trades
+
+        # FALLBACK: fetch from Supabase (used only when engine doesn't embed trades,
+        # e.g. older engine versions or when _closed_replay_trades key is absent).
+        logger.warning(
+            "MULTI STRATEGY: _closed_replay_trades absent from replay result — "
+            "falling back to Supabase fetch (may return 0 rows if schema has issues)"
+        )
         trades: List[dict] = []
         self.db.init()
         try:
@@ -250,8 +311,13 @@ class MultiStrategyReplayEngine:
                     t for t in trades
                     if (t.get("final_result") or "") in _CLOSED_RESULTS
                 ]
+                logger.info(
+                    "MULTI STRATEGY: Supabase fallback fetched %d closed trades "
+                    "for replay_run_id=%s",
+                    len(trades), run_id,
+                )
             else:
-                logger.warning("replay_run_id not in result; trade fetch skipped")
+                logger.warning("replay_run_id not in result; Supabase trade fetch skipped")
         finally:
             self.db.close()
         return result, trades
@@ -393,6 +459,14 @@ class MultiStrategyReplayEngine:
             tp1  = sum(1 for t in grp if int(t.get("tp_progress") or 0) >= 1)
             mpips = missing_pips_by_strategy.get(name, 0)
             bucket = dict(strategy_balance.get(name, {}))
+            sb_closed = int(bucket.get("closed_trades", 0) or 0)
+            if sb_closed > 0 and n == 0:
+                logger.warning(
+                    "BY-STRATEGY WARNING: %s scan_balance shows %d closed trades "
+                    "but 0 normalized trade records — trade mapping or extraction failed",
+                    name, sb_closed,
+                )
+                bucket["_warning"] = "scan_balance_closed_but_no_normalized_trades"
             bucket.update({
                 "trades":              n,
                 "wins":                w,
@@ -451,14 +525,20 @@ class MultiStrategyReplayEngine:
             n_trades = len(strategy_trades)
 
             if scans_run <= 0 and n_trades == 0:
-                reason = "no scans recorded"
-                logger.warning("LEARNING SKIPPED: strategy=%s | reason=%s", strategy_name, reason)
+                reason = "no_closed_trades"
+                logger.info(
+                    "LEARNING PROFILE SKIPPED: strategy=%s | reason=%s",
+                    strategy_name, reason,
+                )
                 skipped.append(f"{strategy_name}:{reason}")
                 continue
 
             if mpips > 0 and n_trades > 0 and mpips >= n_trades:
-                reason = "all trades missing final_pips"
-                logger.warning("LEARNING SKIPPED: strategy=%s | reason=%s", strategy_name, reason)
+                reason = "all_trades_missing_final_pips"
+                logger.info(
+                    "LEARNING PROFILE SKIPPED: strategy=%s | reason=%s",
+                    strategy_name, reason,
+                )
                 skipped.append(f"{strategy_name}:{reason}")
                 continue
 
@@ -490,6 +570,11 @@ class MultiStrategyReplayEngine:
                         "last_multi_run_id":  multi_run_id,
                     })
                     updated_profiles += 1
+                    logger.info(
+                        "LEARNING PROFILE UPDATED: strategy=%s | session=%s | sample=%d | "
+                        "WR=%.1f%% | net=%.1fp",
+                        strategy_name, session, n, wr, round(np, 2),
+                    )
                 except Exception as exc:
                     logger.warning("Learning profile upsert failed (%s): %s", profile_key, exc)
 

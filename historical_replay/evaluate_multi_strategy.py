@@ -99,7 +99,11 @@ def build_report(run: Dict, trades: List[Dict], *, show_trades: int = 20) -> str
         f"  Status     : {status}",
         "",
         _section("COMBINED RESULTS"),
-        _combined_stats(all_closed, total_trades=len(trades)),
+        _combined_stats(
+            all_closed,
+            total_trades=len(trades),
+            scan_closed=_total_scan_closed(run),
+        ),
         "",
         _section("BY STRATEGY"),
         _by_strategy_report(all_closed, strategies),
@@ -163,9 +167,22 @@ def build_report(run: Dict, trades: List[Dict], *, show_trades: int = 20) -> str
 # Section builders
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _combined_stats(trades: List[Dict], *, total_trades: int = 0) -> str:
+def _combined_stats(
+    trades: List[Dict],
+    *,
+    total_trades: int = 0,
+    scan_closed: int = 0,
+) -> str:
     n = len(trades)
     if not n:
+        if scan_closed > 0:
+            return (
+                f"  No closed trades.  "
+                f"!! WARNING: normalized trade storage missing — "
+                f"scan_balance reports {scan_closed} closed trade(s) but "
+                f"multi_strategy_replay_trades is empty. "
+                f"Re-run replay to regenerate."
+            )
         if total_trades:
             return f"  No closed trades.  ({total_trades} trade row(s) stored, none with a closed result)"
         return "  No closed trades."
@@ -281,6 +298,16 @@ def _learning_report(run: Dict) -> str:
     return (
         f"  Profiles upserted : {data.get('profiles_upserted', 0)}\n"
         f"  Multi Run ID       : {data.get('multi_run_id', '?')}"
+    )
+
+
+def _total_scan_closed(run: Dict) -> int:
+    """Sum closed_trades across all strategies from the stored strategy_summary."""
+    data = _read_strategy_summary(run)
+    return sum(
+        int((v or {}).get("closed_trades", 0) or 0)
+        for v in data.values()
+        if isinstance(v, dict)
     )
 
 

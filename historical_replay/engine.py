@@ -316,6 +316,21 @@ class HistoricalReplayEngine:
                 exc,
             )
             stats_payload["stats_insert_failed"] = True
+
+        # Embed in-memory closed trade payloads so the multi-strategy wrapper can use
+        # them directly without a Supabase round-trip.  The round-trip can silently
+        # return 0 rows when historical_replay_trades has schema issues or when
+        # _store_replay_trade() skipped a trade due to an optional-column error.
+        _CLOSED_SET = frozenset({"LOSS", "BREAKEVEN_WIN", "PARTIAL_WIN", "WIN", "STRONG_WIN"})
+        stats_payload["_closed_replay_trades"] = [
+            rt.to_supabase_payload(replay_run_id)
+            for rt in activated_or_closed.values()
+            if rt.final_result in _CLOSED_SET
+        ]
+        logger.info(
+            "REPLAY: embedded %d closed trade payload(s) in result for multi-strategy aggregation",
+            len(stats_payload["_closed_replay_trades"]),
+        )
         return stats_payload
 
     def _update_replay_trades(
