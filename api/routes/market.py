@@ -36,23 +36,17 @@ def _session_label(utc_dt: datetime) -> str:
         return "london"
     if in_new_york:
         return "new_york"
-    return "off_session"
+    return "quiet_session"
 
 
 def _bot_window(utc_dt: datetime) -> tuple[bool, str]:
+    # 24/7 mode — always active; return local time for display only
     try:
         tz = ZoneInfo(BOT_TIMEZONE)
     except Exception:
         tz = datetime.now().astimezone().tzinfo or timezone.utc
     local_dt = utc_dt.astimezone(tz)
-    current_minutes = local_dt.hour * 60 + local_dt.minute
-    start_minutes = BOT_ACTIVE_START_HOUR * 60
-    end_minutes = BOT_ACTIVE_END_HOUR * 60
-    if start_minutes <= end_minutes:
-        active = start_minutes <= current_minutes < end_minutes
-    else:
-        active = current_minutes >= start_minutes or current_minutes < end_minutes
-    return active, local_dt.strftime("%H:%M")
+    return True, local_dt.strftime("%H:%M")
 
 
 def _mt5_tick(symbol: str) -> dict:
@@ -95,10 +89,11 @@ def _heartbeat_context(symbol: str) -> dict:
             "strength": hb.get("bias_strength", "weak"),
         },
         "session": {
-            "botWindowActive": hb.get("bot_window_active"),
-            "sessionName": hb.get("session_name") or hb.get("current_session") or "off_session",
+            "botWindowActive": True,
+            "sessionName": hb.get("session_name") or hb.get("current_session") or "quiet_session",
             "localTime": hb.get("local_time", ""),
-            "activeUntil": hb.get("active_until", f"{BOT_ACTIVE_END_HOUR:02d}:00"),
+            "activeUntil": hb.get("active_until", "24/7"),
+            "operatingMode": hb.get("operating_mode", "24_7"),
         },
         "lastMarketUpdateAt": hb.get("last_market_update_at"),
     }

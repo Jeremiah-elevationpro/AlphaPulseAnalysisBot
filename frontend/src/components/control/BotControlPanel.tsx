@@ -110,9 +110,9 @@ export function BotControlPanel() {
           <Info label="Last Stopped" value={formatDateTime(data?.last_stopped_at)} />
           <Info label="Strategy Mode" value={data?.strategy_mode ?? "hybrid"} />
           <Info label="Current Symbol" value={data?.symbol ?? "XAUUSD"} />
-          <Info label="Current Session" value={data?.session ?? "london"} />
-          <Info label="Bot Window" value={data?.data?.botWindowActive ? `Active until ${data.data.activeUntil ?? "19:00"}` : "Closed"} />
-          <Info label="Session Blocking" value={data?.data?.sessionBlocking ? "yes" : "no"} />
+          <Info label="Market Session" value={formatSessionLabel(data?.session ?? data?.data?.currentSession)} />
+          <Info label="Operating Mode" value={data?.data?.operatingMode === "24_7" ? "24/7 — Always Active" : (data?.data?.operatingMode ?? "24/7")} />
+          <Info label="Scan Active" value="Yes — 24/7 Mode" />
           <Info label="Local Time" value={data?.data?.localTime ?? "--"} />
           <Info label="Last Heartbeat" value={formatDateTime(data?.data?.lastHeartbeatAt ?? data?.last_heartbeat_at)} />
           <Info label="Last Scan" value={formatDateTime(data?.data?.lastScanAt ?? data?.last_scan_at)} />
@@ -133,11 +133,11 @@ export function BotControlPanel() {
           )}
         </div>
 
-        {data?.data?.botWindowActive && data?.data?.sessionBlocking && (
+        {data?.data?.sessionBlocking && (
           <div className="rounded-xl border border-sell/25 bg-sell/8 px-4 py-3 text-sm">
             <div className="label-xs text-sell">Session Warning</div>
             <div className="mt-2 font-medium text-sell">
-              Configuration error: session label is blocking active bot window.
+              Session blocking is active — check operating mode configuration.
             </div>
           </div>
         )}
@@ -211,4 +211,13 @@ function ActionButton({
 function formatDateTime(value?: string | null) {
   if (!value) return "--"
   return new Date(value).toLocaleString()
+}
+
+function formatSessionLabel(value?: string | null) {
+  if (!value || value === "off_session" || value === "quiet_session") return "Quiet Session"
+  if (value === "overlap") return "Overlap"
+  if (value === "london") return "London"
+  if (value === "new_york") return "New York"
+  if (value === "asia") return "Asia"
+  return value.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())
 }

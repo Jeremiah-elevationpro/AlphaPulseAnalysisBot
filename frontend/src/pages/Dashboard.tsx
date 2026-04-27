@@ -116,7 +116,7 @@ export default function Dashboard() {
           subtitle={
             market.isLoading
               ? "Loading live context"
-              : `${formatSessionName(marketContext?.session?.sessionName)} session`
+              : `${formatSessionName(marketContext?.session?.sessionName)} · 24/7 Active`
           }
           accent="gold"
         >
@@ -131,12 +131,15 @@ export default function Dashboard() {
           <InfoRow label="Dominant Bias" value={formatBiasLabel(dominantBias)} valueClass={biasColor(dominantBias)} />
           <InfoRow label="Bias Strength" value={marketContext?.bias?.strength ?? "Unavailable"} />
           <InfoRow
-            label="Bot Window"
-            value={marketContext?.session ? (botWindowActive ? `Active until ${marketContext.session.activeUntil}` : "Closed") : "Unavailable"}
-            valueClass={botWindowActive ? "text-buy" : "text-muted-foreground"}
+            label="Operating Mode"
+            value="24/7 Active"
+            valueClass="text-buy"
           />
-          <InfoRow label="Market Session" value={formatSessionName(marketContext?.session?.sessionName)} />
-          <InfoRow label="Local Time" value={marketContext?.session?.localTime ?? "Unavailable"} mono />
+          <InfoRow
+            label="Market Session"
+            value={formatSessionName(marketContext?.session?.sessionName)}
+          />
+          <InfoRow label="Local Time" value={marketContext?.session?.localTime ?? "—"} mono />
           <InfoRow label="Last Updated" value={marketContext?.timestamp ? new Date(marketContext.timestamp).toLocaleTimeString() : "Unavailable"} mono />
         </StatusCard>
 
@@ -416,8 +419,12 @@ function formatBiasLabel(value?: string | null) {
 }
 
 function formatSessionName(value?: string | null) {
-  if (!value) return "Off-session"
-  return value.replace(/_/g, " ")
+  if (!value || value === "off_session" || value === "quiet_session") return "Quiet Session"
+  if (value === "overlap") return "Overlap"
+  if (value === "london") return "London"
+  if (value === "new_york") return "New York"
+  if (value === "asia") return "Asia"
+  return value.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())
 }
 
 function formatStrategy(value?: string | null) {
