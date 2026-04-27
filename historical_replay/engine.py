@@ -305,7 +305,17 @@ class HistoricalReplayEngine:
             strategy_balance["engulfing_rejection"]["candidates_found"],
             strategy_balance["engulfing_rejection"]["activated_trades"],
         )
-        self.storage.insert_stats(replay_run_id, stats_payload)
+        try:
+            self.storage.insert_stats(replay_run_id, stats_payload)
+        except Exception as exc:
+            # Stats storage is non-critical — trades are already stored.
+            # Mark the payload so callers know, but do not abort the replay.
+            logger.error(
+                "REPLAY STATS STORAGE FAILED (trades preserved, replay marked stats_insert_failed) — %s. "
+                "Run migrate_historical_replay_stats_strategy_scan_balance.sql in Supabase.",
+                exc,
+            )
+            stats_payload["stats_insert_failed"] = True
         return stats_payload
 
     def _update_replay_trades(

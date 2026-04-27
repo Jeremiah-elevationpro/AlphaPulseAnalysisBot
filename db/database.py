@@ -610,6 +610,19 @@ class Database:
         "performance_by_micro_confirmation",
         # migrate_replay_execution_filters.sql (stats table)
         "performance_by_h1_sweep", "performance_by_pd_location", "performance_by_bias_gate",
+        # migrate_historical_replay_stats_strategy_scan_balance.sql
+        # Multi-strategy diagnostic fields — safe to strip when migration not yet run.
+        "strategy_scan_balance",
+        "strategy_summary",
+        "session_summary",
+        "confluence_summary",
+        "learning_summary",
+        "missing_pips_count",
+        "validation_warnings",
+    })
+
+    _REQUIRED_REPLAY_STATS_COLUMNS: frozenset = frozenset({
+        "replay_run_id",
     })
 
     _OPTIONAL_STRATEGY_RESEARCH_TRADE_COLUMNS: frozenset = frozenset({
@@ -802,23 +815,13 @@ class Database:
         return row.get("id") if row else None
 
     def insert_replay_stats(self, payload: Dict[str, Any]) -> Optional[int]:
-        if not self._sb:
-            raise RuntimeError("Historical replay persistence requires USE_SUPABASE=true")
-        try:
-            row = self._sb._post("historical_replay_stats", payload)
-        except Exception as exc:
-            if not self._is_400(exc):
-                raise
-            fallback = {k: v for k, v in payload.items() if k not in self._OPTIONAL_STATS_COLUMNS}
-            stripped = sorted(set(payload) & self._OPTIONAL_STATS_COLUMNS)
-            logger.warning(
-                "Replay stats insert 400 — retrying without optional columns %s. "
-                "Run migrate_replay_pip_metrics.sql, migrate_replay_micro_confirmation.sql, "
-                "and migrate_replay_execution_filters.sql.",
-                stripped,
-            )
-            row = self._sb._post("historical_replay_stats", fallback)
-        return row.get("id") if row else None
+        return self._post_with_missing_column_fallback(
+            "historical_replay_stats",
+            payload,
+            self._OPTIONAL_STATS_COLUMNS,
+            "REPLAY STATS",
+            self._REQUIRED_REPLAY_STATS_COLUMNS,
+        )
 
     @staticmethod
     def _extract_missing_columns(exc: Exception) -> List[str]:
@@ -883,7 +886,9 @@ class Database:
                 for col in missing:
                     removed.append(col)
                     attempt_payload.pop(col, None)
-                    self._warn_missing_schema_once(table, col)
+                    self._warn_missing_schema_once(
+                        table, col, prefix=f"{context_label} FALLBACK"
+                    )
 
     def _patch_with_missing_column_fallback(
         self,
@@ -928,7 +933,9 @@ class Database:
                 for col in missing:
                     removed.append(col)
                     attempt_payload.pop(col, None)
-                    self._warn_missing_schema_once(table, col)
+                    self._warn_missing_schema_once(
+                        table, col, prefix=f"{context_label} FALLBACK"
+                    )
 
     @staticmethod
     def _is_400(exc: Exception) -> bool:
@@ -961,13 +968,20 @@ class Database:
         )
         return any(marker in message for marker in retryable_markers)
 
-    def _warn_missing_schema_once(self, table: str, column: str) -> None:
+    def _warn_missing_schema_once(
+        self,
+        table: str,
+        column: str,
+        *,
+        prefix: str = "SCHEMA WARNING",
+    ) -> None:
         key = (table, column)
         if key in self._schema_warnings_seen:
             return
         self._schema_warnings_seen.add(key)
         logger.warning(
-            "SCHEMA WARNING: missing column %s on %s — run migration",
+            "%s: removed missing column %s from %s — run migration",
+            prefix,
             column,
             table,
         )
