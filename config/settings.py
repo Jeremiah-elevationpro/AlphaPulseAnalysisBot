@@ -136,9 +136,25 @@ ENGULF_STRONG_BIAS_BONUS = int(os.getenv("ENGULF_STRONG_BIAS_BONUS", "8"))
 ENGULF_MODERATE_BIAS_BONUS = int(os.getenv("ENGULF_MODERATE_BIAS_BONUS", "3"))
 
 # Live strategy registry / forward-testing controls
+# ── PRODUCTION LOCK ──────────────────────────────────────────────────────────
+# Only gap_sweep (Gap + liquidity_sweep_reclaim) is approved for live forward
+# testing. All other strategies are research/replay only until verified.
+# Override via env: LIVE_ENABLED_STRATEGIES=gap_sweep
 LIVE_ENABLED_STRATEGIES = [
     part.strip()
-    for part in os.getenv("LIVE_ENABLED_STRATEGIES", "gap_sweep,engulfing_rejection").split(",")
+    for part in os.getenv("LIVE_ENABLED_STRATEGIES", "gap_sweep").split(",")
+    if part.strip()
+]
+
+# Strategies that are scanning/research only — must never produce live Telegram
+# alerts or live trade tracking entries. Changing this list requires explicit
+# replay verification first.
+RESEARCH_ONLY_STRATEGIES: List[str] = [
+    part.strip()
+    for part in os.getenv(
+        "RESEARCH_ONLY_STRATEGIES",
+        "engulfing_rejection,standard_break_retest,failed_engulf_break_retest,failed_gap_break_retest",
+    ).split(",")
     if part.strip()
 ]
 ENGULF_ALLOWED_LIVE_TIMEFRAMES = tuple(

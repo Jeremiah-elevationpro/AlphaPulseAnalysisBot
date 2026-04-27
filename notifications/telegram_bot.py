@@ -371,7 +371,16 @@ class TelegramBot:
             confirmation = f"First bullish rejection closed below resistance ({trade.lower_tf})"
         bias = self._bias_storyline_label(trade.h4_bias)
         extra = ""
-        if getattr(trade, "strategy_type", "") == "engulfing_rejection":
+        if getattr(trade, "strategy_type", "") == "gap_sweep":
+            extra = (
+                f"\nSession: {trade.session_name or 'checking'}"
+                f"\nBias: {getattr(trade, 'dominant_bias', trade.h4_bias) or trade.h4_bias}"
+                f"/{getattr(trade, 'bias_strength', 'moderate')}"
+                f"\nConfirmation Type: liquidity_sweep_reclaim"
+                f"\nScore: {float(getattr(trade, 'confirmation_score', 0.0) or 0.0):.0f}"
+                f"\nTracking: ✓ Pending retest fill"
+            )
+        elif getattr(trade, "strategy_type", "") == "engulfing_rejection":
             extra = (
                 f"\nStrategy: Engulfing Rejection"
                 f"\nBias: {getattr(trade, 'dominant_bias', trade.h4_bias)}/{getattr(trade, 'bias_strength', 'weak')}"

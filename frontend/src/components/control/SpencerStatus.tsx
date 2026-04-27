@@ -84,8 +84,13 @@ export function SpencerStatus({ status }: { status?: BotStatusResponse }) {
           </Badge>
           <Badge variant="gold" className="text-[10px]">Powered by AlphaPulse</Badge>
           {status?.data?.liveEnabledStrategies?.map((strategy) => (
-            <Badge key={strategy} variant="purple" className="text-[10px]">
-              {strategy.replace(/_/g, " ")}
+            <Badge key={`live-${strategy}`} variant="buy" className="text-[10px]">
+              Live: {strategy.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())}
+            </Badge>
+          ))}
+          {status?.data?.researchOnlyStrategies?.map((strategy) => (
+            <Badge key={`research-${strategy}`} variant="outline" className="text-[10px]">
+              Research Only: {strategy.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())}
             </Badge>
           ))}
           <Badge variant="outline" className="text-[10px]">Current Symbol: {status?.symbol ?? "XAUUSD"}</Badge>

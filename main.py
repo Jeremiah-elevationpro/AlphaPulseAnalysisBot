@@ -41,6 +41,7 @@ from config.settings import (
     SEND_NO_SETUP_STATUS_ALERT, NO_SETUP_STATUS_INTERVAL_MINUTES,
     BOT_ACTIVE_START_HOUR, BOT_ACTIVE_END_HOUR,
     ENGULF_ALLOWED_LIVE_TIMEFRAMES, LIVE_ENABLED_STRATEGIES,
+    RESEARCH_ONLY_STRATEGIES,
 )
 from data.mt5_client import MT5Client
 from strategies.strategy_manager import StrategyManager
@@ -429,6 +430,19 @@ class AlphaPulse:
                             )
                             continue
 
+                        # ── Live strategy gate ────────────────────────────────
+                        # Research-only strategies are blocked from live alerts
+                        # and live trade tracking regardless of confidence score.
+                        _trade_strategy = getattr(trade, "strategy_type", "gap_sweep") or "gap_sweep"
+                        if _trade_strategy in RESEARCH_ONLY_STRATEGIES:
+                            logger.info(
+                                "LIVE STRATEGY BLOCKED: %s is research-only — "
+                                "no Telegram alert, no live trade tracking | %s %s @ %.2f",
+                                _trade_strategy,
+                                trade.direction, trade.pair, trade.entry_price,
+                            )
+                            continue
+
                         # ── Alert sequence ───────────────────────────────────
                         self._confirmed_setups.add(fp)
                         self._mark_level_confirmed(level_id)
@@ -615,6 +629,7 @@ class AlphaPulse:
                 "active_until":         getattr(ctx, "active_until", f"{BOT_ACTIVE_END_HOUR:02d}:00") if ctx else f"{BOT_ACTIVE_END_HOUR:02d}:00",
                 "last_market_update_at": datetime.now(timezone.utc).isoformat(),
                 "live_enabled_strategies": list(LIVE_ENABLED_STRATEGIES),
+                "research_only_strategies": list(RESEARCH_ONLY_STRATEGIES),
             }
             self._heartbeat_file.write_text(json.dumps(data), encoding="utf-8")
         except Exception as exc:

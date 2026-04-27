@@ -210,6 +210,7 @@ export interface BotStatusResponse {
     biasStrength?: string | null
     lastMarketUpdateAt?: string | null
     liveEnabledStrategies?: string[] | null
+    researchOnlyStrategies?: string[] | null
   } | null
 }
 
