@@ -42,6 +42,7 @@ from config.settings import (
     BOT_ACTIVE_START_HOUR, BOT_ACTIVE_END_HOUR,
     ENGULF_ALLOWED_LIVE_TIMEFRAMES, LIVE_ENABLED_STRATEGIES,
     RESEARCH_ONLY_STRATEGIES,
+    MANUAL_SETUP_APPROACH_DISTANCE_PIPS, MANUAL_SETUP_ALERT_COOLDOWN_MINUTES,
 )
 from data.mt5_client import MT5Client
 from strategies.strategy_manager import StrategyManager
@@ -124,6 +125,9 @@ class AlphaPulse:
         # Last daily summary sent
         self._last_daily_date: Optional[str] = None
 
+        # Manual setup approach alert cooldown: setup_id → last alert time
+        self._manual_setup_approach_alerted: Dict[int, datetime] = {}
+
         # Heartbeat file for API status sync
         self._heartbeat_file = Path(__file__).resolve().parent / "bot_heartbeat.json"
         # Tracks when the last no-setup status alert was sent
@@ -140,24 +144,19 @@ class AlphaPulse:
             "session_blocking":      False,
         }
 
-    def _bot_window_active(self, ctx) -> bool:
-        if ctx is None:
-            return True
-        return bool(getattr(ctx, "bot_window_active", getattr(ctx, "session_allowed", True)))
+    def _bot_window_active(self, _ctx) -> bool:
+        # 24/7 mode — always active
+        return True
 
     def _log_time_block_check(self, ctx) -> bool:
+        # 24/7 mode — never blocks; logs session context only
         local_time = getattr(ctx, "local_time", "--:--") if ctx else "--:--"
         session_label = getattr(ctx, "session_name", "unknown") if ctx else "unknown"
-        bot_window_active = self._bot_window_active(ctx)
-        will_block = not bot_window_active
         runtime_logger.info(
-            "TIME BLOCK CHECK: local_time=%s | bot_window_active=%s | session_label=%s | will_block=%s",
-            local_time,
-            str(bot_window_active).lower(),
-            session_label,
-            str(will_block).lower(),
+            "SESSION CONTEXT: label=%s | scan_allowed=true | mode=24_7 | local_time=%s",
+            session_label, local_time,
         )
-        return will_block
+        return False
 
     # ─────────────────────────────────────────────────────
     # STARTUP
@@ -291,72 +290,53 @@ class AlphaPulse:
         # 3. Monitoring layer always computes current market context
         ctx = self.context_engine.analyze(data, utc_dt=now)
 
+        _session_label = getattr(ctx, "session_name", "unknown") if ctx else "unknown"
+        _local_time = getattr(ctx, "local_time", "--:--") if ctx else "--:--"
         runtime_logger.info(
-            "SESSION CHECK: local_time=%s | bot_window=%02d:00-%02d:00 | allowed=%s | session_label=%s",
-            getattr(ctx, "local_time", "--:--") if ctx else "--:--",
-            BOT_ACTIVE_START_HOUR,
-            BOT_ACTIVE_END_HOUR,
-            str(getattr(ctx, "session_allowed", True)).lower() if ctx else "true",
-            getattr(ctx, "session_name", "unknown") if ctx else "unknown",
+            "SESSION CONTEXT: label=%s | scan_allowed=true | mode=24_7 | local_time=%s",
+            _session_label, _local_time,
         )
-        scan_blocked = self._log_time_block_check(ctx)
-        if scan_blocked:
-            runtime_logger.info("SCAN SKIPPED: outside bot operating window")
-            runtime_logger.info("ALERT SKIPPED: outside active trading window")
-            self._last_scan_summary.update({
-                "last_candidates_count": 0,
-                "last_alerts_sent": 0,
-                "last_alerts_failed": 0,
-                "last_reject_reason": "session_blocked",
-                "last_telegram_status": "none",
-                "last_telegram_error": "",
-                "last_scan_number": self._scan_count,
-                "session_blocking": True,
-            })
-        else:
-            runtime_logger.info("SCAN ALLOWED: inside bot operating window")
-            self._last_scan_summary.update({
-                "last_scan_number": self._scan_count,
-                "session_blocking": False,
-            })
+        self._last_scan_summary.update({
+            "last_scan_number": self._scan_count,
+            "session_blocking": False,
+        })
 
         signals = []
         outlook = None
         watchlist_sent = 0
 
-        # 3a. Scanning layer only runs inside the active bot window
-        if not scan_blocked:
-            run_result = self.strategy_manager.run(data, current_price=current_price)
-            outlook = run_result.outlook
-            signals = run_result.signals
-            ctx = outlook.context
+        # 3a. Scanning layer — always runs (24/7 mode)
+        run_result = self.strategy_manager.run(data, current_price=current_price)
+        outlook = run_result.outlook
+        signals = run_result.signals
+        ctx = outlook.context
 
-            # 3b. Log strategy performance and filter states (internal only)
-            self._log_strategy_performance(run_result)
-            if ctx:
-                if not ctx.is_volatile:
-                    logger.debug("Filter: low volatility — signals may be weaker")
-                if ctx.is_news_window:
-                    logger.debug("Filter: news window active")
+        # 3b. Log strategy performance and filter states (internal only)
+        self._log_strategy_performance(run_result)
+        if ctx:
+            if not ctx.is_volatile:
+                logger.debug("Filter: low volatility — signals may be weaker")
+            if ctx.is_news_window:
+                logger.debug("Filter: news window active")
 
-            # 3c. Track structural level changes (state management — no Telegram send)
-            outlook_key = self._outlook_fingerprint(outlook)
-            if outlook_key != self._last_outlook_hash:
-                self._last_outlook_hash = outlook_key
-                self._seen_setups.clear()
-                self._watchlist_alerted.clear()
-                self._confirmed_levels.clear()
-                self._last_watch_distance.clear()
-                logger.info("Structural levels refreshed (%d groups)", len(outlook.timeframe_levels))
-                runtime_logger.info(
-                    "WATCHLIST DEDUPE CLEARED: structural levels changed — %d timeframe groups",
-                    len(outlook.timeframe_levels),
-                )
+        # 3c. Track structural level changes (state management — no Telegram send)
+        outlook_key = self._outlook_fingerprint(outlook)
+        if outlook_key != self._last_outlook_hash:
+            self._last_outlook_hash = outlook_key
+            self._seen_setups.clear()
+            self._watchlist_alerted.clear()
+            self._confirmed_levels.clear()
+            self._last_watch_distance.clear()
+            logger.info("Structural levels refreshed (%d groups)", len(outlook.timeframe_levels))
+            runtime_logger.info(
+                "WATCHLIST DEDUPE CLEARED: structural levels changed — %d timeframe groups",
+                len(outlook.timeframe_levels),
+            )
 
-            # 3d. Alert layer only runs inside the active bot window
-            if current_price and not in_silent_phase:
-                watchlist_sent = self._send_shortlisted_level_alerts(outlook, current_price) or 0
-                self._check_watch_levels(outlook, current_price)
+        # 3d. Alert layer — always active (24/7 mode)
+        if current_price and not in_silent_phase:
+            watchlist_sent = self._send_shortlisted_level_alerts(outlook, current_price) or 0
+            self._check_watch_levels(outlook, current_price)
 
         # 4. Freshness filter removed — historical rejection candles ARE valid pending
         #    setups (e.g. a level rejection from yesterday is still actionable today).
@@ -373,14 +353,6 @@ class AlphaPulse:
             new_signals = [s for s in active_signals if not self._is_seen_setup(s)]
 
             if new_signals:
-                # ── Session gate (relaxed for manual bot) ────────────────────
-                if self._bot_window_active(ctx) is False:
-                    session_label = getattr(ctx, "session_name", "off_session") if ctx else "off_session"
-                    logger.info(
-                        "Off-session (%s): %d signal(s) found — manual discretion advised.",
-                        session_label, len(new_signals),
-                    )
-
                 # ── Confidence split ──────────────────────────────────────────
                 high_prob = [s for s in new_signals if s.confidence >= MIN_SIGNAL_CONFIDENCE]
                 low_prob  = [s for s in new_signals if s.confidence <  MIN_SIGNAL_CONFIDENCE]
@@ -499,6 +471,10 @@ class AlphaPulse:
             self.trade_mgr.update(current_price)
             logger.debug("Price update @ %.2f", current_price)
 
+        # 6b. Track manual setups — price proximity and confirmation alerts
+        if current_price and not in_silent_phase:
+            self._track_manual_setups(current_price)
+
         # 7. Periodically refresh learning (every 5 scans = every 5 minutes)
         if self._scan_count % 5 == 0:
             self._refresh_learning()
@@ -515,9 +491,7 @@ class AlphaPulse:
                         or (now_ts - self._last_no_setup_alert_time) >= interval):
                     session_name = getattr(ctx, "session_name", "unknown") if ctx else "unknown"
                     bias = getattr(ctx, "h4_bias", "neutral") if ctx else "neutral"
-                    if self._bot_window_active(ctx) is False:
-                        logger.info("NO-SETUP STATUS ALERT SUPPRESSED: outside bot operating window")
-                    else:
+                    if True:
                         self.telegram.send_system_alert(
                             f"Spencer is watching — no active setups in the last "
                             f"{NO_SETUP_STATUS_INTERVAL_MINUTES} minutes.\n"
@@ -575,6 +549,62 @@ class AlphaPulse:
             logger.error("Learning refresh failed: %s", e)
 
     # ─────────────────────────────────────────────────────
+    # MANUAL SETUP TRACKING
+    # ─────────────────────────────────────────────────────
+
+    def _track_manual_setups(self, current_price: float) -> None:
+        """Check active manual setups against live price; fire approach/confirmation alerts."""
+        try:
+            setups = self.db.get_watching_manual_setups()
+        except Exception as exc:
+            logger.debug("Manual setup fetch failed: %s", exc)
+            return
+
+        if not setups:
+            return
+
+        approach_dist = MANUAL_SETUP_APPROACH_DISTANCE_PIPS * PIP_SIZE
+        cooldown = timedelta(minutes=MANUAL_SETUP_ALERT_COOLDOWN_MINUTES)
+        now = datetime.now(timezone.utc)
+
+        for setup in setups:
+            setup_id = setup.get("id")
+            entry = setup.get("entry_price")
+            if not setup_id or not entry:
+                continue
+
+            try:
+                entry = float(entry)
+            except (TypeError, ValueError):
+                continue
+
+            distance_pips = abs(current_price - entry) / PIP_SIZE
+            logger.info(
+                "MANUAL SETUP TRACKING: setup_id=%s | status=%s | entry=%.2f | current=%.2f | distance=%.1fp",
+                setup_id, setup.get("tracking_status", "watching"), entry, current_price, distance_pips,
+            )
+
+            if not setup.get("enable_telegram_alerts", True):
+                continue
+
+            if distance_pips <= MANUAL_SETUP_APPROACH_DISTANCE_PIPS:
+                last_alerted = self._manual_setup_approach_alerted.get(setup_id)
+                if last_alerted and (now - last_alerted) < cooldown:
+                    continue
+
+                logger.info("MANUAL SETUP APPROACHING: setup_id=%s | distance=%.1fp", setup_id, distance_pips)
+                sent = self.telegram.send_manual_setup_approaching(setup, current_price, distance_pips)
+                if sent:
+                    self._manual_setup_approach_alerted[setup_id] = now
+                    try:
+                        self.db.update_manual_setup(setup_id, {
+                            "tracking_status": "approaching_entry",
+                            "approach_alert_sent_at": now.isoformat(),
+                        })
+                    except Exception as exc:
+                        logger.debug("Manual setup status update failed: %s", exc)
+
+    # ─────────────────────────────────────────────────────
     # HEARTBEAT
     # ─────────────────────────────────────────────────────
 
@@ -582,10 +612,7 @@ class AlphaPulse:
         """Write bot_heartbeat.json so the API can surface analyzing/watching status."""
         try:
             status = "analyzing" if in_silent_phase else "watching"
-            if self._bot_window_active(ctx) is False and not in_silent_phase:
-                message = "Spencer online — outside active trading window"
-            else:
-                message = "Spencer is analyzing charts" if in_silent_phase else "Spencer is watching the market"
+            message = "Spencer is analyzing charts" if in_silent_phase else "Spencer is watching the market"
             session = getattr(ctx, "session_name", None) if ctx else None
             ss = self._last_scan_summary
             alerts_sent = ss.get("last_alerts_sent", 0)
@@ -623,10 +650,11 @@ class AlphaPulse:
                 "h1_bias":              getattr(ctx, "h1_bias", "neutral") if ctx else "neutral",
                 "dominant_bias":        getattr(ctx, "dominant_bias", "neutral") if ctx else "neutral",
                 "bias_strength":        getattr(ctx, "bias_strength", "weak") if ctx else "weak",
-                "bot_window_active":    getattr(ctx, "bot_window_active", True) if ctx else True,
+                "bot_window_active":    True,
                 "session_name":         getattr(ctx, "session_name", None) if ctx else None,
                 "local_time":           getattr(ctx, "local_time", "") if ctx else "",
-                "active_until":         getattr(ctx, "active_until", f"{BOT_ACTIVE_END_HOUR:02d}:00") if ctx else f"{BOT_ACTIVE_END_HOUR:02d}:00",
+                "active_until":         "24/7",
+                "operating_mode":       "24_7",
                 "last_market_update_at": datetime.now(timezone.utc).isoformat(),
                 "live_enabled_strategies": list(LIVE_ENABLED_STRATEGIES),
                 "research_only_strategies": list(RESEARCH_ONLY_STRATEGIES),
@@ -767,15 +795,6 @@ class AlphaPulse:
           4. At most one alert above price and one below per scan
           5. No alert when price is already within LEVEL_TOLERANCE_PIPS (at the level)
         """
-        ctx = getattr(outlook, "context", None)
-        if self._log_time_block_check(ctx):
-            logger.info(
-                "WATCH LEVELS SKIPPED: outside bot window (%s | %s)",
-                getattr(ctx, "session_name", "off_session"),
-                getattr(ctx, "session_block_reason", "blocked"),
-            )
-            return
-
         watch_dist    = WATCH_DISTANCE_PIPS * PIP_SIZE
         touch_dist    = LEVEL_TOLERANCE_PIPS * PIP_SIZE
         re_alert_dist = 25.0 * PIP_SIZE
@@ -879,42 +898,6 @@ class AlphaPulse:
         """
         ctx = getattr(outlook, "context", None)
         _session_name = getattr(ctx, "session_name", "unknown") if ctx else "unknown"
-
-        if self._log_time_block_check(ctx):
-            logger.info(
-                "WATCHLIST SKIPPED: outside bot window (%s | %s)",
-                getattr(ctx, "session_name", "off_session"),
-                getattr(ctx, "session_block_reason", "blocked"),
-            )
-            runtime_logger.info(
-                "NO WATCHLIST SETUPS FOUND: symbol=%s | reason=session_blocked | session=%s",
-                outlook.pair, _session_name,
-            )
-            self._last_scan_summary.update({
-                "last_candidates_count": 0,
-                "last_alerts_sent": 0,
-                "last_reject_reason": "session_blocked",
-                "last_telegram_status": "none",
-                "last_scan_number": self._scan_count,
-                "session_blocking": True,
-            })
-            runtime_logger.info(
-                "SCAN SUMMARY: %s",
-                json.dumps({
-                    "symbol": outlook.pair,
-                    "levels_detected": 0,
-                    "gap_levels": 0,
-                    "bias_passed": 0,
-                    "sweep_confirmed": 0,
-                    "session_passed": 0,
-                    "distance_passed": 0,
-                    "watchlist_candidates": 0,
-                    "alerts_sent": 0,
-                    "alerts_failed": 0,
-                    "reject_reasons": {"session_blocked": 1},
-                }),
-            )
-            return 0
 
         runtime_logger.info(
             "WATCHLIST LOOP STARTED: symbol=%s | session=%s | timeframe_groups=%d",

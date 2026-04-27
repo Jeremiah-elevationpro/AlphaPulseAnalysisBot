@@ -58,8 +58,10 @@ bot_state: dict = {
     "h1_bias":                None,
     "dominant_bias":          None,
     "bias_strength":          None,
-    "last_market_update_at":  None,
-    "live_enabled_strategies": ["gap_sweep"],
+    "last_market_update_at":      None,
+    "live_enabled_strategies":    ["gap_sweep"],
+    "research_only_strategies":   None,
+    "operating_mode":             "24_7",
 }
 
 replay_runs: dict[int, dict] = {}

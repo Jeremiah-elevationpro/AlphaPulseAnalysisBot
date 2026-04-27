@@ -24,7 +24,7 @@ import pandas as pd
 from config.settings import (
     SESSION_ASIA_UTC, SESSION_LONDON_UTC, SESSION_NEW_YORK_UTC,
     BOT_ACTIVE_START_HOUR, BOT_ACTIVE_END_HOUR, BOT_TIMEZONE,
-    ALLOWED_SESSIONS, BLOCK_OFF_SESSION,
+    ALLOWED_SESSIONS, BLOCK_OFF_SESSION, OPERATING_MODE,
     H4_EMA_PERIOD, VOLATILITY_MIN_BODY,
     USD_NEWS_TIMES, NEWS_FILTER_MINUTES,
     PIP_SIZE, LEVEL_TOLERANCE_PIPS,
@@ -122,23 +122,12 @@ class SessionFilter:
 
     def is_bot_window_active(self, utc_dt: datetime) -> tuple[bool, str, str]:
         local_dt = self.local_time(utc_dt)
-        hour = local_dt.hour
-        minute = local_dt.minute
-        current_minutes = hour * 60 + minute
-        start_minutes = BOT_ACTIVE_START_HOUR * 60
-        end_minutes = BOT_ACTIVE_END_HOUR * 60
-
-        if start_minutes <= end_minutes:
-            allowed = start_minutes <= current_minutes < end_minutes
-        else:
-            allowed = current_minutes >= start_minutes or current_minutes < end_minutes
-
-        return allowed, local_dt.strftime("%H:%M"), f"{BOT_ACTIVE_END_HOUR:02d}:00"
+        local_time_str = local_dt.strftime("%H:%M")
+        # 24/7 mode — always active regardless of local hour
+        return True, local_time_str, "24/7"
 
     def is_allowed(self, utc_dt: datetime, session_name: str) -> tuple[bool, str, str, str]:
-        allowed, local_time, active_until = self.is_bot_window_active(utc_dt)
-        if not allowed:
-            return False, "outside bot operating window", local_time, active_until
+        _, local_time, active_until = self.is_bot_window_active(utc_dt)
         return True, "", local_time, active_until
 
 
@@ -600,10 +589,12 @@ class MarketContextEngine:
         self._sweep      = LiquiditySweepFilter()
         self._news       = NewsFilter()
         logger.info(
-            "Session filter configured: allowed=%s | block_off_session=%s",
+            "Session filter configured: operating_mode=%s | allowed=%s | block_off_session=%s",
+            OPERATING_MODE,
             ",".join(ALLOWED_SESSIONS),
             BLOCK_OFF_SESSION,
         )
+        logger.info("SPENCER 24/7 MODE: session filters do not block alerts")
 
     def analyze(
         self,
@@ -645,6 +636,10 @@ class MarketContextEngine:
         # News filter
         ctx.is_news_window = not self._news.is_safe(utc_dt)
 
+        logger.info(
+            "SESSION CONTEXT: label=%s | scan_allowed=true | mode=24_7 | local_time=%s",
+            ctx.session_name, ctx.local_time,
+        )
         logger.debug(
             "MarketContext | session=%s | %s | volatile=%s | "
             "sweep=%s | news_block=%s | session_allowed=%s | local_time=%s",

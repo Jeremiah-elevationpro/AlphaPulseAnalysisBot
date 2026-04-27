@@ -531,6 +531,97 @@ class TelegramBot:
         return self._send_logged("TP ALERT", msg)
 
     # ─────────────────────────────────────────────────────
+    # MANUAL SETUP ALERTS
+    # ─────────────────────────────────────────────────────
+
+    def send_manual_setup_saved(self, setup: dict) -> bool:
+        """Fired immediately when a manual setup is created from the frontend."""
+        direction = setup.get("direction", "?")
+        symbol = setup.get("symbol", "XAUUSD")
+        entry = setup.get("entry_price", 0.0)
+        sl = setup.get("stop_loss", 0.0)
+        tp1 = setup.get("tp1", 0.0)
+        tp2 = setup.get("tp2")
+        tp3 = setup.get("tp3")
+        notes = setup.get("notes") or ""
+        session = setup.get("session") or "—"
+        setup_id = setup.get("id", "?")
+
+        tp_lines = f"TP1: {float(tp1):.2f}"
+        if tp2:
+            tp_lines += f"\nTP2: {float(tp2):.2f}"
+        if tp3:
+            tp_lines += f"\nTP3: {float(tp3):.2f}"
+
+        notes_line = f"\nNotes: {notes[:80]}" if notes else ""
+        msg = (
+            f"SPENCER MANUAL SETUP SAVED\n\n"
+            f"Symbol: {symbol}\n"
+            f"Direction: {direction}\n"
+            f"Entry: {float(entry):.2f}\n"
+            f"SL: {float(sl):.2f}\n"
+            f"{tp_lines}\n"
+            f"Session: {session}\n"
+            f"Strategy: Manual Setup\n"
+            f"Status: Watching{notes_line}\n\n"
+            f"Spencer is now tracking this level and will alert when price approaches or confirms.\n"
+            f"Setup ID: {setup_id}"
+        )
+        return self._send_logged("MANUAL SETUP SAVED", msg, parse_mode=None)
+
+    def send_manual_setup_approaching(self, setup: dict, current_price: float, distance_pips: float) -> bool:
+        """Fired when current price gets within approach distance of the manual setup entry."""
+        direction = setup.get("direction", "?")
+        symbol = setup.get("symbol", "XAUUSD")
+        entry = setup.get("entry_price", 0.0)
+        setup_id = setup.get("id", "?")
+
+        msg = (
+            f"SPENCER MANUAL SETUP APPROACHING\n\n"
+            f"Symbol: {symbol}\n"
+            f"Direction: {direction}\n"
+            f"Entry: {float(entry):.2f}\n"
+            f"Current Price: {current_price:.2f}\n"
+            f"Distance: {distance_pips:.1f} pips\n"
+            f"Status: Approaching entry\n\n"
+            f"Prepare for confirmation.\n"
+            f"Setup ID: {setup_id}"
+        )
+        return self._send_logged("MANUAL SETUP APPROACHING", msg, parse_mode=None)
+
+    def send_manual_setup_confirmed(self, setup: dict, current_price: float, confirmation: str = "manual") -> bool:
+        """Fired when price reaches the manual setup zone and confirmation is signalled."""
+        direction = setup.get("direction", "?")
+        symbol = setup.get("symbol", "XAUUSD")
+        entry = setup.get("entry_price", 0.0)
+        sl = setup.get("stop_loss", 0.0)
+        tp1 = setup.get("tp1", 0.0)
+        tp2 = setup.get("tp2")
+        tp3 = setup.get("tp3")
+        setup_id = setup.get("id", "?")
+
+        tp_lines = f"TP1: {float(tp1):.2f}"
+        if tp2:
+            tp_lines += f"\nTP2: {float(tp2):.2f}"
+        if tp3:
+            tp_lines += f"\nTP3: {float(tp3):.2f}"
+
+        msg = (
+            f"SPENCER MANUAL SETUP CONFIRMED\n\n"
+            f"Symbol: {symbol}\n"
+            f"Direction: {direction}\n"
+            f"Entry: {float(entry):.2f}\n"
+            f"Current Price: {current_price:.2f}\n"
+            f"Confirmation: {confirmation}\n"
+            f"SL: {float(sl):.2f}\n"
+            f"{tp_lines}\n\n"
+            f"Action: Manual execution opportunity.\n"
+            f"Spencer does not auto-execute. Place your order manually.\n"
+            f"Setup ID: {setup_id}"
+        )
+        return self._send_logged("MANUAL SETUP CONFIRMED", msg, parse_mode=None)
+
+    # ─────────────────────────────────────────────────────
     # ALERT TYPE 1 — STARTUP  /  ALERT TYPE 6 — SHUTDOWN
     # OPERATIONAL — system errors
     # ─────────────────────────────────────────────────────

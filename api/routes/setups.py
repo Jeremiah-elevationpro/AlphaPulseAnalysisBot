@@ -1,10 +1,13 @@
 from datetime import datetime, timezone
 from typing import Literal, Optional
+import logging
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 import api.state as state
+
+logger = logging.getLogger("alphapulse.api.setups")
 
 router = APIRouter()
 
@@ -65,9 +68,10 @@ class SetupUpdate(BaseModel):
     status: Optional[StatusValue] = None
 
 
-def _shape_setup(row: dict) -> dict:
+def _shape_setup(row: dict, *, telegram_alert_sent: Optional[bool] = None, tracking_enabled: bool = True) -> dict:
     created_at = row.get("created_at") or datetime.now(timezone.utc).isoformat()
     updated_at = row.get("updated_at") or created_at
+    tg_sent = telegram_alert_sent if telegram_alert_sent is not None else bool(row.get("telegram_alert_sent", False))
     return {
         "id": row.get("id"),
         "symbol": row.get("symbol", "XAUUSD"),
@@ -87,9 +91,26 @@ def _shape_setup(row: dict) -> dict:
         "enable_telegram_alerts": bool(row.get("enable_telegram_alerts", True)),
         "high_priority": bool(row.get("high_priority", False)),
         "status": row.get("status", "draft"),
+        "tracking_enabled": tracking_enabled,
+        "tracking_status": row.get("tracking_status", "watching"),
+        "telegram_alert_sent": tg_sent,
+        "telegram_alert_sent_at": row.get("telegram_alert_sent_at"),
+        "telegram_error": row.get("telegram_error"),
         "created_at": str(created_at),
         "updated_at": str(updated_at),
     }
+
+
+def _send_telegram_saved(row: dict) -> tuple[bool, Optional[str]]:
+    """Send Telegram saved alert from the API process. Returns (sent, error_str)."""
+    try:
+        from notifications.telegram_bot import TelegramBot
+        tg = TelegramBot()
+        ok = tg.send_manual_setup_saved(row)
+        return ok, None
+    except Exception as exc:
+        logger.warning("Manual setup Telegram alert failed: %s", exc)
+        return False, str(exc)
 
 
 @router.get("/setups")
@@ -112,16 +133,48 @@ def create_setup(body: SetupCreate):
 
     payload = body.model_dump()
     payload["symbol"] = payload["symbol"].strip().upper()
+    payload.setdefault("source", "manual")
+    payload.setdefault("strategy_type", "manual_setup")
+    payload.setdefault("setup_type", "manual_setup")
+    payload.setdefault("tracking_enabled", True)
+    payload.setdefault("tracking_status", "watching")
+
+    # Force status to "watching" so tracking activates immediately
+    if payload.get("status") == "draft":
+        payload["status"] = "watching"
 
     try:
         row = state.db.insert_manual_setup(payload)
         if not row:
             raise HTTPException(status_code=500, detail="Failed to create manual setup")
-        return _shape_setup(row)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+    # Send Telegram saved alert (non-blocking — failure does not break the response)
+    tg_sent = False
+    tg_error = None
+    if body.enable_telegram_alerts:
+        tg_sent, tg_error = _send_telegram_saved(row)
+        # Persist telegram outcome back to DB
+        try:
+            patch: dict = {"telegram_alert_sent": tg_sent}
+            if tg_sent:
+                patch["telegram_alert_sent_at"] = datetime.now(timezone.utc).isoformat()
+            if tg_error:
+                patch["telegram_error"] = tg_error[:500]
+            state.db.update_manual_setup(row["id"], patch)
+            row["telegram_alert_sent"] = tg_sent
+            row["telegram_error"] = tg_error
+        except Exception:
+            pass
+
+    shaped = _shape_setup(row, telegram_alert_sent=tg_sent, tracking_enabled=True)
+    shaped["setup_id"] = shaped["id"]
+    shaped["telegram_alert_sent"] = tg_sent
+    shaped["telegram_error"] = tg_error if not tg_sent else None
+    return shaped
 
 
 @router.patch("/setups/{setup_id}")

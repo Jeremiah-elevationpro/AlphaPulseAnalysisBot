@@ -41,7 +41,7 @@ type ConfirmationType =
   | "engulfing_reclaim"
   | "structure_reclaim"
   | "manual_discretionary"
-type Session = "asia" | "london" | "new_york" | "off_session"
+type Session = "asia" | "london" | "new_york" | "off_session" | "quiet_session"
 type ActivationMode =
   | "touch_activation"
   | "rejection_then_revisit"
@@ -79,6 +79,10 @@ interface ManualSetup {
   enableTelegramAlerts: boolean
   highPriority: boolean
   status: ManualSetupStatus
+  trackingEnabled: boolean
+  trackingStatus: string
+  telegramAlertSent: boolean
+  telegramError?: string | null
   createdAt: string
   updatedAt: string
 }
@@ -110,7 +114,7 @@ const CONFIRMATION_OPTIONS: ConfirmationType[] = [
   "structure_reclaim",
   "manual_discretionary",
 ]
-const SESSION_OPTIONS: Session[] = ["asia", "london", "new_york", "off_session"]
+const SESSION_OPTIONS: Session[] = ["asia", "london", "new_york", "quiet_session", "off_session"]
 const ACTIVATION_OPTIONS: ActivationMode[] = [
   "touch_activation",
   "rejection_then_revisit",
@@ -196,6 +200,10 @@ export default function ManualSetups() {
         enableTelegramAlerts: setup.enable_telegram_alerts,
         highPriority: setup.high_priority,
         status: (setup.status as ManualSetupStatus) ?? "draft",
+        trackingEnabled: (setup as any).tracking_enabled ?? true,
+        trackingStatus: (setup as any).tracking_status ?? "watching",
+        telegramAlertSent: (setup as any).telegram_alert_sent ?? false,
+        telegramError: (setup as any).telegram_error ?? null,
         createdAt: setup.created_at ? formatApiDate(setup.created_at) : "--",
         updatedAt: setup.updated_at ? formatApiDate(setup.updated_at) : "--",
       })),
@@ -251,7 +259,19 @@ export default function ManualSetups() {
         : await createSetup.mutateAsync(payload)
       setSelectedId(row.id)
       setEditingId(row.id)
-      setSuccessMessage(editingId ? "Manual setup updated and kept in bot-tracking flow." : "Manual setup saved and queued for future bot tracking.")
+      if (editingId) {
+        setSuccessMessage("Manual setup updated. Tracking active.")
+      } else {
+        const tgSent = (row as any).telegram_alert_sent
+        const tgErr = (row as any).telegram_error
+        if (tgSent) {
+          setSuccessMessage("Setup saved. Telegram alert sent. Tracking active.")
+        } else if (tgErr) {
+          setSuccessMessage(`Setup saved. Telegram alert failed — ${tgErr}`)
+        } else {
+          setSuccessMessage("Setup saved. Tracking active.")
+        }
+      }
     } catch (err) {
       setSuccessMessage(err instanceof Error ? err.message : "Failed to save manual setup.")
     }
@@ -320,13 +340,15 @@ export default function ManualSetups() {
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -10 }}
           >
-            <Card glow className="border-buy/30">
+            <Card glow className={successMessage.toLowerCase().includes("failed") ? "border-sell/30" : "border-buy/30"}>
               <CardContent className="flex items-start gap-3 py-4">
-                <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-buy/25 bg-buy/10">
-                  <CheckCircle2 className="h-4 w-4 text-buy" />
+                <div className={`flex h-9 w-9 items-center justify-center rounded-lg border ${successMessage.toLowerCase().includes("failed") ? "border-sell/25 bg-sell/10" : "border-buy/25 bg-buy/10"}`}>
+                  <CheckCircle2 className={`h-4 w-4 ${successMessage.toLowerCase().includes("failed") ? "text-sell" : "text-buy"}`} />
                 </div>
-                <div className="space-y-1">
-                  <p className="text-sm font-semibold text-foreground">Setup saved successfully</p>
+                <div className="flex-1 space-y-1">
+                  <p className="text-sm font-semibold text-foreground">
+                    {successMessage.toLowerCase().includes("failed") ? "Telegram alert failed" : "Setup saved successfully"}
+                  </p>
                   <p className="text-xs text-muted-foreground">{successMessage}</p>
                 </div>
               </CardContent>

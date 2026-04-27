@@ -55,7 +55,18 @@ export function SpencerStatus({ status }: { status?: BotStatusResponse }) {
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
             <StatusPill icon={Bot} label="Status" value={STATUS_LABELS[status?.status ?? "offline"] ?? status?.status ?? "Offline"} tone={tone} />
             <StatusPill icon={Cpu} label="Mode" value={status?.strategy_mode ?? "hybrid"} tone="purple" />
-            <StatusPill icon={RadioTower} label="Session" value={status?.session ?? "london"} tone="gold" />
+            <StatusPill
+              icon={RadioTower}
+              label="Market Session"
+              value={
+                (() => {
+                  const s = status?.session ?? status?.data?.currentSession ?? "—"
+                  if (s === "off_session" || s === "quiet_session") return "Quiet Session"
+                  return s.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())
+                })()
+              }
+              tone="gold"
+            />
             <div className="rounded-xl border border-ap-border bg-ap-surface/45 px-3 py-3">
               <div className="label-xs">Backend</div>
               <div className="mt-2 flex items-center gap-2 text-sm font-semibold text-foreground">
@@ -65,15 +76,15 @@ export function SpencerStatus({ status }: { status?: BotStatusResponse }) {
             </div>
             <StatusPill
               icon={RadioTower}
-              label="Bot Window"
-              value={status?.data?.botWindowActive ? `Active until ${status?.data?.activeUntil ?? "19:00"}` : "Closed"}
-              tone={status?.data?.botWindowActive ? "buy" : "purple"}
+              label="Operating Mode"
+              value={status?.data?.operatingMode === "24_7" ? "24/7 Active" : (status?.data?.activeUntil ?? "24/7")}
+              tone="buy"
             />
             <StatusPill
               icon={Cpu}
-              label="Session Block"
-              value={status?.data?.sessionBlocking ? "Yes" : "No"}
-              tone={status?.data?.sessionBlocking ? "sell" : "buy"}
+              label="Scan Active"
+              value="Yes — 24/7"
+              tone="buy"
             />
           </div>
         </div>
@@ -83,6 +94,7 @@ export function SpencerStatus({ status }: { status?: BotStatusResponse }) {
             {STATUS_LABELS[status?.status ?? "offline"] ?? "Spencer Offline"}
           </Badge>
           <Badge variant="gold" className="text-[10px]">Powered by AlphaPulse</Badge>
+          <Badge variant="buy" className="text-[10px]">24/7 Scanning Active</Badge>
           {status?.data?.liveEnabledStrategies?.map((strategy) => (
             <Badge key={`live-${strategy}`} variant="buy" className="text-[10px]">
               Live: {strategy.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())}
@@ -108,9 +120,9 @@ export function SpencerStatus({ status }: { status?: BotStatusResponse }) {
           {status?.data?.lastScanNumber != null && (
             <Badge variant="outline" className="text-[10px]">Scan #{status.data.lastScanNumber}</Badge>
           )}
-          {status?.data?.botWindowActive && status?.data?.sessionBlocking && (
+          {status?.data?.sessionBlocking && (
             <Badge variant="sell" className="text-[10px]">
-              Configuration error: session label is blocking active bot window.
+              Session blocking active — check config
             </Badge>
           )}
         </div>

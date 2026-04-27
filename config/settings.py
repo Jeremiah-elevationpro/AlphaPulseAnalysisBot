@@ -378,14 +378,18 @@ SESSION_ASIA_UTC      = (0, 7)
 SESSION_LONDON_UTC    = (7, 10)
 SESSION_NEW_YORK_UTC  = (13, 16)
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Africa/Johannesburg")
-BOT_ACTIVE_START_HOUR = int(os.getenv("BOT_ACTIVE_START_HOUR", "7"))
-BOT_ACTIVE_END_HOUR = int(os.getenv("BOT_ACTIVE_END_HOUR", "19"))
+BOT_ACTIVE_START_HOUR = int(os.getenv("BOT_ACTIVE_START_HOUR", "0"))
+BOT_ACTIVE_END_HOUR = int(os.getenv("BOT_ACTIVE_END_HOUR", "24"))
+# 24/7 mode — off_session is a descriptive label, not a rejection reason
+OPERATING_MODE = os.getenv("OPERATING_MODE", "24_7")
 ALLOWED_SESSIONS = [
     item.strip().lower()
-    for item in os.getenv("ALLOWED_SESSIONS", "asia,london,new_york,overlap").split(",")
+    for item in os.getenv(
+        "ALLOWED_SESSIONS", "asia,london,new_york,overlap,off_session,quiet_session"
+    ).split(",")
     if item.strip()
 ]
-BLOCK_OFF_SESSION = os.getenv("BLOCK_OFF_SESSION", "true").lower() == "true"
+BLOCK_OFF_SESSION = os.getenv("BLOCK_OFF_SESSION", "false").lower() == "true"
 SESSION_CONFIDENCE_BONUS = {
     "overlap": 0.10,
     "asia": 0.00,
@@ -398,7 +402,8 @@ SESSION_PROFILE = {
     "london": "balanced",
     "new_york": "aggressive",
     "overlap": "priority",
-    "off_session": "blocked",
+    "off_session": "quiet",
+    "quiet_session": "quiet",
 }
 SESSION_FINAL_SCORE_ADJUSTMENT = {
     "asia": 8,
@@ -742,3 +747,30 @@ DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", 8501))
 # found over the configured interval (useful to confirm the bot is alive).
 SEND_NO_SETUP_STATUS_ALERT = os.getenv("SEND_NO_SETUP_STATUS_ALERT", "false").lower() == "true"
 NO_SETUP_STATUS_INTERVAL_MINUTES = int(os.getenv("NO_SETUP_STATUS_INTERVAL_MINUTES", "30"))
+
+# ─────────────────────────────────────────────
+# LIVE / RESEARCH STRATEGY GATES
+# ─────────────────────────────────────────────
+LIVE_ENABLED_STRATEGIES = [
+    part.strip()
+    for part in os.getenv("LIVE_ENABLED_STRATEGIES", "gap_sweep").split(",")
+    if part.strip()
+]
+RESEARCH_ONLY_STRATEGIES: List[str] = [
+    part.strip()
+    for part in os.getenv(
+        "RESEARCH_ONLY_STRATEGIES",
+        "engulfing_rejection,standard_break_retest,failed_engulf_break_retest,failed_gap_break_retest",
+    ).split(",")
+    if part.strip()
+]
+
+# ─────────────────────────────────────────────
+# MANUAL SETUP TRACKING
+# ─────────────────────────────────────────────
+MANUAL_SETUP_APPROACH_DISTANCE_PIPS = float(
+    os.getenv("MANUAL_SETUP_APPROACH_DISTANCE_PIPS", "10")
+)
+MANUAL_SETUP_ALERT_COOLDOWN_MINUTES = int(
+    os.getenv("MANUAL_SETUP_ALERT_COOLDOWN_MINUTES", "30")
+)

@@ -108,8 +108,10 @@ def _sync_process_state() -> None:
             state.bot_state["dominant_bias"]         = hb.get("dominant_bias")
             state.bot_state["bias_strength"]         = hb.get("bias_strength")
             state.bot_state["last_market_update_at"] = hb.get("last_market_update_at")
-            state.bot_state["live_enabled_strategies"] = hb.get("live_enabled_strategies", state.bot_state.get("live_enabled_strategies"))
-            state.bot_state["process_id"]            = hb.get("process_id", state.bot_state.get("process_id"))
+            state.bot_state["live_enabled_strategies"]     = hb.get("live_enabled_strategies", state.bot_state.get("live_enabled_strategies"))
+            state.bot_state["research_only_strategies"]    = hb.get("research_only_strategies", state.bot_state.get("research_only_strategies"))
+            state.bot_state["operating_mode"]              = hb.get("operating_mode", "24_7")
+            state.bot_state["process_id"]                  = hb.get("process_id", state.bot_state.get("process_id"))
             if hb.get("last_error"):
                 state.bot_state["last_error"] = hb["last_error"]
         else:
@@ -183,9 +185,11 @@ def _payload(message: str) -> dict:
             "lastTelegramStatus":  s["last_telegram_status"],
             "lastTelegramError":   s["last_telegram_error"],
             "lastScanNumber":      s["last_scan_number"],
-            "sessionBlocking":     s["session_blocking"],
-            "instanceId":          s["instance_id"],
-            "liveEnabledStrategies": s.get("live_enabled_strategies"),
+            "sessionBlocking":        s["session_blocking"],
+            "instanceId":             s["instance_id"],
+            "liveEnabledStrategies":  s.get("live_enabled_strategies"),
+            "researchOnlyStrategies": s.get("research_only_strategies"),
+            "operatingMode":          s.get("operating_mode", "24_7"),
         },
     }
 

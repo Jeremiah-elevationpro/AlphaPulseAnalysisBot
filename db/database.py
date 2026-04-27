@@ -372,10 +372,39 @@ class Database:
                 enable_telegram_alerts          BOOLEAN DEFAULT TRUE,
                 high_priority                   BOOLEAN DEFAULT FALSE,
                 status                          VARCHAR(30) NOT NULL DEFAULT 'draft',
+                source                          VARCHAR(30) DEFAULT 'manual',
+                strategy_type                   VARCHAR(50) DEFAULT 'manual_setup',
+                setup_type                      VARCHAR(50) DEFAULT 'manual_setup',
+                tracking_enabled                BOOLEAN DEFAULT TRUE,
+                tracking_status                 VARCHAR(50) DEFAULT 'watching',
+                confirmation_required           BOOLEAN DEFAULT TRUE,
+                telegram_alert_sent             BOOLEAN DEFAULT FALSE,
+                telegram_alert_sent_at          TIMESTAMPTZ,
+                telegram_error                  TEXT,
+                approach_alert_sent_at          TIMESTAMPTZ,
                 created_at                      TIMESTAMPTZ DEFAULT NOW(),
                 updated_at                      TIMESTAMPTZ DEFAULT NOW()
             );
         """)
+        # Idempotent additions for existing deployments
+        for _col, _ddl in [
+            ("source",                 "VARCHAR(30) DEFAULT 'manual'"),
+            ("strategy_type",          "VARCHAR(50) DEFAULT 'manual_setup'"),
+            ("setup_type",             "VARCHAR(50) DEFAULT 'manual_setup'"),
+            ("tracking_enabled",       "BOOLEAN DEFAULT TRUE"),
+            ("tracking_status",        "VARCHAR(50) DEFAULT 'watching'"),
+            ("confirmation_required",  "BOOLEAN DEFAULT TRUE"),
+            ("telegram_alert_sent",    "BOOLEAN DEFAULT FALSE"),
+            ("telegram_alert_sent_at", "TIMESTAMPTZ"),
+            ("telegram_error",         "TEXT"),
+            ("approach_alert_sent_at", "TIMESTAMPTZ"),
+        ]:
+            try:
+                self._pg.execute(
+                    f"ALTER TABLE manual_setups ADD COLUMN IF NOT EXISTS {_col} {_ddl}"
+                )
+            except Exception:
+                pass
 
         logger.info("Schema verified/created.")
 
@@ -1444,6 +1473,50 @@ class Database:
                     "updated_at": str(row[19]) if row[19] else None,
                 }
                 for row in rows
+            ]
+        return []
+
+    def get_watching_manual_setups(self) -> List[Dict[str, Any]]:
+        """Return manual setups that are actively being tracked (watching / approaching_entry)."""
+        watching_statuses = ("watching", "approaching_entry", "pending-order-ready")
+        if self._sb:
+            rows = self._sb._get(
+                "manual_setups",
+                {"tracking_enabled": "eq.true", "status": f"in.({','.join(watching_statuses)})"},
+                limit=100,
+            )
+            return rows or []
+        if self._pg:
+            placeholders = ",".join(["%s"] * len(watching_statuses))
+            rows = self._pg.fetchall(
+                f"""
+                SELECT id, symbol, direction, entry_price, stop_loss, tp1, tp2, tp3,
+                       session, notes, enable_telegram_alerts, status, tracking_status,
+                       approach_alert_sent_at, confirmation_required
+                FROM manual_setups
+                WHERE tracking_enabled = TRUE
+                  AND status IN ({placeholders})
+                ORDER BY created_at DESC
+                """,
+                watching_statuses,
+            )
+            if not rows:
+                return []
+            return [
+                {
+                    "id": r[0], "symbol": r[1], "direction": r[2],
+                    "entry_price": float(r[3]) if r[3] is not None else None,
+                    "stop_loss": float(r[4]) if r[4] is not None else None,
+                    "tp1": float(r[5]) if r[5] is not None else None,
+                    "tp2": float(r[6]) if r[6] is not None else None,
+                    "tp3": float(r[7]) if r[7] is not None else None,
+                    "session": r[8], "notes": r[9],
+                    "enable_telegram_alerts": bool(r[10]),
+                    "status": r[11], "tracking_status": r[12],
+                    "approach_alert_sent_at": str(r[13]) if r[13] else None,
+                    "confirmation_required": bool(r[14]),
+                }
+                for r in rows
             ]
         return []
 

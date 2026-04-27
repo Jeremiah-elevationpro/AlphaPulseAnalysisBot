@@ -211,6 +211,7 @@ export interface BotStatusResponse {
     lastMarketUpdateAt?: string | null
     liveEnabledStrategies?: string[] | null
     researchOnlyStrategies?: string[] | null
+    operatingMode?: string | null
   } | null
 }
 
