@@ -23,6 +23,7 @@ from db.models import TradeStatus
 from signals.signal_generator import SignalGenerator
 from strategies.filters import SessionFilter
 from strategies.strategy_manager import StrategyManager, StrategySignal
+from historical_replay.engulfing_replay_adapter import EngulfingReplayAdapter
 from historical_replay.models import PendingReplayTrade, ReplayCounters
 from historical_replay.storage import ReplayStorage
 from utils.logger import get_logger
@@ -66,6 +67,7 @@ class HistoricalReplayEngine:
         )
         self.signal_generator = signal_generator or SignalGenerator(learning_engine=None)
         self.session_filter = SessionFilter()
+        self._engulfing_adapter = EngulfingReplayAdapter()
         self.storage = ReplayStorage(self.db)
         self._enabled_replay_strategies = list(getattr(self.strategy_manager, "enabled_strategies", ["gap_sweep"]))
         if DISABLED_TIMEFRAME_PAIRS:
@@ -237,11 +239,43 @@ class HistoricalReplayEngine:
                         "unsupported timeframe",
                     )
                     continue
+
+                # ── Gap-specific replay filters ───────────────────────────────
+                if signal.strategy_name == "gap_sweep":
+                    # Hard block: no counter-bias Gap trades in replay
+                    bias_gate = getattr(signal.setup, "bias_gate_result", "") or ""
+                    if "passed_counter_" in bias_gate:
+                        logger.info(
+                            "GAP REJECTED: counter-bias trade blocked | %s bias_gate=%s",
+                            getattr(signal.setup, "direction", "?"), bias_gate,
+                        )
+                        continue
+
+                    # Hard block: PD location safety
+                    pd_loc = getattr(signal.setup, "pd_location", "") or "unknown"
+                    sig_dir = (getattr(signal.setup, "direction", "") or "").upper()
+                    bias_strength = getattr(signal.setup, "bias_strength", "") or "weak"
+                    if sig_dir == "SELL" and pd_loc == "discount":
+                        logger.info(
+                            "GAP PD SAFETY REJECT: SELL in discount | unfavorable PD zone"
+                        )
+                        continue
+                    if sig_dir == "BUY" and pd_loc == "premium" and bias_strength != "strong":
+                        logger.info(
+                            "GAP PD SAFETY REJECT: BUY in premium without strong bias | strength=%s",
+                            bias_strength,
+                        )
+                        continue
+
                 key = signal.fingerprint()
                 if key in seen_pending or key in pending or key in activated_or_closed:
                     continue
 
-                trade, rejection = self.signal_generator.generate(signal.setup)
+                # ── Generate trade (strategy-specific path) ───────────────────
+                if signal.strategy_name == "engulfing_rejection":
+                    trade, rejection = self._engulfing_adapter.generate(signal.setup)
+                else:
+                    trade, rejection = self.signal_generator.generate(signal.setup)
                 if trade is None:
                     logger.debug("Replay signal rejected: %s", rejection)
                     continue

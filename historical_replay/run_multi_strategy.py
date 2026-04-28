@@ -74,7 +74,16 @@ def main() -> None:
     if not strategies:
         parser.error("--strategies must not be empty")
 
-    from historical_replay.multi_strategy_engine import MultiStrategyReplayEngine
+    print(f"\nMULTI REPLAY STRATEGIES FROM CLI: {', '.join(strategies)}")
+
+    from historical_replay.multi_strategy_engine import MultiStrategyReplayEngine, SUPPORTED_STRATEGIES
+
+    unknown = set(strategies) - SUPPORTED_STRATEGIES
+    if unknown:
+        parser.error(
+            f"REQUESTED STRATEGY NOT AVAILABLE: {sorted(unknown)} — "
+            f"supported: {sorted(SUPPORTED_STRATEGIES)}"
+        )
 
     engine = MultiStrategyReplayEngine(strategies=strategies)
 
@@ -111,6 +120,7 @@ def _print_summary(result: dict) -> None:
     scan_balance = result.get("strategy_scan_balance", {})
     confluence = result.get("confluence_summary", {})
     learning   = result.get("learning_summary", {})
+    validation = result.get("validation", {})
 
     print()
     print("=" * 52)
@@ -155,6 +165,20 @@ def _print_summary(result: dict) -> None:
     print()
     print("  LEARNING PROFILES")
     print(f"  Profiles upserted: {learning.get('profiles_upserted', 0)}")
+    if learning.get("learning_blocked_reason"):
+        print(f"  Blocked reason   : {learning['learning_blocked_reason']}")
+    if learning.get("skipped"):
+        print(f"  Skipped          : {learning['skipped']}")
+    print()
+    print("  VALIDATION REPORT")
+    req  = validation.get("requested_strategies", strategies)
+    rep  = validation.get("reported_strategies", [])
+    match = validation.get("strategies_match", False)
+    lrn  = validation.get("learning_allowed", False)
+    print(f"  Requested strategies : {', '.join(req) if req else '(none)'}")
+    print(f"  Reported strategies  : {', '.join(rep) if rep else '(none)'}")
+    print(f"  Strategies match     : {'YES' if match else 'NO — learning blocked'}")
+    print(f"  Learning allowed     : {'YES' if lrn else 'NO'}")
     print()
     print("  To evaluate results:")
     print(f"    python -m historical_replay.evaluate_multi_strategy --run-id {run_id} --show-trades 20")

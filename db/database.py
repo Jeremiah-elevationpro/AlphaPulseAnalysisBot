@@ -639,6 +639,8 @@ class Database:
         "pd_location", "pd_filter_score", "bias_gate_result",
         # quality refinement tags
         "high_quality_trade", "micro_strength",
+        # migrate_historical_replay_trades_confluence_with.sql
+        "confluence_with",
     })
 
     _OPTIONAL_STATS_COLUMNS: frozenset = frozenset({
@@ -830,27 +832,12 @@ class Database:
     })
 
     def insert_replay_trade(self, payload: Dict[str, Any]) -> Optional[int]:
-        if not self._sb:
-            raise RuntimeError("Historical replay persistence requires USE_SUPABASE=true")
-        try:
-            row = self._sb._post("historical_replay_trades", payload)
-        except Exception as exc:
-            if not self._is_400(exc):
-                raise
-            # At least one optional column is missing from the table.
-            # Strip ALL migration-optional fields and retry once. This handles
-            # any combination of missing migrations (pip, micro, or both).
-            fallback = {k: v for k, v in payload.items() if k not in self._OPTIONAL_TRADE_COLUMNS}
-            stripped = sorted(set(payload) & self._OPTIONAL_TRADE_COLUMNS)
-            logger.warning(
-                "Replay trade insert 400 — retrying without optional columns %s. "
-                "Run migrate_replay_pip_metrics.sql, migrate_replay_micro_confirmation.sql, "
-                "and migrate_replay_execution_filters.sql "
-                "in Supabase to capture full trade data.",
-                stripped,
-            )
-            row = self._sb._post("historical_replay_trades", fallback)
-        return row.get("id") if row else None
+        return self._post_with_missing_column_fallback(
+            "historical_replay_trades",
+            payload,
+            self._OPTIONAL_TRADE_COLUMNS,
+            "REPLAY TRADE",
+        )
 
     def insert_replay_stats(self, payload: Dict[str, Any]) -> Optional[int]:
         return self._post_with_missing_column_fallback(

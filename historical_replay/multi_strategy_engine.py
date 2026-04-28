@@ -179,6 +179,10 @@ class MultiStrategyReplayEngine:
         )
         combined["confluence_summary"] = confluence_summary
 
+        # Validation report — requested vs reported strategies
+        validation = self._validate_replay_result(result, all_multi_trades)
+        combined["validation"] = validation
+
         # ── Step 5: upsert learning profiles (optional — never crashes run) ───
         try:
             learning_summary = self._update_learning_profiles(
@@ -502,6 +506,26 @@ class MultiStrategyReplayEngine:
     # Learning profiles
     # ─────────────────────────────────────────────────────────────────────────
 
+    def _validate_replay_result(
+        self,
+        replay_result: dict,
+        all_trades: List[dict],
+    ) -> dict:
+        """Cross-check requested strategies vs what the replay actually ran and reported."""
+        strategy_balance = replay_result.get("strategy_scan_balance", {})
+        reported = sorted(k for k, v in strategy_balance.items() if isinstance(v, dict) and int((v or {}).get("scans_run", 0) or 0) > 0)
+        requested = sorted(self.strategies)
+        strategies_match = reported == requested
+        trade_counts = {s: sum(1 for t in all_trades if t.get("strategy_type") == s) for s in requested}
+        learning_allowed = strategies_match and any(v > 0 for v in trade_counts.values())
+        return {
+            "requested_strategies": requested,
+            "reported_strategies": reported,
+            "strategies_match": strategies_match,
+            "learning_allowed": learning_allowed,
+            "trade_counts_by_strategy": trade_counts,
+        }
+
     def _update_learning_profiles(
         self,
         *,
@@ -514,6 +538,27 @@ class MultiStrategyReplayEngine:
         updated_profiles = 0
         skipped: List[str] = []
         strategy_balance = replay_result.get("strategy_scan_balance", {})
+
+        # Validate requested vs reported strategies — block learning on mismatch
+        validation = self._validate_replay_result(replay_result, trades)
+        if not validation["strategies_match"]:
+            reason = (
+                f"strategies_mismatch: requested={validation['requested_strategies']} "
+                f"reported={validation['reported_strategies']}"
+            )
+            logger.warning(
+                "LEARNING PROFILES BLOCKED: %s | multi_run_id=%d",
+                reason, multi_run_id,
+            )
+            for strategy_name in self.strategies:
+                skipped.append(f"{strategy_name}:{reason}")
+            return {
+                "profiles_upserted": 0,
+                "skipped": skipped,
+                "multi_run_id": multi_run_id,
+                "learning_blocked_reason": reason,
+                **validation,
+            }
 
         for strategy_name in self.strategies:
             balance   = strategy_balance.get(strategy_name, {})
