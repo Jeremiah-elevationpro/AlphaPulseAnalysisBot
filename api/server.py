@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 import api.state as state
-from api.routes import health, trades, signals, analytics, market, setups, alerts, bot, replay, logs
+from api.routes import health, trades, signals, analytics, market, setups, alerts, bot, replay, logs, learning
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -67,3 +67,4 @@ app.include_router(alerts.router,    prefix="/api", tags=["Alerts"])
 app.include_router(bot.router,       prefix="/api", tags=["Bot"])
 app.include_router(replay.router,    prefix="/api", tags=["Replay"])
 app.include_router(logs.router,      prefix="/api", tags=["Logs"])
+app.include_router(learning.router,  prefix="/api", tags=["Learning"])

@@ -16,10 +16,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export interface HealthResponse {
-  status: "ok" | "degraded"
+  status: "ok" | "online" | "degraded"
   db_connected: boolean
   active_trades: number
-  uptime: number
+  uptime: string
+  uptime_seconds: number
   version: string
   timestamp: string
 }
@@ -136,6 +137,7 @@ export interface AnalyticsMetrics {
 export interface AnalyticsResponse {
   db_ready: boolean
   metrics: AnalyticsMetrics
+  sources?: Array<{ key: string; label: string; tone?: string }>
   charts: {
     cumulative_pips: Array<{ label: string; pips: number }>
     session_performance: Array<{ name: string; trades: number; win_rate: number; net_pips: number; tp1_rate: number }>
@@ -211,8 +213,137 @@ export interface BotStatusResponse {
     lastMarketUpdateAt?: string | null
     liveEnabledStrategies?: string[] | null
     researchOnlyStrategies?: string[] | null
+    strategyScans?: Record<
+      string,
+      {
+        enabled?: boolean
+        mode?: string
+        scans_run?: number
+        candidates_found?: number
+        watchlist_alerts_sent?: number
+        entry_alerts_sent?: number
+        alerts_sent?: number
+        alerts_failed?: number
+        duplicates_blocked?: number
+        last_result?: string
+        last_reject_reason?: string
+        last_scan_time?: string
+      }
+    >
     operatingMode?: string | null
+    marketSession?: string | null
+    scanAllowed?: boolean | null
+    lastAlertsFailed?: number | null
+    lastTelegramAlertType?: string | null
+    lastTelegramAlertTime?: string | null
+    levelsDetected?: number | null
+    gapLevels?: number | null
+    biasPassed?: number | null
+    sweepConfirmed?: number | null
+    sessionPassed?: number | null
+    distancePassed?: number | null
+    watchlistCandidates?: number | null
+    alertsSentThisScan?: number | null
+    alertsFailedThisScan?: number | null
+    dedupeRejections?: number | null
+    totalScans?: number | null
+    totalCandidatesFound?: number | null
+    totalWatchlistCandidates?: number | null
+    totalAlertsSent?: number | null
+    totalAlertsFailed?: number | null
+    totalDuplicatesBlocked?: number | null
+    totalManualAlertsSent?: number | null
+    totalConfirmationAlertsSent?: number | null
+    marketPlan?: {
+      current_price?: number | null
+      h4_context?: string
+      h1_context?: string
+      m15_context?: string
+      dominant_bias?: string
+      bias_strength?: string
+      targets_source?: string
+      primary_scenario?: {
+        direction?: string
+        reason?: string
+        watch_zone?: string
+        invalidation?: string
+        targets?: number[]
+        market_plan_targets?: number[]
+        trigger_conditions?: string[]
+        scenario_status?: string
+        played_out_note?: string
+      }
+      secondary_scenario?: {
+        direction?: string
+        reason?: string
+        watch_zone?: string
+        invalidation?: string
+        targets?: number[]
+        market_plan_targets?: number[]
+        trigger_conditions?: string[]
+        scenario_status?: string
+        played_out_note?: string
+      }
+      actionable_psych_levels?: number[]
+      key_supports?: number[]
+      key_resistances?: number[]
+      psychological_levels?: number[]
+      active_watch_zones?: Array<{
+        zone_id: string
+        direction: string
+        level_low: number
+        level_high: number
+        scenario_type: string
+        status: string
+        distance_from_current_pips?: number
+        played_out_note?: string
+      }>
+      confirmation_waiting_for?: string[]
+      last_updated?: string
+    } | null
+    fiveLayerStatus?: {
+      market_analyst?: Record<string, unknown>
+      confirmation_engine?: Record<string, unknown>
+      learning_score?: Record<string, unknown>
+      decision_engine?: Record<string, unknown>
+      risk_management?: Record<string, unknown>
+    } | null
+    activeInstanceId?: string | null
+    botProcessAlive?: boolean | null
+    backgroundTasksActive?: number | null
+    runtimeAlertsEnabled?: boolean | null
+    lastShutdownTime?: string | null
+    alertDedupe?: Record<string, unknown> | null
   } | null
+}
+
+export interface DataHealthResponse {
+  heartbeat_ok: boolean
+  telegram_ok: boolean
+  active_instance_id: string | number | null
+  last_scan_age_seconds: number | null
+  last_alert_sent_at: string | null
+  manual_tracking_count: number
+  analytics_unknown_session_count: number
+  analytics_unknown_micro_count: number
+  warnings: string[]
+}
+
+export interface LearningProfileSummary {
+  strategy_type: string
+  sample_size: number
+  wins: number
+  losses: number
+  win_rate: number
+  net_pips: number
+  best_session?: string | null
+  best_timeframe?: string | null
+  status: string
+}
+
+export interface LearningProfilesResponse {
+  profiles: LearningProfileSummary[]
+  db_ready: boolean
 }
 
 export interface ReplayRunPayload {
@@ -326,6 +457,9 @@ export interface MarketContextResponse {
 
 export interface SetupRow {
   id: number
+  source?: string | null
+  strategy_type?: string | null
+  setup_type?: string | null
   symbol: string
   direction: "BUY" | "SELL"
   timeframe_pair: string
@@ -343,6 +477,22 @@ export interface SetupRow {
   enable_telegram_alerts: boolean
   high_priority: boolean
   status: string
+  tracking_enabled?: boolean
+  tracking_status?: string | null
+  confirmation_required?: boolean
+  telegram_alert_sent?: boolean
+  telegram_alert_sent_at?: string | null
+  telegram_error?: string | null
+  last_alert_type?: string | null
+  last_alert_time?: string | null
+  current_price?: number | null
+  distance_to_entry_pips?: number | null
+  closed_at?: string | null
+  completed_at?: string | null
+  cancelled_at?: string | null
+  failed_at?: string | null
+  archived_at?: string | null
+  completion_note?: string | null
   created_at: string
   updated_at: string
 }
@@ -373,19 +523,26 @@ export interface SetupPayload {
   status?: string
 }
 
+export interface SetupStatusPayload {
+  status: "completed" | "cancelled" | "failed" | "expired" | "invalidated" | "archived"
+  note?: string
+}
+
 export const api = {
   health: () => request<HealthResponse>("/api/health"),
+  dataHealth: () => request<DataHealthResponse>("/api/system/data-health"),
   market: () => request<MarketResponse>("/api/market"),
   marketContext: (symbol = "XAUUSD") => request<MarketContextResponse>(`/api/market/context?symbol=${encodeURIComponent(symbol)}`),
   trades: (status: "all" | "active" | "closed" = "all", limit = 50) =>
     request<TradesResponse>(`/api/trades?status=${status}&limit=${limit}`),
   signals: (limit = 50) => request<SignalsResponse>(`/api/signals?limit=${limit}`),
   alerts: (limit = 50) => request<AlertsResponse>(`/api/alerts?limit=${limit}`),
-  analytics: (filters?: { session?: string; confirmation_type?: string; symbol?: string }) => {
+  analytics: (filters?: { session?: string; confirmation_type?: string; symbol?: string; source?: string }) => {
     const params = new URLSearchParams()
     if (filters?.session) params.set("session", filters.session)
     if (filters?.confirmation_type) params.set("confirmation_type", filters.confirmation_type)
     if (filters?.symbol) params.set("symbol", filters.symbol)
+    if (filters?.source) params.set("source", filters.source)
     const qs = params.toString()
     return request<AnalyticsResponse>(`/api/analytics${qs ? `?${qs}` : ""}`)
   },
@@ -408,12 +565,24 @@ export const api = {
     replay: (limit = 100) => request<ReplayLogsResponse>(`/api/logs/replay?limit=${limit}`),
     telegram: (limit = 100) => request<TelegramLogsResponse>(`/api/logs/telegram?limit=${limit}`),
   },
+  learning: {
+    profiles: () => request<LearningProfilesResponse>("/api/learning/profiles"),
+  },
   setups: {
-    list: () => request<SetupsResponse>("/api/setups"),
+    list: () => request<SetupsResponse>("/api/manual-setups"),
+    active: () => request<SetupsResponse>("/api/manual-setups/active"),
+    history: () => request<SetupsResponse>("/api/manual-setups/history"),
     create: (body: SetupPayload) =>
-      request<SetupRow>("/api/setups", { method: "POST", body: JSON.stringify(body) }),
+      request<SetupRow>("/api/manual-setups", { method: "POST", body: JSON.stringify(body) }),
     update: (id: number, body: Partial<SetupPayload> & { status?: string }) =>
-      request<SetupRow>(`/api/setups/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+      request<SetupRow>(`/api/manual-setups/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+    updateStatus: (id: number, body: SetupStatusPayload) =>
+      request<{ success: boolean; setup_id: number; status: string; tracking_enabled: boolean; closed_at: string; setup?: SetupRow }>(
+        `/api/manual-setups/${id}/status`,
+        { method: "PATCH", body: JSON.stringify(body) }
+      ),
+    resendAlert: (id: number) =>
+      request<{ success: boolean; setup: SetupRow }>(`/api/manual-setups/${id}/resend-alert`, { method: "POST" }),
     delete: (id: number) => request<{ ok: boolean }>(`/api/setups/${id}`, { method: "DELETE" }),
   },
 }

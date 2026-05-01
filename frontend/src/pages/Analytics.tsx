@@ -26,8 +26,9 @@ export default function Analytics() {
   const [session, setSession] = useState("all")
   const [confirmation, setConfirmation] = useState("all")
   const [symbol, setSymbol] = useState("all")
+  const [source, setSource] = useState("all")
 
-  const query = useAnalytics({ session, confirmation_type: confirmation, symbol })
+  const query = useAnalytics({ session, confirmation_type: confirmation, symbol, source })
   const data = query.data
   const metrics = data?.metrics
   const charts = data?.charts ?? {
@@ -60,11 +61,20 @@ export default function Analytics() {
           <p className="max-w-2xl text-sm text-muted-foreground">Supabase-backed replay and performance data visualized without changing the existing premium dashboard feel.</p>
         </div>
 
-        <div className="grid grid-cols-2 gap-3 md:grid-cols-3">
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
           <FilterPill icon={CalendarRange} label="Session" value={session} onChange={setSession} options={["all", "asia", "london", "new_york"]} />
-          <FilterPill icon={ShieldCheck} label="Confirmation" value={confirmation} onChange={setConfirmation} options={["all", "liquidity_sweep_reclaim", "double_pattern", "unknown"]} />
+          <FilterPill icon={ShieldCheck} label="Confirmation" value={confirmation} onChange={setConfirmation} options={["all", "liquidity_sweep_reclaim", "engulfing_rejection", "manual_setup", "unknown"]} />
           <FilterPill icon={Layers3} label="Symbol" value={symbol} onChange={setSymbol} options={["all", "XAUUSD"]} />
+          <FilterPill icon={Activity} label="Source" value={source} onChange={setSource} options={["all", "live_bot", "replay", "manual_setups", "research", "legacy_mixed_data"]} />
         </div>
+      </div>
+
+      <div className="flex flex-wrap gap-2">
+        {(data?.sources ?? []).map((item) => (
+          <Badge key={item.key} variant={item.tone === "buy" ? "buy" : item.tone === "gold" ? "gold" : item.tone === "warn" ? "sell" : item.tone === "purple" ? "purple" : "outline"} className="text-[10px]">
+            Source: {item.label}
+          </Badge>
+        ))}
       </div>
 
       <div className="grid grid-cols-2 gap-3 xl:grid-cols-5">

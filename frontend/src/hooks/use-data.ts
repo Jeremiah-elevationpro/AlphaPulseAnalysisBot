@@ -4,13 +4,29 @@ import {
   useQueryClient,
 } from "@tanstack/react-query"
 
-import { api, type ReplayRunPayload, type SetupPayload } from "@/lib/api"
+import { api, type ReplayRunPayload, type SetupPayload, type SetupStatusPayload } from "@/lib/api"
 
 export function useHealth() {
   return useQuery({
     queryKey: ["health"],
     queryFn: api.health,
     refetchInterval: 15000,
+  })
+}
+
+export function useDataHealth() {
+  return useQuery({
+    queryKey: ["data-health"],
+    queryFn: api.dataHealth,
+    refetchInterval: 15000,
+  })
+}
+
+export function useLearningProfiles() {
+  return useQuery({
+    queryKey: ["learning-profiles"],
+    queryFn: api.learning.profiles,
+    refetchInterval: 60000,
   })
 }
 
@@ -58,9 +74,9 @@ export function useAlerts(limit = 50) {
   })
 }
 
-export function useAnalytics(filters?: { session?: string; confirmation_type?: string; symbol?: string }) {
+export function useAnalytics(filters?: { session?: string; confirmation_type?: string; symbol?: string; source?: string }) {
   return useQuery({
-    queryKey: ["analytics", filters?.session ?? "all", filters?.confirmation_type ?? "all", filters?.symbol ?? "all"],
+    queryKey: ["analytics", filters?.session ?? "all", filters?.confirmation_type ?? "all", filters?.symbol ?? "all", filters?.source ?? "all"],
     queryFn: () => api.analytics(filters),
     refetchInterval: 60000,
   })
@@ -190,12 +206,30 @@ export function useSetups() {
   })
 }
 
+export function useActiveSetups() {
+  return useQuery({
+    queryKey: ["manual-setups", "active"],
+    queryFn: api.setups.active,
+    refetchInterval: 15000,
+  })
+}
+
+export function useSetupHistory() {
+  return useQuery({
+    queryKey: ["manual-setups", "history"],
+    queryFn: api.setups.history,
+    refetchInterval: 30000,
+  })
+}
+
 export function useCreateSetup() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (payload: SetupPayload) => api.setups.create(payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["manual-setups"] })
+      queryClient.invalidateQueries({ queryKey: ["manual-setups", "active"] })
+      queryClient.invalidateQueries({ queryKey: ["manual-setups", "history"] })
       queryClient.invalidateQueries({ queryKey: ["alerts"] })
     },
   })
@@ -208,6 +242,34 @@ export function useUpdateSetup() {
       api.setups.update(id, payload),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["manual-setups"] })
+      queryClient.invalidateQueries({ queryKey: ["manual-setups", "active"] })
+      queryClient.invalidateQueries({ queryKey: ["manual-setups", "history"] })
+      queryClient.invalidateQueries({ queryKey: ["alerts"] })
+    },
+  })
+}
+
+export function useUpdateSetupStatus() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, payload }: { id: number; payload: SetupStatusPayload }) => api.setups.updateStatus(id, payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["manual-setups"] })
+      queryClient.invalidateQueries({ queryKey: ["manual-setups", "active"] })
+      queryClient.invalidateQueries({ queryKey: ["manual-setups", "history"] })
+      queryClient.invalidateQueries({ queryKey: ["alerts"] })
+    },
+  })
+}
+
+export function useResendSetupAlert() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => api.setups.resendAlert(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["manual-setups"] })
+      queryClient.invalidateQueries({ queryKey: ["manual-setups", "active"] })
+      queryClient.invalidateQueries({ queryKey: ["manual-setups", "history"] })
       queryClient.invalidateQueries({ queryKey: ["alerts"] })
     },
   })
@@ -219,6 +281,8 @@ export function useDeleteSetup() {
     mutationFn: (id: number) => api.setups.delete(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["manual-setups"] })
+      queryClient.invalidateQueries({ queryKey: ["manual-setups", "active"] })
+      queryClient.invalidateQueries({ queryKey: ["manual-setups", "history"] })
       queryClient.invalidateQueries({ queryKey: ["alerts"] })
     },
   })

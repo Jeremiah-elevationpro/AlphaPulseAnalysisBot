@@ -33,7 +33,7 @@ def list_signals(limit: int = Query(30, ge=1, le=200)):
                 "price":       float(entry) if entry else None,
                 "level_price": float(row["level_price"]) if row.get("level_price") else None,
                 "direction":   direction,
-                "strategy_type": row.get("strategy_type") or "gap_sweep",
+                "strategy_type": row.get("strategy_type") or "gap_liquidity_sweep_reclaim",
                 "setup_type": row.get("setup_type"),
                 "quality":     round(float(row.get("confidence", 0.5)) * 100),
                 "displacement": float(row.get("realized_pips", 0) or 0),

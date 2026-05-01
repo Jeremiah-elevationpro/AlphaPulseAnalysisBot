@@ -29,9 +29,24 @@ os.environ.setdefault("ALPHAPULSE_REPLAY_MODE", "1")
 from config.settings import (
     PIP_SIZE, TP_PIPS, MIN_SL_PIPS, MAX_SL_PIPS,
     LEVEL_TOLERANCE_PIPS, SYMBOL,
+    FAILED_ENGULF_BRT_ALLOWED_CONFIRMATIONS,
+    FAILED_ENGULF_BRT_RESEARCH_CONFIRMATIONS,
+    FAILED_ENGULF_RESEARCH_TIMEFRAMES,
+    FAILED_ENGULF_APPROVED_TIMEFRAMES,
+    FAILED_ENGULF_RESEARCH_ALLOW_WEAK_BIAS,
+    FAILED_ENGULF_MIN_BREAK_PIPS,
+    FAILED_ENGULF_RETEST_TOLERANCE_PIPS,
+    STANDARD_BRT_ALLOWED_CONFIRMATIONS,
+    STANDARD_BRT_RESEARCH_CONFIRMATIONS,
 )
 from data.mt5_client import MT5Client
 from db.database import Database
+from historical_replay.failed_engulf_adapter import (
+    FailedEngulfCandidateRecord,
+    _as_utc as _fea_utc,
+    _normalize_timeframe,
+    get_failed_engulf_candidates,
+)
 from strategies.strategy_manager import StrategyManager
 from utils.logger import get_logger
 
@@ -81,7 +96,7 @@ CONFIRMATION_THRESHOLD      = 25   # minimum score to activate
 
 # Timeframes to scan
 SCAN_TIMEFRAMES_STANDARD      = ["H1", "M30", "M15"]
-SCAN_TIMEFRAMES_FAILED_ENGULF = ["H1", "M30"]       # M15 disabled per spec
+SCAN_TIMEFRAMES_FAILED_ENGULF = ["H1", "M30", "M15"]  # overridden per mode in engine
 
 # Allowed bias strengths
 ALLOWED_BIAS_STRENGTHS = {"moderate", "strong"}
@@ -111,7 +126,7 @@ class BreakCandidate:
     # Level identity
     break_level: float
     source_level_type: str        # A | V | Gap
-    source_strategy_type: str     # gap_sweep | engulfing_rejection
+    source_strategy_type: str     # gap_liquidity_sweep_reclaim | engulfing_rejection
     zone_high: float
     zone_low: float
 
@@ -226,14 +241,20 @@ class BreakRetestResearchEngine:
     Never sends Telegram alerts. Stores results to strategy_research_* tables.
     """
 
-    def __init__(self, strategy_type: str = STRATEGY_STANDARD):
+    def __init__(self, strategy_type: str = STRATEGY_STANDARD, mode: str = "research", source_strategy: str = "engulfing_rejection"):
         if strategy_type not in (STRATEGY_STANDARD, STRATEGY_FAILED_ENGULF):
             raise ValueError(f"Unknown strategy_type: {strategy_type!r}")
         self.strategy_type = strategy_type
+        self.mode = mode
+        self.source_strategy = source_strategy
+        self.standard_allowed_confirmations = set(STANDARD_BRT_ALLOWED_CONFIRMATIONS)
+        self.standard_research_confirmations = set(STANDARD_BRT_RESEARCH_CONFIRMATIONS)
+        self.failed_engulf_allowed_confirmations = set(FAILED_ENGULF_BRT_ALLOWED_CONFIRMATIONS)
+        self.failed_engulf_research_confirmations = set(FAILED_ENGULF_BRT_RESEARCH_CONFIRMATIONS)
         self.db = Database()
         self.mt5 = MT5Client()
         self.strategy_manager = StrategyManager(learning_engine=None)
-        logger.info("BreakRetestResearchEngine: strategy=%s", strategy_type)
+        logger.info("BreakRetestResearchEngine: strategy=%s | mode=%s | source_strategy=%s", strategy_type, mode, source_strategy)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Public entry points
@@ -272,21 +293,28 @@ class BreakRetestResearchEngine:
         self.db.init()
         self.mt5.connect()
 
-        run_id = self.db.create_strategy_research_run({
-            "symbol":        symbol,
-            "strategy_type": self.strategy_type,
-            "status":        "running",
-            "replay_start":  replay_start.isoformat(),
-            "replay_end":    end.isoformat(),
-            "started_at":    datetime.now(timezone.utc).isoformat(),
-        })
-        if not run_id:
-            logger.error("Failed to create strategy research run row")
-            return {}
+        run_id: Optional[int] = None
+        try:
+            run_id = self.db.create_strategy_research_run({
+                "source":         "strategy_research",
+                "symbol":         symbol,
+                "strategy_group": self.strategy_type,
+                "strategy_type":  self.strategy_type,
+                "status":         "running",
+                "replay_start":   replay_start.isoformat(),
+                "replay_end":     end.isoformat(),
+                "started_at":     datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception as exc:
+            logger.warning(
+                "Strategy research run row creation failed for %s: %s | continuing without persisted run row",
+                self.strategy_type,
+                exc,
+            )
 
         logger.info(
-            "%s run %d: %s → %s",
-            self.strategy_type, run_id,
+            "%s run %s: %s -> %s",
+            self.strategy_type, run_id if run_id is not None else "local-only",
             replay_start.strftime("%Y-%m-%d"),
             end.strftime("%Y-%m-%d"),
         )
@@ -294,18 +322,27 @@ class BreakRetestResearchEngine:
         try:
             history = self._load_history(start, end, symbol)
             result = self._replay(run_id, history, replay_start, end, symbol)
-            self._store_result(run_id, result)
-            self.db.update_strategy_research_run(run_id, {
-                "status":      "completed",
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-            })
+            if run_id is not None:
+                self._store_result(run_id, result)
+                completed_at = datetime.now(timezone.utc).isoformat()
+                self.db.update_strategy_research_run(run_id, {
+                    "status":         "completed",
+                    "finished_at":    completed_at,
+                    "completed_at":   completed_at,
+                    "summary":        result,
+                    "funnel_summary": result.get("funnel", {}),
+                    "reject_summary": result.get("reject_reasons", {}),
+                })
             return result
         except Exception as exc:
-            logger.error("Run %d failed: %s", run_id, exc, exc_info=True)
-            self.db.update_strategy_research_run(run_id, {
-                "status": "failed",
-                "notes":  str(exc)[:500],
-            })
+            logger.error("Run %s failed: %s", run_id if run_id is not None else "local-only", exc, exc_info=True)
+            if run_id is not None:
+                self.db.update_strategy_research_run(run_id, {
+                    "status":        "failed",
+                    "notes":         str(exc)[:500],
+                    "error_message": str(exc)[:500],
+                    "completed_at":  datetime.now(timezone.utc).isoformat(),
+                })
             return {}
         finally:
             self.mt5.disconnect()
@@ -363,7 +400,11 @@ class BreakRetestResearchEngine:
         symbol: str,
     ) -> dict:
         # Step on M15 (finest grain); fall back to M30/H1
-        step_df = history.get("M15") or history.get("M30") or history.get("H1")
+        step_df = history.get("M15")
+        if step_df is None or len(step_df) == 0:
+            step_df = history.get("M30")
+        if step_df is None or len(step_df) == 0:
+            step_df = history.get("H1")
         if step_df is None or len(step_df) == 0:
             logger.error("No step-timeframe data available")
             return {}
@@ -378,16 +419,21 @@ class BreakRetestResearchEngine:
 
         # ── Funnel counters ───────────────────────────────────────────────────
         counters: Dict[str, int] = {
-            "raw_levels_detected":       0,
-            "break_candidates":          0,
-            "valid_breaks":              0,
-            "fake_breaks_rejected":      0,
-            "retest_candidates":         0,
-            "valid_retests":             0,
-            "confirmation_passed":       0,
-            "activated_trades":          0,
-            "expired_candidates":        0,
-            "failed_engulf_candidates":  0,
+            "raw_levels_detected":           0,
+            "raw_failed_engulf_candidates":  0,
+            "failed_engulf_candidates":      0,
+            "timeframe_supported":           0,
+            "continuation_bias_passed":      0,
+            "weak_bias_soft_passed":         0,
+            "break_candidates":              0,
+            "valid_breaks":                  0,
+            "fake_breaks_rejected":          0,
+            "retest_candidates":             0,
+            "valid_retests":                 0,
+            "close_confirmation_passed":     0,
+            "confirmation_passed":           0,
+            "activated_trades":              0,
+            "expired_candidates":            0,
         }
         reject_reasons: Dict[str, int] = {}
 
@@ -400,6 +446,17 @@ class BreakRetestResearchEngine:
             if self.strategy_type == STRATEGY_STANDARD
             else SCAN_TIMEFRAMES_FAILED_ENGULF
         )
+        seed_candidates: List[BreakCandidate] = []
+        if self.strategy_type == STRATEGY_FAILED_ENGULF:
+            seed_candidates = self._load_failed_engulf_seed_candidates(
+                symbol=symbol,
+                start=replay_start,
+                end=end,
+                scan_tfs=scan_tfs,
+                counters=counters,
+                reject_reasons=reject_reasons,
+            )
+        seed_index = 0
 
         for _, bar_row in step_df.iterrows():
             bar_time  = pd.to_datetime(bar_row["time"], utc=True).to_pydatetime()
@@ -416,21 +473,33 @@ class BreakRetestResearchEngine:
             ctx = self._get_context(snap, bar_close)
 
             # ── Detect new break candidates ───────────────────────────────────
-            new_candidates = self._detect_breaks(
-                snap, bar_row, bar_time, ctx, symbol, seen_break_keys, scan_tfs
-            )
+            if self.strategy_type == STRATEGY_FAILED_ENGULF:
+                new_candidates = []
+                while seed_index < len(seed_candidates) and seed_candidates[seed_index].break_time <= bar_time:
+                    new_candidates.append(seed_candidates[seed_index])
+                    seed_index += 1
+            else:
+                new_candidates = self._detect_breaks(
+                    snap, bar_row, bar_time, ctx, symbol, seen_break_keys, scan_tfs
+                )
             for c in new_candidates:
-                counters["raw_levels_detected"] += 1
-                if c.strategy_type == STRATEGY_FAILED_ENGULF:
-                    counters["failed_engulf_candidates"] += 1
+                if self.strategy_type != STRATEGY_FAILED_ENGULF:
+                    counters["raw_levels_detected"] += 1
 
-                # Bias gates
+                # Timeframe supported (seed loader already filtered; this tracks for standard)
+                counters["timeframe_supported"] = counters.get("timeframe_supported", 0) + 1
+
+                # Bias gates — failed-engulf: weak bias is soft in research mode
+                is_weak_bias = c.bias_strength not in ALLOWED_BIAS_STRENGTHS
                 if not self._bias_strength_ok(c):
                     _inc("weak_bias")
                     continue
+                if is_weak_bias and c.strategy_type == STRATEGY_FAILED_ENGULF and self.mode == "research":
+                    counters["weak_bias_soft_passed"] += 1
                 if not self._bias_direction_aligned(c):
-                    _inc("counter_bias")
+                    _inc("bias_mismatch_to_continuation" if c.strategy_type == STRATEGY_FAILED_ENGULF else "counter_bias")
                     continue
+                counters["continuation_bias_passed"] += 1
 
                 # Break quality
                 ok, reason = self._validate_break_quality(c)
@@ -469,27 +538,39 @@ class BreakRetestResearchEngine:
                 if c.state not in ("broken", "retest_zone"):
                     continue
 
-                in_zone = (bar_low <= c.break_level + zone_tol
-                           and bar_high >= c.break_level - zone_tol)
+                # Failed-engulf uses a wider retest tolerance (spec §6)
+                eff_zone_tol = (
+                    FAILED_ENGULF_RETEST_TOLERANCE_PIPS * PIP_SIZE
+                    if c.strategy_type == STRATEGY_FAILED_ENGULF
+                    else zone_tol
+                )
+
+                if c.strategy_type == STRATEGY_FAILED_ENGULF:
+                    # Retest checks the zone boundary the price broke through
+                    in_zone = (bar_high >= c.break_level - eff_zone_tol and bar_low <= c.break_level + eff_zone_tol)
+                else:
+                    in_zone = (bar_low <= c.break_level + eff_zone_tol
+                               and bar_high >= c.break_level - eff_zone_tol)
 
                 if not c.retest_touched and in_zone:
                     c.retest_touched = True
                     c.state = "retest_zone"
                     c.retest_time = bar_time
-                    c.retest_level = c.break_level
+                    c.retest_level = c.break_level  # break_level is zone boundary for both strategies
                     counters["retest_candidates"] += 1
 
                 if c.retest_touched:
                     c.confirmation_bars += 1
 
-                    # Fail if price closed deeply through zone in wrong direction
-                    if c.direction == "BUY" and bar_close < c.break_level - zone_tol * 2:
+                    # Fail if price closed deeply back through zone in wrong direction
+                    invalidation_tol = eff_zone_tol * 2
+                    if c.direction == "BUY" and bar_close < c.break_level - invalidation_tol:
                         c.state = "failed"
                         c.reject_reason = "retest_failed"
                         failed_keys.append(key)
                         _inc("retest_failed")
                         continue
-                    if c.direction == "SELL" and bar_close > c.break_level + zone_tol * 2:
+                    if c.direction == "SELL" and bar_close > c.break_level + invalidation_tol:
                         c.state = "failed"
                         c.reject_reason = "retest_failed"
                         failed_keys.append(key)
@@ -500,10 +581,31 @@ class BreakRetestResearchEngine:
                     conf_type, conf_score = self._evaluate_confirmation(
                         c, bar_high, bar_low, bar_close, bar_open, ctx
                     )
+                    # Soft weak-bias penalty for failed-engulf research (spec §4)
+                    if (
+                        c.strategy_type == STRATEGY_FAILED_ENGULF
+                        and self.mode == "research"
+                        and c.bias_strength not in ALLOWED_BIAS_STRENGTHS
+                    ):
+                        conf_score = max(0.0, conf_score - 10.0)
+
+                    if not self._confirmation_allowed(conf_type):
+                        logger.info(
+                            "%s REJECTED: %s disabled for approved mode",
+                            "FAILED ENGULF BRT" if self.strategy_type == STRATEGY_FAILED_ENGULF else "STANDARD BRT",
+                            conf_type,
+                        )
+                        c.state = "failed"
+                        c.reject_reason = "disabled_confirmation_type"
+                        failed_keys.append(key)
+                        _inc("disabled_confirmation_type")
+                        continue
 
                     if conf_score >= CONFIRMATION_THRESHOLD:
                         counters["valid_retests"] += 1
                         counters["confirmation_passed"] += 1
+                        if conf_type == "close_confirmation":
+                            counters["close_confirmation_passed"] += 1
 
                         entry, sl = self._compute_entry_sl(
                             c, bar_high, bar_low, bar_close
@@ -622,6 +724,212 @@ class BreakRetestResearchEngine:
             pass
         return ctx
 
+    def _load_failed_engulf_seed_candidates(
+        self,
+        *,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        scan_tfs: List[str],
+        counters: Dict[str, int],
+        reject_reasons: Dict[str, int],
+    ) -> List[BreakCandidate]:
+        def _inc(reason: str) -> None:
+            reject_reasons[reason] = reject_reasons.get(reason, 0) + 1
+
+        try:
+            records = get_failed_engulf_candidates(
+                self.db,
+                symbol=symbol,
+                start=start,
+                end=end,
+                source_strategy=self.source_strategy,
+            )
+        except Exception as exc:
+            logger.warning("Failed engulf candidate load failed: %s", exc)
+            _inc("missing_engulf_research_data")
+            records = []
+
+        if not records:
+            logger.info(
+                "FAILED ENGULF SEEDS: 0 from DB — regenerating via EngulfingResearchEngine for %s [%s → %s]",
+                symbol, start.date(), end.date(),
+            )
+            records = self._regenerate_failed_engulf_candidates(
+                symbol=symbol, start=start, end=end,
+                reject_reasons=reject_reasons,
+            )
+
+        if not records:
+            _inc("no_failed_engulf_candidates_loaded")
+            logger.warning(
+                "FAILED ENGULF SEEDS: still 0 after regeneration — check engulfing_rejection research "
+                "has run for this period or run: python -m historical_replay.run_strategy --strategy engulfing_rejection"
+            )
+            return []
+
+        allowed_tfs = (
+            FAILED_ENGULF_RESEARCH_TIMEFRAMES
+            if self.mode == "research"
+            else FAILED_ENGULF_APPROVED_TIMEFRAMES
+        )
+        seeds: List[BreakCandidate] = []
+        for idx, record in enumerate(records, start=1):
+            counters["raw_levels_detected"] += 1
+            counters["raw_failed_engulf_candidates"] += 1
+            counters["failed_engulf_candidates"] += 1
+            # Normalize timeframe from record (may arrive as "m30", "30m", "M30->M15", etc.)
+            tf_raw = record.timeframe or ""
+            tf = _normalize_timeframe(tf_raw)
+            if not tf or tf not in allowed_tfs:
+                raw_label = tf_raw or "<empty>"
+                _inc(f"unsupported_timeframe_raw:{raw_label}")
+                _inc("unsupported_timeframe")
+                logger.debug(
+                    "FAILED ENGULF TF REJECTED: raw=%s normalized=%s allowed=%s",
+                    raw_label, tf, allowed_tfs,
+                )
+                continue
+            # Use zone boundary as break_level (spec §5):
+            # SELL continuation broke below engulf_low; BUY broke above engulf_high
+            boundary = (
+                record.original_engulf_low
+                if record.continuation_direction == "SELL"
+                else record.original_engulf_high
+            )
+            seed = BreakCandidate(
+                candidate_key=f"failed_engulf_{tf}_{record.continuation_direction}_{round(record.original_engulf_mid, 2)}_{record.break_time.strftime('%Y%m%d%H%M')}_{idx}",
+                strategy_type=STRATEGY_FAILED_ENGULF,
+                symbol=record.symbol,
+                direction=record.continuation_direction,
+                timeframe=tf,
+                break_level=boundary,
+                source_level_type="Gap",
+                source_strategy_type=record.source_strategy_type,
+                zone_high=record.original_engulf_high,
+                zone_low=record.original_engulf_low,
+                break_time=record.break_time,
+                break_close=record.break_close,
+                break_distance_pips=record.break_distance_pips,
+                break_body_pips=max(record.break_distance_pips, MIN_BODY_PIPS),
+                break_body_ratio=max(MIN_BODY_RANGE_RATIO, 1.0),
+                dominant_bias=record.dominant_bias,
+                bias_strength=record.bias_strength,
+                session_name=record.session_name,
+                original_engulf_high=record.original_engulf_high,
+                original_engulf_low=record.original_engulf_low,
+                original_engulf_mid=record.original_engulf_mid,
+                original_engulf_direction=record.original_engulf_direction,
+                original_engulf_time=record.failed_at,
+                original_quality_rejection_count=record.quality_rejection_count,
+                original_structure_break_count=record.structure_break_count,
+                original_quality_score=record.quality_score,
+            )
+            seeds.append(seed)
+        logger.info("FAILED ENGULF SEEDS: loaded %d candidate(s) for %s", len(seeds), symbol)
+        return sorted(seeds, key=lambda item: item.break_time)
+
+    def _regenerate_failed_engulf_candidates(
+        self,
+        *,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        reject_reasons: Dict[str, int],
+    ):
+        """Run EngulfingResearchEngine inline and extract in-memory failed engulf candidates."""
+        try:
+            from historical_replay.engulfing_research import EngulfingResearchEngine  # lazy to avoid circular
+        except ImportError as exc:
+            logger.warning("FAILED ENGULF REGEN: import failed — %s", exc)
+            reject_reasons["regen_import_error"] = reject_reasons.get("regen_import_error", 0) + 1
+            return []
+
+        try:
+            engulf_engine = EngulfingResearchEngine(db=self.db, mt5=self.mt5)
+            engulf_engine.run_embedded(start=start, end=end, symbol=symbol, show_trades=0)
+            live_candidates = engulf_engine._live_failed_engulf_candidates
+            logger.info(
+                "FAILED ENGULF REGEN: EngulfingResearchEngine produced %d in-memory candidate(s)",
+                len(live_candidates),
+            )
+        except Exception as exc:
+            logger.warning("FAILED ENGULF REGEN: EngulfingResearchEngine run failed — %s", exc)
+            reject_reasons["regen_engine_error"] = reject_reasons.get("regen_engine_error", 0) + 1
+            return []
+
+        if live_candidates:
+            try:
+                records = get_failed_engulf_candidates(
+                    self.db,
+                    symbol=symbol,
+                    start=start,
+                    end=end,
+                    source_strategy=self.source_strategy,
+                )
+                if records:
+                    logger.info("FAILED ENGULF REGEN: re-queried %d record(s) from DB after regeneration", len(records))
+                    return records
+            except Exception:
+                pass
+
+            # DB re-query failed or empty — build records directly from in-memory payloads
+            records = []
+            for p in live_candidates:
+                notes_raw = p.get("notes") or "{}"
+                try:
+                    notes = json.loads(notes_raw) if isinstance(notes_raw, str) else (notes_raw or {})
+                except Exception:
+                    notes = {}
+                direction = str(p.get("direction") or notes.get("broken_direction") or "").upper()
+                continuation = "SELL" if direction == "BUY" else "BUY"
+                engulf_high = p.get("engulf_high") or notes.get("broken_level_high")
+                engulf_low = p.get("engulf_low") or notes.get("broken_level_low")
+                engulf_mid = p.get("engulf_mid") or p.get("entry")
+                break_close = notes.get("break_close_price") or p.get("entry")
+                break_time_raw = notes.get("break_time") or p.get("closed_at") or p.get("created_at")
+                if isinstance(break_time_raw, str):
+                    try:
+                        break_time = datetime.fromisoformat(break_time_raw.replace("Z", "+00:00"))
+                        if break_time.tzinfo is None:
+                            break_time = break_time.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        continue
+                elif isinstance(break_time_raw, datetime):
+                    break_time = break_time_raw if break_time_raw.tzinfo else break_time_raw.replace(tzinfo=timezone.utc)
+                else:
+                    continue
+                if not (engulf_high and engulf_low and engulf_mid and break_close):
+                    continue
+                break_level = float(engulf_low) if continuation == "SELL" else float(engulf_high)
+                records.append(FailedEngulfCandidateRecord(
+                    original_engulf_high=float(engulf_high),
+                    original_engulf_low=float(engulf_low),
+                    original_engulf_mid=float(engulf_mid),
+                    original_engulf_direction=direction,
+                    failed_direction=direction,
+                    continuation_direction=continuation,
+                    failed_at=_fea_utc(break_time),
+                    break_level=break_level,
+                    break_time=_fea_utc(break_time),
+                    break_close=float(break_close),
+                    break_distance_pips=round(max(0.0, abs(float(break_close) - break_level) / PIP_SIZE), 2),
+                    timeframe=_normalize_timeframe(str(p.get("timeframe") or "")) or "H1",
+                    session_name=str(p.get("session_name") or "off_session"),
+                    dominant_bias=str(p.get("dominant_bias") or "neutral"),
+                    bias_strength=str(p.get("bias_strength") or "weak"),
+                    quality_rejection_count=int(p.get("quality_rejection_count") or 0),
+                    structure_break_count=int(p.get("structure_break_count") or 0),
+                    quality_score=float(p.get("quality_score") or 0.0),
+                    reason_failed="price broke through engulf zone before rejection confirmation",
+                    symbol=str(p.get("symbol") or symbol),
+                ))
+            logger.info("FAILED ENGULF REGEN: built %d record(s) from in-memory payloads", len(records))
+            return records
+
+        reject_reasons["regen_produced_zero_candidates"] = reject_reasons.get("regen_produced_zero_candidates", 0) + 1
+        return []
+
     # ─────────────────────────────────────────────────────────────────────────
     # Break detection
     # ─────────────────────────────────────────────────────────────────────────
@@ -699,7 +1007,7 @@ class BreakRetestResearchEngine:
                     src_strategy = "engulfing_rejection"
                     orig_engulf_dir = "SELL" if direction == "BUY" else "BUY"
                 else:
-                    src_strategy    = "gap_sweep"
+                    src_strategy    = "gap_liquidity_sweep_reclaim"
                     orig_engulf_dir = None
 
                 c = BreakCandidate(
@@ -746,6 +1054,15 @@ class BreakRetestResearchEngine:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _validate_break_quality(self, c: BreakCandidate) -> Tuple[bool, str]:
+        if c.strategy_type == STRATEGY_FAILED_ENGULF:
+            # Spec §5: break must close beyond zone boundary by at least FAILED_ENGULF_MIN_BREAK_PIPS.
+            # break_level is already set to the zone boundary (engulf_low or engulf_high).
+            if c.break_distance_pips < FAILED_ENGULF_MIN_BREAK_PIPS:
+                return False, "no_boundary_break"
+            # Body-only check: break_body_ratio >= MIN_BODY_RANGE_RATIO ensures it's not wick-only
+            if c.break_body_ratio < MIN_BODY_RANGE_RATIO:
+                return False, "wick_only_break"
+            return True, ""
         min_dist = MIN_BREAK_DISTANCE_PIPS.get(c.timeframe, 15.0)
         if c.break_distance_pips < min_dist:
             return False, "no_valid_break"
@@ -756,13 +1073,38 @@ class BreakRetestResearchEngine:
         return True, ""
 
     def _bias_strength_ok(self, c: BreakCandidate) -> bool:
+        if c.strategy_type == STRATEGY_FAILED_ENGULF:
+            # Research mode: soft-allow weak bias (candidate proceeds; score penalty applied at confirmation)
+            if self.mode == "research" and FAILED_ENGULF_RESEARCH_ALLOW_WEAK_BIAS:
+                return True
         return c.bias_strength in ALLOWED_BIAS_STRENGTHS
 
     def _bias_direction_aligned(self, c: BreakCandidate) -> bool:
         b = c.dominant_bias.lower()
         if b == "neutral":
             return True
+        if c.strategy_type == STRATEGY_FAILED_ENGULF:
+            # Check bias against continuation_direction, not original engulf direction.
+            # e.g. bearish engulf broke up → continuation=BUY → need bullish bias.
+            continuation = c.direction  # direction IS continuation_direction for failed-engulf seeds
+            aligned = (continuation == "BUY" and b == "bullish") or (continuation == "SELL" and b == "bearish")
+            logger.debug(
+                "FAILED ENGULF BIAS CHECK: continuation=%s bias=%s result=%s",
+                continuation, b, "pass" if aligned else "fail",
+            )
+            return aligned
         return (c.direction == "BUY" and b == "bullish") or (c.direction == "SELL" and b == "bearish")
+
+    def _confirmation_allowed(self, confirmation_type: str) -> bool:
+        if self.strategy_type == STRATEGY_FAILED_ENGULF:
+            if self.mode == "research":
+                return confirmation_type in self.failed_engulf_research_confirmations
+            return confirmation_type in self.failed_engulf_allowed_confirmations
+        if self.strategy_type != STRATEGY_STANDARD:
+            return True
+        if self.mode == "research":
+            return confirmation_type in self.standard_research_confirmations
+        return confirmation_type in self.standard_allowed_confirmations
 
     # ─────────────────────────────────────────────────────────────────────────
     # Retest confirmation scoring
@@ -779,19 +1121,28 @@ class BreakRetestResearchEngine:
     ) -> Tuple[str, float]:
         score     = 0.0
         conf_type = "none"
-        zone_tol  = RETEST_ZONE_TOLERANCE_PIPS * PIP_SIZE
-        body      = abs(bar_close - bar_open)
+        # Failed-engulf uses wider tolerance; standard uses default
+        eff_tol = (
+            FAILED_ENGULF_RETEST_TOLERANCE_PIPS * PIP_SIZE
+            if c.strategy_type == STRATEGY_FAILED_ENGULF
+            else RETEST_ZONE_TOLERANCE_PIPS * PIP_SIZE
+        )
+        body = abs(bar_close - bar_open)
 
         if c.direction == "BUY":
             lower_wick = min(bar_open, bar_close) - bar_low
             if body > 0 and lower_wick > body * 1.5 and bar_close > c.break_level:
                 score    += CONFIRMATION_WICK_SCORE
                 conf_type = "rejection_wick"
-            elif bar_close > c.break_level + zone_tol * 0.5:
+            elif bar_close > c.break_level + eff_tol * 0.3:
                 score    += CONFIRMATION_CLOSE_SCORE
                 conf_type = "close_confirmation"
 
-            momentum_threshold = MIN_BREAK_DISTANCE_PIPS.get(c.timeframe, 15.0) * PIP_SIZE * 0.3
+            momentum_threshold = (
+                FAILED_ENGULF_MIN_BREAK_PIPS * PIP_SIZE * 0.5
+                if c.strategy_type == STRATEGY_FAILED_ENGULF
+                else MIN_BREAK_DISTANCE_PIPS.get(c.timeframe, 15.0) * PIP_SIZE * 0.3
+            )
             if bar_close > c.break_level + momentum_threshold:
                 score += CONFIRMATION_MOMENTUM_SCORE
                 if conf_type == "none":
@@ -801,11 +1152,15 @@ class BreakRetestResearchEngine:
             if body > 0 and upper_wick > body * 1.5 and bar_close < c.break_level:
                 score    += CONFIRMATION_WICK_SCORE
                 conf_type = "rejection_wick"
-            elif bar_close < c.break_level - zone_tol * 0.5:
+            elif bar_close < c.break_level - eff_tol * 0.3:
                 score    += CONFIRMATION_CLOSE_SCORE
                 conf_type = "close_confirmation"
 
-            momentum_threshold = MIN_BREAK_DISTANCE_PIPS.get(c.timeframe, 15.0) * PIP_SIZE * 0.3
+            momentum_threshold = (
+                FAILED_ENGULF_MIN_BREAK_PIPS * PIP_SIZE * 0.5
+                if c.strategy_type == STRATEGY_FAILED_ENGULF
+                else MIN_BREAK_DISTANCE_PIPS.get(c.timeframe, 15.0) * PIP_SIZE * 0.3
+            )
             if bar_close < c.break_level - momentum_threshold:
                 score += CONFIRMATION_MOMENTUM_SCORE
                 if conf_type == "none":
@@ -1048,12 +1403,12 @@ class BreakRetestResearchEngine:
         avg_pips  = (net_pips / total) if total else 0.0
 
         logger.info(
-            "%s run %d done: %d trades | WR=%.1f%% | TP1=%.0f%% | Net=%.1f pips",
-            self.strategy_type, run_id, total, win_rate,
+            "%s run %s done: %d trades | WR=%.1f%% | TP1=%.0f%% | Net=%.1f pips",
+            self.strategy_type, run_id if run_id is not None else "local-only", total, win_rate,
             (tp1_hit / total * 100) if total else 0.0, net_pips,
         )
 
-        return {
+        result = {
             "run_id":        run_id,
             "strategy_type": self.strategy_type,
             "total_trades":  total,
@@ -1073,6 +1428,19 @@ class BreakRetestResearchEngine:
             "by_direction":         self._group(activated, "direction"),
             "by_confirmation_type": self._group(activated, "retest_confirmation_type"),
         }
+        if self.strategy_type == STRATEGY_FAILED_ENGULF:
+            result["failed_engulf_funnel"] = {
+                "raw_failed_engulf_candidates": counters.get("raw_failed_engulf_candidates", 0),
+                "timeframe_supported":           counters.get("timeframe_supported", 0),
+                "continuation_bias_passed":      counters.get("continuation_bias_passed", 0),
+                "weak_bias_soft_passed":         counters.get("weak_bias_soft_passed", 0),
+                "valid_breaks":                  counters.get("valid_breaks", 0),
+                "retest_candidates":             counters.get("retest_candidates", 0),
+                "valid_retests":                 counters.get("valid_retests", 0),
+                "close_confirmation_passed":     counters.get("close_confirmation_passed", 0),
+                "activated_trades":              counters.get("activated_trades", 0),
+            }
+        return result
 
     def _group(self, trades: List[BreakRetestTrade], attr: str) -> dict:
         groups: Dict[str, list] = {}

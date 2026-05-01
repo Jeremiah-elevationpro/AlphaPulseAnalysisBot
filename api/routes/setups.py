@@ -16,6 +16,11 @@ Direction = Literal["BUY", "SELL"]
 StatusValue = Literal[
     "draft",
     "watching",
+    "approaching_entry",
+    "entry_touched",
+    "confirmation_waiting",
+    "confirmed",
+    "active",
     "pending-order-ready",
     "activated",
     "TP1 hit",
@@ -25,6 +30,11 @@ StatusValue = Literal[
     "stopped out",
     "closed manually",
     "expired",
+    "completed",
+    "failed",
+    "cancelled",
+    "invalidated",
+    "archived",
 ]
 
 
@@ -68,6 +78,11 @@ class SetupUpdate(BaseModel):
     status: Optional[StatusValue] = None
 
 
+class SetupStatusUpdate(BaseModel):
+    status: Literal["completed", "cancelled", "failed", "expired", "invalidated", "archived"]
+    note: Optional[str] = None
+
+
 def _shape_setup(row: dict, *, telegram_alert_sent: Optional[bool] = None, tracking_enabled: bool = True) -> dict:
     created_at = row.get("created_at") or datetime.now(timezone.utc).isoformat()
     updated_at = row.get("updated_at") or created_at
@@ -91,11 +106,25 @@ def _shape_setup(row: dict, *, telegram_alert_sent: Optional[bool] = None, track
         "enable_telegram_alerts": bool(row.get("enable_telegram_alerts", True)),
         "high_priority": bool(row.get("high_priority", False)),
         "status": row.get("status", "draft"),
+        "source": row.get("source", "manual"),
+        "strategy_type": row.get("strategy_type", "manual_setup"),
+        "setup_type": row.get("setup_type", "manual_setup"),
         "tracking_enabled": tracking_enabled,
         "tracking_status": row.get("tracking_status", "watching"),
+        "confirmation_required": bool(row.get("confirmation_required", False)),
         "telegram_alert_sent": tg_sent,
         "telegram_alert_sent_at": row.get("telegram_alert_sent_at"),
         "telegram_error": row.get("telegram_error"),
+        "last_alert_type": row.get("last_alert_type"),
+        "last_alert_time": row.get("last_alert_time"),
+        "current_price": row.get("current_price"),
+        "distance_to_entry_pips": row.get("distance_to_entry_pips"),
+        "closed_at": row.get("closed_at"),
+        "completed_at": row.get("completed_at"),
+        "cancelled_at": row.get("cancelled_at"),
+        "failed_at": row.get("failed_at"),
+        "archived_at": row.get("archived_at"),
+        "completion_note": row.get("completion_note"),
         "created_at": str(created_at),
         "updated_at": str(updated_at),
     }
@@ -125,6 +154,37 @@ def list_setups():
     except Exception:
         state.mark_db_failure()
         return {"setups": [], "total": 0, "db_ready": False}
+
+
+@router.get("/manual-setups")
+def list_manual_setups():
+    return list_setups()
+
+
+@router.get("/manual-setups/active")
+def list_active_manual_setups():
+    if not state.db_ready:
+        return {"setups": [], "total": 0, "db_ready": False}
+    rows = state.db.get_manual_setups(limit=500)
+    active = [
+        _shape_setup(row)
+        for row in rows
+        if row.get("tracking_enabled", True) and row.get("status") not in {"completed", "failed", "cancelled", "expired", "invalidated", "archived"}
+    ]
+    return {"setups": active, "total": len(active), "db_ready": True}
+
+
+@router.get("/manual-setups/history")
+def list_manual_setup_history():
+    if not state.db_ready:
+        return {"setups": [], "total": 0, "db_ready": False}
+    rows = state.db.get_manual_setups(limit=500)
+    history = [
+        _shape_setup(row, tracking_enabled=bool(row.get("tracking_enabled", False)))
+        for row in rows
+        if row.get("status") in {"completed", "failed", "cancelled", "expired", "invalidated", "archived"}
+    ]
+    return {"setups": history, "total": len(history), "db_ready": True}
 
 
 @router.post("/setups", status_code=201)
@@ -164,6 +224,8 @@ def create_setup(body: SetupCreate):
             patch: dict = {"telegram_alert_sent": tg_sent}
             if tg_sent:
                 patch["telegram_alert_sent_at"] = datetime.now(timezone.utc).isoformat()
+                patch["last_alert_type"] = "manual_setup"
+                patch["last_alert_time"] = datetime.now(timezone.utc).isoformat()
             if tg_error:
                 patch["telegram_error"] = tg_error[:500]
             state.db.update_manual_setup(row["id"], patch)
@@ -177,6 +239,11 @@ def create_setup(body: SetupCreate):
     shaped["telegram_alert_sent"] = tg_sent
     shaped["telegram_error"] = tg_error if not tg_sent else None
     return shaped
+
+
+@router.post("/manual-setups", status_code=201)
+def create_manual_setup(body: SetupCreate):
+    return create_setup(body)
 
 
 @router.patch("/setups/{setup_id}")
@@ -200,6 +267,66 @@ def update_setup(setup_id: int, body: SetupUpdate):
     except Exception as exc:
         state.mark_db_failure()
         raise HTTPException(status_code=503, detail=f"Database unavailable: {exc}")
+
+
+@router.patch("/manual-setups/{setup_id}/status")
+def update_manual_setup_status(setup_id: int, body: SetupStatusUpdate):
+    if not state.db_ready:
+        raise HTTPException(status_code=503, detail="Database not available")
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "status": body.status,
+        "tracking_enabled": False,
+        "completion_note": body.note or "",
+        "closed_at": now,
+        "tracking_status": body.status,
+        f"{body.status}_at": now if body.status in {"completed", "failed", "cancelled", "archived"} else None,
+    }
+    if body.status == "expired":
+        payload["completed_at"] = None
+    try:
+        row = state.db.update_manual_setup(setup_id, {k: v for k, v in payload.items() if v is not None})
+        if not row:
+            raise HTTPException(status_code=404, detail="Setup not found")
+        logger.info("MANUAL SETUP STATUS UPDATED: id=%s status=%s tracking=false", setup_id, body.status)
+        return {
+            "success": True,
+            "setup_id": setup_id,
+            "status": body.status,
+            "tracking_enabled": False,
+            "closed_at": now,
+            "setup": _shape_setup(row, tracking_enabled=False),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        state.mark_db_failure()
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {exc}")
+
+
+@router.post("/manual-setups/{setup_id}/resend-alert")
+def resend_manual_setup_alert(setup_id: int):
+    if not state.db_ready:
+        raise HTTPException(status_code=503, detail="Database not available")
+    rows = state.db.get_manual_setups(limit=500)
+    row = next((item for item in rows if item.get("id") == setup_id), None)
+    if not row:
+        raise HTTPException(status_code=404, detail="Setup not found")
+    tg_sent, tg_error = _send_telegram_saved(row)
+    patch = {
+        "telegram_alert_sent": tg_sent,
+        "telegram_alert_sent_at": datetime.now(timezone.utc).isoformat() if tg_sent else row.get("telegram_alert_sent_at"),
+        "telegram_error": tg_error[:500] if tg_error else None,
+        "last_alert_type": "manual_setup",
+        "last_alert_time": datetime.now(timezone.utc).isoformat(),
+    }
+    updated = state.db.update_manual_setup(setup_id, {k: v for k, v in patch.items() if v is not None}) or row
+    return {"success": tg_sent, "setup": _shape_setup(updated, telegram_alert_sent=tg_sent)}
+
+
+@router.patch("/manual-setups/{setup_id}")
+def patch_manual_setup(setup_id: int, body: SetupUpdate):
+    return update_setup(setup_id, body)
 
 
 @router.delete("/setups/{setup_id}")

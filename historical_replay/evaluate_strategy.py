@@ -9,8 +9,11 @@ os.environ.setdefault("ALPHAPULSE_REPLAY_MODE", "1")
 
 from db.database import Database
 from historical_replay.break_retest_research import STRATEGY_STANDARD, STRATEGY_FAILED_ENGULF
+from historical_replay.evaluate import build_report as build_gap_report
+from utils.strategy_registry import canonical_strategy_type
 
 _BREAK_RETEST_STRATEGIES = {STRATEGY_STANDARD, STRATEGY_FAILED_ENGULF}
+_GAP_SWEEP_STRATEGIES = {"gap_sweep", "gap_liquidity_sweep_reclaim", "alphapulse"}
 
 
 def main():
@@ -19,18 +22,84 @@ def main():
     parser.add_argument("--run-id", type=int, default=0)
     parser.add_argument("--show-trades", type=int, default=20)
     args = parser.parse_args()
+    strategy_name = "gap_liquidity_sweep_reclaim" if args.strategy == "alphapulse" else canonical_strategy_type(args.strategy)
 
     db = Database()
     try:
         db.init()
-        result = db.get_strategy_research_results(args.run_id) if args.run_id else db.get_latest_strategy_research_results(args.strategy)
+        if strategy_name in _GAP_SWEEP_STRATEGIES:
+            run = db.get_replay_run(args.run_id) if args.run_id else db.get_latest_replay_run()
+            if not run:
+                raise SystemExit("No Gap Sweep replay runs found in Supabase.")
+            run_id = int(run["id"])
+            stats = db.get_replay_stats(run_id) or {}
+            trades = db.get_replay_trades(run_id)
+            learning_error = None
+            try:
+                learning_rows = db.get_strategy_learning_trades(strategy_type="gap_liquidity_sweep_reclaim", source="replay", source_run_id=run_id, limit=20000)
+            except Exception as exc:
+                learning_rows = []
+                learning_error = f"table=strategy_learning_trades query_keys=strategy_type,source,source_run_id,order error={exc}"
+            learning_summary = _learning_export_summary(
+                run.get("summary") if isinstance(run.get("summary"), dict) else {},
+                learning_rows,
+                activated_trades=int(stats.get("total_activated_trades") or 0),
+            )
+            report = build_gap_report(run, stats, trades, show_trades=args.show_trades)
+            learning_lines = [
+                "",
+                "Learning Export",
+                "- strategy_type: gap_liquidity_sweep_reclaim",
+                f"- activated_trades: {learning_summary['activated_trades']}",
+                f"- rows_exported: {learning_summary['rows_exported']}",
+                f"- duplicates_skipped: {learning_summary['duplicates_skipped']}",
+                f"- invalid_skipped: {learning_summary['invalid_skipped']}",
+                f"- learning_valid: {learning_summary['learning_valid']}",
+                f"- skipped: {learning_summary['skipped']}",
+            ]
+            if learning_error:
+                learning_lines.append(f"- error: {learning_error}")
+            _emit(report + "\n" + "\n".join(learning_lines))
+            return
+
+        result = db.get_strategy_research_results(args.run_id) if args.run_id else db.get_latest_strategy_research_results(strategy_name)
         if not result:
             raise SystemExit("No strategy research runs found in Supabase.")
-        if args.strategy in _BREAK_RETEST_STRATEGIES:
+        run = result["run"]
+        learning_error = None
+        try:
+            learning_rows = db.get_strategy_learning_trades(
+                strategy_type=strategy_name,
+                source="research",
+                source_run_id=int(run["id"]),
+                limit=20000,
+            )
+        except Exception as exc:
+            learning_rows = []
+            learning_error = f"table=strategy_learning_trades query_keys=strategy_type,source,source_run_id,order error={exc}"
+        learning_summary = _learning_export_summary(
+            run.get("summary") if isinstance(run.get("summary"), dict) else {},
+            learning_rows,
+            activated_trades=len([t for t in result["trades"] if (t.get("final_result") or "") in {"LOSS", "BREAKEVEN_WIN", "PARTIAL_WIN", "WIN", "STRONG_WIN"}]),
+        )
+        learning_lines = [
+            "",
+            "Learning Export",
+            f"- strategy_type: {strategy_name}",
+            f"- activated_trades: {learning_summary['activated_trades']}",
+            f"- rows_exported: {learning_summary['rows_exported']}",
+            f"- duplicates_skipped: {learning_summary['duplicates_skipped']}",
+            f"- invalid_skipped: {learning_summary['invalid_skipped']}",
+            f"- learning_valid: {learning_summary['learning_valid']}",
+            f"- skipped: {learning_summary['skipped']}",
+        ]
+        if learning_error:
+            learning_lines.append(f"- error: {learning_error}")
+        if strategy_name in _BREAK_RETEST_STRATEGIES:
             from historical_replay.evaluate_break_retest import build_report as br_build_report
-            print(br_build_report(result["run"], result["stats"], result["trades"], show_trades=args.show_trades))
+            _emit(br_build_report(result["run"], result["stats"], result["trades"], show_trades=args.show_trades) + "\n" + "\n".join(learning_lines))
         else:
-            print(build_report(result["run"], result["stats"], result["trades"], show_trades=args.show_trades))
+            _emit(build_report(result["run"], result["stats"], result["trades"], show_trades=args.show_trades) + "\n" + "\n".join(learning_lines))
     finally:
         db.close()
 
@@ -273,6 +342,38 @@ def _average_confirmation_score(trades: Iterable[Dict], *, winner: bool) -> floa
         if ((trade.get("final_result") != "LOSS") if winner else (trade.get("final_result") == "LOSS"))
     ]
     return round(sum(selected) / len(selected), 2) if selected else 0.0
+
+
+def _emit(text: str) -> None:
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(text.encode("ascii", errors="replace").decode("ascii"))
+
+
+def _learning_export_summary(summary_payload: Dict, learning_rows: List[Dict], *, activated_trades: int) -> Dict[str, int]:
+    learning_export = summary_payload.get("learning_export") if isinstance(summary_payload, dict) else None
+    if isinstance(learning_export, dict):
+        return {
+            "activated_trades": int(learning_export.get("activated_trades", activated_trades) or 0),
+            "rows_exported": int(learning_export.get("rows_exported", 0) or 0),
+            "duplicates_skipped": int(learning_export.get("duplicates_skipped", 0) or 0),
+            "invalid_skipped": int(learning_export.get("invalid_skipped", 0) or 0),
+            "learning_valid": int(learning_export.get("learning_valid", 0) or 0),
+            "skipped": int(learning_export.get("skipped", 0) or 0),
+        }
+    exported = len(learning_rows)
+    learning_valid = sum(1 for row in learning_rows if row.get("learning_valid", True))
+    invalid_skipped = sum(1 for row in learning_rows if not row.get("learning_valid", True))
+    duplicates_skipped = max(0, activated_trades - exported - invalid_skipped)
+    return {
+        "activated_trades": activated_trades,
+        "rows_exported": exported,
+        "duplicates_skipped": duplicates_skipped,
+        "invalid_skipped": invalid_skipped,
+        "learning_valid": learning_valid,
+        "skipped": duplicates_skipped + invalid_skipped,
+    }
 
 
 if __name__ == "__main__":

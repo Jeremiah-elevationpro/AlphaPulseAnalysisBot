@@ -12,6 +12,7 @@ import json
 import re
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from config.settings import (
@@ -20,6 +21,7 @@ from config.settings import (
     SUPABASE_URL, SUPABASE_KEY,
     ACTIVE_TIMEFRAME_PAIR_LABELS,
 )
+from utils.strategy_registry import canonical_strategy_type
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -244,6 +246,30 @@ class SupabaseDB:
         headers = {**self._headers, "Prefer": f"resolution=merge-duplicates,return=representation"}
         r = self._request("POST", table, params={"on_conflict": on_conflict}, data=data, headers=headers)
         r.raise_for_status()
+        rows = r.json()
+        return rows[0] if rows else None
+
+    def _post_many(self, table: str, rows: List[Dict]) -> List[Dict]:
+        if not rows:
+            return []
+        r = self._request("POST", table, data=rows)
+        if not r.ok:
+            try:
+                err_body = r.json()
+            except Exception:
+                err_body = r.text
+            logger.error(
+                "Supabase POST MANY %s failed %d: %s",
+                table, r.status_code, err_body,
+            )
+            try:
+                r.raise_for_status()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Supabase POST MANY {table} failed {r.status_code}: {err_body}"
+                ) from exc
+        r.raise_for_status()
+        return r.json() or []
 
 
 # ─────────────────────────────────────────────────────────
@@ -390,9 +416,62 @@ class Database:
                 telegram_alert_sent             BOOLEAN DEFAULT FALSE,
                 telegram_alert_sent_at          TIMESTAMPTZ,
                 telegram_error                  TEXT,
+                last_alert_type                 VARCHAR(50),
+                last_alert_time                 TIMESTAMPTZ,
                 approach_alert_sent_at          TIMESTAMPTZ,
+                current_price                   NUMERIC(12,2),
+                distance_to_entry_pips          NUMERIC(12,2),
+                closed_at                       TIMESTAMPTZ,
+                completed_at                    TIMESTAMPTZ,
+                cancelled_at                    TIMESTAMPTZ,
+                failed_at                       TIMESTAMPTZ,
+                archived_at                     TIMESTAMPTZ,
+                completion_note                 TEXT,
                 created_at                      TIMESTAMPTZ DEFAULT NOW(),
                 updated_at                      TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        self._pg.execute("""
+            CREATE TABLE IF NOT EXISTS live_setups (
+                id                  SERIAL PRIMARY KEY,
+                setup_key           VARCHAR(255) UNIQUE,
+                source              VARCHAR(30) DEFAULT 'live_bot',
+                strategy_type       VARCHAR(80) NOT NULL,
+                alert_stage         VARCHAR(30) DEFAULT 'setup',
+                setup_status        VARCHAR(40) DEFAULT 'watching',
+                symbol              VARCHAR(20) NOT NULL DEFAULT 'XAUUSD',
+                direction           VARCHAR(10) NOT NULL,
+                entry               NUMERIC(12,3),
+                sl                  NUMERIC(12,3),
+                tp1                 NUMERIC(12,3),
+                tp2                 NUMERIC(12,3),
+                tp3                 NUMERIC(12,3),
+                level_type          VARCHAR(20),
+                level_price         NUMERIC(12,3),
+                level_high          NUMERIC(12,3),
+                level_low           NUMERIC(12,3),
+                timeframe           VARCHAR(10),
+                timeframe_pair      VARCHAR(20),
+                session_name        VARCHAR(30),
+                dominant_bias       VARCHAR(20),
+                bias_strength       VARCHAR(20),
+                confirmation_type   VARCHAR(50),
+                confirmation_score  NUMERIC(8,2),
+                pd_location         VARCHAR(30),
+                distance_to_level_pips NUMERIC(10,2),
+                quality_score       NUMERIC(10,2),
+                learning_score      NUMERIC(10,2),
+                learning_context    TEXT,
+                quality_rejection_count INTEGER,
+                structure_break_count INTEGER,
+                watchlist_alert_sent BOOLEAN DEFAULT FALSE,
+                watchlist_alert_sent_at TIMESTAMPTZ,
+                entry_alert_sent    BOOLEAN DEFAULT FALSE,
+                entry_alert_sent_at TIMESTAMPTZ,
+                telegram_alert_sent BOOLEAN DEFAULT FALSE,
+                telegram_alert_sent_at TIMESTAMPTZ,
+                updated_at          TIMESTAMPTZ DEFAULT NOW(),
+                created_at          TIMESTAMPTZ DEFAULT NOW()
             );
         """)
         # Idempotent additions for existing deployments
@@ -406,7 +485,17 @@ class Database:
             ("telegram_alert_sent",    "BOOLEAN DEFAULT FALSE"),
             ("telegram_alert_sent_at", "TIMESTAMPTZ"),
             ("telegram_error",         "TEXT"),
+            ("last_alert_type",        "VARCHAR(50)"),
+            ("last_alert_time",        "TIMESTAMPTZ"),
             ("approach_alert_sent_at", "TIMESTAMPTZ"),
+            ("current_price",          "NUMERIC(12,2)"),
+            ("distance_to_entry_pips", "NUMERIC(12,2)"),
+            ("closed_at",              "TIMESTAMPTZ"),
+            ("completed_at",           "TIMESTAMPTZ"),
+            ("cancelled_at",           "TIMESTAMPTZ"),
+            ("failed_at",              "TIMESTAMPTZ"),
+            ("archived_at",            "TIMESTAMPTZ"),
+            ("completion_note",        "TEXT"),
         ]:
             try:
                 self._pg.execute(
@@ -505,6 +594,43 @@ class Database:
                 trade.get("breakeven_exit", False),
             ))
             return row[0] if row else None
+
+    def upsert_live_setup(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if self._sb:
+            setup_key = payload.get("setup_key")
+            if setup_key:
+                return self._sb._upsert("live_setups", payload, on_conflict="setup_key")
+            return self._sb._post("live_setups", payload)
+
+        if self._pg:
+            cols = list(payload.keys())
+            placeholders = ", ".join(["%s"] * len(cols))
+            updates = ", ".join(
+                f"{col}=EXCLUDED.{col}" for col in cols if col != "setup_key"
+            )
+            row = self._pg.fetchone(
+                f"""
+                INSERT INTO live_setups ({", ".join(cols)})
+                VALUES ({placeholders})
+                ON CONFLICT (setup_key) DO UPDATE SET {updates}, updated_at=NOW()
+                RETURNING id
+                """,
+                tuple(payload[col] for col in cols),
+            )
+            return {"id": row[0]} if row else None
+        return None
+
+    def update_live_setup(self, setup_key: str, payload: Dict[str, Any]) -> None:
+        if self._sb:
+            self._sb._patch("live_setups", {"setup_key": setup_key}, payload)
+            return
+        if self._pg:
+            assignments = ", ".join([f"{key}=%s" for key in payload.keys()])
+            params = tuple(payload[key] for key in payload.keys()) + (setup_key,)
+            self._pg.execute(
+                f"UPDATE live_setups SET {assignments}, updated_at=NOW() WHERE setup_key = %s",
+                params,
+            )
 
     def update_trade_status(self, trade_uuid: str, status: str, **kwargs):
         """Update a trade's status and any additional fields."""
@@ -746,17 +872,33 @@ class Database:
     })
 
     _OPTIONAL_STRATEGY_RESEARCH_RUN_COLUMNS: frozenset = frozenset({
+        "strategy_group",
+        "symbol",
         "strategy_type",
+        "source",
         "started_at",
+        "completed_at",
         "finished_at",
         "notes",
         "replay_start",
         "replay_end",
         "status",
+        "error_message",
+        "export_learning",
+        "rows_exported",
+        "learning_valid_count",
+        "learning_skipped_count",
+        "summary",
         "funnel_summary",
         "reject_summary",
         "created_at",
         "updated_at",
+    })
+
+    _REQUIRED_STRATEGY_RESEARCH_RUN_COLUMNS: frozenset = frozenset({
+        "symbol",
+        "strategy_group",
+        "strategy_type",
     })
 
     _OPTIONAL_STRATEGY_RESEARCH_STATS_COLUMNS: frozenset = frozenset({
@@ -810,6 +952,25 @@ class Database:
         "profile_key", "created_at", "updated_at",
     })
 
+    _OPTIONAL_STRATEGY_LEARNING_TRADE_COLUMNS: frozenset = frozenset({
+        "source", "source_run_id", "strategy_type", "setup_type", "symbol",
+        "direction", "timeframe", "timeframe_pair", "session_name", "market_condition",
+        "dominant_bias", "bias_strength", "confirmation_type", "confirmation_score",
+        "level_type", "level_price", "level_high", "level_low", "level_mid",
+        "entry", "sl", "tp1", "tp2", "tp3",
+        "final_result", "final_pips", "reward_score",
+        "tp_progress", "protected_after_tp1",
+        "activated_at", "closed_at", "created_at",
+        "quality_rejection_count", "structure_break_count", "pd_location",
+        "break_level", "break_distance_pips", "retest_level", "retest_confirmation_type",
+        "original_engulf_high", "original_engulf_low", "original_engulf_direction",
+        "learning_valid", "validation_warning", "export_key",
+    })
+
+    _REQUIRED_STRATEGY_LEARNING_TRADE_COLUMNS: frozenset = frozenset({
+        "source", "strategy_type", "symbol",
+    })
+
     _OPTIONAL_LIVE_TRADE_COLUMNS: frozenset = frozenset({
         "setup_type",
         "is_qm",
@@ -829,6 +990,45 @@ class Database:
         "structure_break_count",
         "level_timeframe",
         "confluence_with",
+    })
+
+    _OPTIONAL_ANALYST_REPLAY_RUN_COLUMNS: frozenset = frozenset({
+        "symbol", "source", "started_at", "completed_at", "status", "months",
+        "replay_start", "replay_end", "total_scenarios", "total_confirmations",
+        "total_entries", "total_reviews", "net_pips", "summary", "notes",
+    })
+
+    _OPTIONAL_ANALYST_SCENARIO_COLUMNS: frozenset = frozenset({
+        "run_id", "symbol", "scenario_key", "source", "primary_or_secondary",
+        "scenario_type", "direction", "zone_low", "zone_high", "trigger_conditions",
+        "invalidation_level", "tp_targets", "h4_bias", "h1_bias", "dominant_bias",
+        "bias_strength", "session_name", "psychological_level_context",
+        "market_condition", "status", "created_at", "resolved_at",
+        "final_outcome", "max_favorable_pips", "max_adverse_pips",
+        "tp1_reached", "tp2_reached", "tp3_reached", "notes",
+    })
+
+    _OPTIONAL_ANALYST_CONFIRMATION_COLUMNS: frozenset = frozenset({
+        "run_id", "symbol", "scenario_key", "confirmation_key", "source",
+        "scenario_type", "confirmation_type", "confirmation_grade",
+        "confirmation_score", "direction", "level", "entry", "sl", "tp1",
+        "tp2", "tp3", "decision", "rejection_reason", "session_name",
+        "timeframe", "created_at", "final_outcome", "pips_result",
+        "candidate_rank_score", "candidate_rank_reason",
+        "tp1_hit", "tp2_hit", "tp3_hit", "sl_hit",
+    })
+
+    _OPTIONAL_ANALYST_TRADE_REVIEW_COLUMNS: frozenset = frozenset({
+        "run_id", "setup_id", "symbol", "scenario_key", "scenario_type",
+        "direction", "entry", "sl", "tp1", "tp2", "tp3", "confirmation_type",
+        "confirmation_grade", "learning_score", "candidate_rank_score",
+        "reaction_level", "invalidation_level", "risk_pips", "tp1_reward_pips",
+        "tp2_reward_pips", "tp3_reward_pips", "tp1_rr", "tp2_rr", "tp3_rr",
+        "sl_source", "tp_source", "trade_path_source", "trade_path_rationale",
+        "target_roles", "setup_quality_label", "decision_reason",
+        "session_name", "h4_bias", "h1_bias", "market_condition", "result",
+        "pips_result", "tp1_hit", "tp2_hit", "tp3_hit", "protected_after_tp1",
+        "review_notes", "created_at", "closed_at",
     })
 
     def insert_replay_trade(self, payload: Dict[str, Any]) -> Optional[int]:
@@ -888,6 +1088,36 @@ class Database:
             except Exception as exc:
                 if not self._is_400(exc):
                     raise
+                if table == "strategy_research_runs":
+                    message = str(exc)
+                    if 'null value in column "strategy_group"' in message:
+                        strategy_group = (
+                            attempt_payload.get("strategy_group")
+                            or attempt_payload.get("strategy_type")
+                            or attempt_payload.get("strategy")
+                            or "strategy_research"
+                        )
+                        attempt_payload["strategy_group"] = strategy_group
+                        if not attempt_payload.get("strategy_type"):
+                            attempt_payload["strategy_type"] = strategy_group
+                        logger.warning(
+                            "STRATEGY RESEARCH FALLBACK: filled missing required strategy_group"
+                        )
+                        continue
+                    if 'null value in column "strategy_type"' in message:
+                        strategy_type = (
+                            attempt_payload.get("strategy_type")
+                            or attempt_payload.get("strategy_group")
+                            or attempt_payload.get("strategy")
+                            or "unknown_strategy"
+                        )
+                        attempt_payload["strategy_type"] = strategy_type
+                        if not attempt_payload.get("strategy_group"):
+                            attempt_payload["strategy_group"] = strategy_type
+                        logger.warning(
+                            "STRATEGY RESEARCH FALLBACK: filled missing required strategy_type"
+                        )
+                        continue
                 extracted_missing = [col for col in self._extract_missing_columns(exc) if col in attempt_payload]
                 required_missing = [col for col in extracted_missing if col in required_columns]
                 if required_missing:
@@ -1085,11 +1315,28 @@ class Database:
 
     def create_strategy_research_run(self, payload: Dict[str, Any]) -> Optional[int]:
         """Create a strategy research run row in Supabase."""
+        normalized = dict(payload)
+        normalized["strategy_group"] = (
+            normalized.get("strategy_group")
+            or normalized.get("strategy_type")
+            or normalized.get("strategy")
+            or "strategy_research"
+        )
+        normalized["strategy_type"] = (
+            normalized.get("strategy_type")
+            or normalized.get("strategy_group")
+            or normalized.get("strategy")
+            or "unknown_strategy"
+        )
+        normalized.setdefault("source", "strategy_research")
+        normalized.setdefault("status", "running")
+        normalized.setdefault("started_at", datetime.now(timezone.utc).isoformat())
         return self._post_with_missing_column_fallback(
             "strategy_research_runs",
-            payload,
+            normalized,
             self._OPTIONAL_STRATEGY_RESEARCH_RUN_COLUMNS,
             "strategy research run",
+            self._REQUIRED_STRATEGY_RESEARCH_RUN_COLUMNS,
         )
 
     def update_strategy_research_run(self, run_id: int, payload: Dict[str, Any]):
@@ -1230,9 +1477,271 @@ class Database:
             "trades": trades,
         }
 
+    def get_strategy_research_trade_rows(
+        self,
+        *,
+        strategy_type: Optional[str] = None,
+        final_result: Optional[str] = None,
+        symbol: Optional[str] = None,
+        limit: int = 20000,
+    ) -> List[Dict]:
+        if not self._sb:
+            raise RuntimeError("Strategy research persistence requires USE_SUPABASE=true")
+        params = {"order": "id.asc"}
+        if strategy_type:
+            params["strategy_type"] = f"eq.{strategy_type}"
+        if final_result:
+            params["final_result"] = f"eq.{final_result}"
+        if symbol:
+            params["symbol"] = f"eq.{symbol}"
+        return self._sb._get("strategy_research_trades", params, limit=limit)
+
     # ─────────────────────────────────────────────────────────────────────
     # MULTI-STRATEGY REPLAY
     # ─────────────────────────────────────────────────────────────────────
+
+    def create_analyst_replay_run(self, payload: Dict[str, Any]) -> Optional[int]:
+        normalized = dict(payload)
+        normalized.setdefault("symbol", "XAUUSD")
+        normalized.setdefault("source", "historical_replay")
+        normalized.setdefault("status", "running")
+        normalized.setdefault("started_at", datetime.now(timezone.utc).isoformat())
+        return self._post_with_missing_column_fallback(
+            "analyst_replay_runs",
+            normalized,
+            self._OPTIONAL_ANALYST_REPLAY_RUN_COLUMNS,
+            "analyst replay run",
+        )
+
+    def update_analyst_replay_run(self, run_id: int, payload: Dict[str, Any]) -> None:
+        self._patch_with_missing_column_fallback(
+            "analyst_replay_runs",
+            {"id": run_id},
+            payload,
+            self._OPTIONAL_ANALYST_REPLAY_RUN_COLUMNS,
+            "analyst replay run",
+        )
+
+    def insert_analyst_scenario_history(self, payload: Dict[str, Any]) -> Optional[int]:
+        return self._post_with_missing_column_fallback(
+            "analyst_scenario_history",
+            payload,
+            self._OPTIONAL_ANALYST_SCENARIO_COLUMNS,
+            "analyst scenario history",
+        )
+
+    def update_analyst_scenario_history(self, row_id: int, payload: Dict[str, Any]) -> None:
+        self._patch_with_missing_column_fallback(
+            "analyst_scenario_history",
+            {"id": row_id},
+            payload,
+            self._OPTIONAL_ANALYST_SCENARIO_COLUMNS,
+            "analyst scenario history",
+        )
+
+    def insert_analyst_confirmation_history(self, payload: Dict[str, Any]) -> Optional[int]:
+        return self._post_with_missing_column_fallback(
+            "analyst_confirmation_history",
+            payload,
+            self._OPTIONAL_ANALYST_CONFIRMATION_COLUMNS,
+            "analyst confirmation history",
+        )
+
+    def update_analyst_confirmation_history(self, row_id: int, payload: Dict[str, Any]) -> None:
+        self._patch_with_missing_column_fallback(
+            "analyst_confirmation_history",
+            {"id": row_id},
+            payload,
+            self._OPTIONAL_ANALYST_CONFIRMATION_COLUMNS,
+            "analyst confirmation history",
+        )
+
+    def insert_analyst_trade_review(self, payload: Dict[str, Any]) -> Optional[int]:
+        return self._post_with_missing_column_fallback(
+            "analyst_trade_reviews",
+            payload,
+            self._OPTIONAL_ANALYST_TRADE_REVIEW_COLUMNS,
+            "analyst trade review",
+        )
+
+    def bulk_insert_analyst_scenarios(self, rows: List[Dict[str, Any]]) -> int:
+        return self._bulk_insert_with_optional_fallback(
+            "analyst_scenario_history",
+            rows,
+            self._OPTIONAL_ANALYST_SCENARIO_COLUMNS,
+            "analyst scenario history",
+        )
+
+    def bulk_insert_analyst_confirmations(self, rows: List[Dict[str, Any]]) -> int:
+        return self._bulk_insert_with_optional_fallback(
+            "analyst_confirmation_history",
+            rows,
+            self._OPTIONAL_ANALYST_CONFIRMATION_COLUMNS,
+            "analyst confirmation history",
+        )
+
+    def bulk_insert_analyst_trade_reviews(self, rows: List[Dict[str, Any]]) -> int:
+        return self._bulk_insert_with_optional_fallback(
+            "analyst_trade_reviews",
+            rows,
+            self._OPTIONAL_ANALYST_TRADE_REVIEW_COLUMNS,
+            "analyst trade review",
+        )
+
+    def get_analyst_replay_run(self, run_id: int) -> Optional[Dict]:
+        if not self._sb:
+            return None
+        rows = self._sb._get("analyst_replay_runs", {"id": f"eq.{run_id}"}, limit=1)
+        return rows[0] if rows else None
+
+    def get_latest_analyst_replay_run(self) -> Optional[Dict]:
+        if not self._sb:
+            return None
+        rows = self._sb._get("analyst_replay_runs", {"order": "id.desc"}, limit=1)
+        return rows[0] if rows else None
+
+    def get_analyst_scenario_rows(
+        self,
+        *,
+        run_id: Optional[int] = None,
+        source: Optional[str] = None,
+        limit: int = 20000,
+    ) -> List[Dict]:
+        if not self._sb:
+            return []
+        params: Dict[str, str] = {"order": "id.asc"}
+        if run_id is not None:
+            params["run_id"] = f"eq.{run_id}"
+        if source:
+            params["source"] = f"eq.{source}"
+        return self._sb._get("analyst_scenario_history", params, limit=limit)
+
+    def get_analyst_confirmation_rows(
+        self,
+        *,
+        run_id: Optional[int] = None,
+        source: Optional[str] = None,
+        limit: int = 20000,
+    ) -> List[Dict]:
+        if not self._sb:
+            return []
+        params: Dict[str, str] = {"order": "id.asc"}
+        if run_id is not None:
+            params["run_id"] = f"eq.{run_id}"
+        if source:
+            params["source"] = f"eq.{source}"
+        return self._sb._get("analyst_confirmation_history", params, limit=limit)
+
+    def get_analyst_trade_reviews(
+        self,
+        *,
+        run_id: Optional[int] = None,
+        symbol: Optional[str] = None,
+        limit: int = 20000,
+    ) -> List[Dict]:
+        if not self._sb:
+            return []
+        params: Dict[str, str] = {"order": "created_at.asc"}
+        if run_id is not None:
+            params["run_id"] = f"eq.{run_id}"
+        if symbol:
+            params["symbol"] = f"eq.{symbol}"
+        return self._sb._get("analyst_trade_reviews", params, limit=limit)
+
+    def get_analyst_learning_profile(self, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        context = context or {}
+        rows = self.get_analyst_trade_reviews(limit=20000)
+        filtered: List[Dict[str, Any]] = []
+        for row in rows:
+            if context.get("scenario_type") and row.get("scenario_type") != context["scenario_type"]:
+                continue
+            if context.get("confirmation_type") and row.get("confirmation_type") != context["confirmation_type"]:
+                continue
+            if context.get("direction") and row.get("direction") != context["direction"]:
+                continue
+            if context.get("session_name") and row.get("session_name") != context["session_name"]:
+                continue
+            if context.get("h4_bias") and row.get("h4_bias") != context["h4_bias"]:
+                continue
+            if context.get("h1_bias") and row.get("h1_bias") != context["h1_bias"]:
+                continue
+            if context.get("market_condition") and row.get("market_condition") != context["market_condition"]:
+                continue
+            filtered.append(row)
+
+        rows = filtered or rows
+        sample_size = len(rows)
+        wins = sum(1 for row in rows if str(row.get("result") or "").upper() in {"WIN", "STRONG_WIN", "BREAKEVEN_WIN"})
+        losses = sum(1 for row in rows if str(row.get("result") or "").upper() == "LOSS")
+        tp1_rate = round((sum(1 for row in rows if row.get("tp1_hit")) / sample_size) * 100.0, 2) if sample_size else 0.0
+        tp2_rate = round((sum(1 for row in rows if row.get("tp2_hit")) / sample_size) * 100.0, 2) if sample_size else 0.0
+        tp3_rate = round((sum(1 for row in rows if row.get("tp3_hit")) / sample_size) * 100.0, 2) if sample_size else 0.0
+        net_pips = round(sum(float(row.get("pips_result") or 0.0) for row in rows), 2)
+        avg_pips = round(net_pips / sample_size, 2) if sample_size else 0.0
+        if sample_size >= 50:
+            confidence_tier = "high"
+        elif sample_size >= 25:
+            confidence_tier = "medium"
+        elif sample_size >= 10:
+            confidence_tier = "low"
+        else:
+            confidence_tier = "insufficient_sample"
+        win_rate = round((wins / sample_size) * 100.0, 2) if sample_size else 0.0
+        recommended_action = "allow"
+        if sample_size >= 10 and win_rate < 35.0:
+            recommended_action = "block"
+        elif sample_size >= 10 and win_rate < 50.0:
+            recommended_action = "caution"
+        elif sample_size >= 10 and win_rate >= 65.0:
+            recommended_action = "boost"
+        return {
+            "profile_used": ":".join(
+                [
+                    str(context.get("scenario_type", "any")),
+                    str(context.get("confirmation_type", "any")),
+                    str(context.get("direction", "any")),
+                    str(context.get("session_name", "any")),
+                ]
+            ),
+            "sample_size": sample_size,
+            "win_rate": win_rate,
+            "tp1_rate": tp1_rate,
+            "tp2_rate": tp2_rate,
+            "tp3_rate": tp3_rate,
+            "loss_rate": round((losses / sample_size) * 100.0, 2) if sample_size else 0.0,
+            "avg_pips": avg_pips,
+            "net_pips": net_pips,
+            "confidence_tier": confidence_tier,
+            "recommended_action": recommended_action,
+            "recommended_weight": 1.15 if recommended_action == "boost" else 0.75 if recommended_action == "block" else 0.9 if recommended_action == "caution" else 1.0,
+        }
+
+    def _bulk_insert_with_optional_fallback(
+        self,
+        table: str,
+        rows: List[Dict[str, Any]],
+        optional_columns: frozenset[str],
+        context_label: str,
+    ) -> int:
+        if not rows:
+            return 0
+        if not self._sb:
+            inserted = 0
+            for row in rows:
+                if self._post_with_missing_column_fallback(table, row, optional_columns, context_label) is not None:
+                    inserted += 1
+            return inserted
+        try:
+            payload = [dict(row) for row in rows]
+            self._sb._post_many(table, payload)
+            return len(rows)
+        except Exception as exc:
+            logger.warning("%s bulk insert fallback to row-wise: %s", context_label, exc)
+            inserted = 0
+            for row in rows:
+                if self._post_with_missing_column_fallback(table, row, optional_columns, context_label) is not None:
+                    inserted += 1
+            return inserted
 
     def create_multi_strategy_replay_run(self, payload: Dict[str, Any]) -> Optional[int]:
         return self._post_with_missing_column_fallback(
@@ -1315,6 +1824,150 @@ class Database:
                 self._sb._upsert("strategy_learning_profiles", minimal, on_conflict="profile_key")
             except Exception:
                 logger.warning("strategy_learning_profiles upsert failed: %s", exc)
+
+    def insert_strategy_learning_trade(self, payload: Dict[str, Any]) -> Optional[int]:
+        if not self._sb:
+            return None
+        payload = dict(payload)
+        payload["strategy_type"] = canonical_strategy_type(payload.get("strategy_type"))
+        if payload.get("export_key") is None:
+            activated_at = str(payload.get("activated_at") or "")
+            entry = payload.get("entry")
+            direction = payload.get("direction")
+            final_result = payload.get("final_result")
+            payload["export_key"] = ":".join(
+                [
+                    str(payload.get("strategy_type") or ""),
+                    str(payload.get("source") or ""),
+                    str(payload.get("source_run_id") or ""),
+                    str(payload.get("symbol") or ""),
+                    str(direction or ""),
+                    activated_at,
+                    str(entry if entry is not None else ""),
+                    str(final_result or ""),
+                ]
+            )
+        try:
+            row = self._sb._upsert("strategy_learning_trades", payload, on_conflict="export_key")
+            return row.get("id") if row else None
+        except Exception as exc:
+            if "export_key" not in str(exc).lower() and "on_conflict" not in str(exc).lower():
+                return self._post_with_missing_column_fallback(
+                    "strategy_learning_trades",
+                    payload,
+                    self._OPTIONAL_STRATEGY_LEARNING_TRADE_COLUMNS,
+                    "strategy learning trade",
+                    self._REQUIRED_STRATEGY_LEARNING_TRADE_COLUMNS,
+                )
+            logger.warning("strategy_learning_trades upsert unavailable or schema-missing, falling back to insert: %s", exc)
+        return self._post_with_missing_column_fallback(
+            "strategy_learning_trades",
+            payload,
+            self._OPTIONAL_STRATEGY_LEARNING_TRADE_COLUMNS,
+            "strategy learning trade",
+            self._REQUIRED_STRATEGY_LEARNING_TRADE_COLUMNS,
+        )
+
+    def get_strategy_learning_trades(
+        self,
+        *,
+        strategy_type: Optional[str] = None,
+        source: Optional[str] = None,
+        source_run_id: Optional[int] = None,
+        limit: int = 5000,
+    ) -> List[Dict]:
+        if not self._sb:
+            return []
+        params: Dict[str, str] = {"order": "closed_at.desc.nullslast,created_at.desc"}
+        if strategy_type:
+            params["strategy_type"] = f"eq.{strategy_type}"
+        if source:
+            params["source"] = f"eq.{source}"
+        if source_run_id is not None:
+            params["source_run_id"] = f"eq.{source_run_id}"
+        try:
+            return self._sb._get("strategy_learning_trades", params, limit=limit)
+        except Exception as exc:
+            if "400" in str(exc) and "order=" in str(exc):
+                logger.warning("STRATEGY LEARNING FETCH FALLBACK: retrying without nullslast")
+            fallback = dict(params)
+            fallback["order"] = "closed_at.desc,created_at.desc"
+            try:
+                return self._sb._get("strategy_learning_trades", fallback, limit=limit)
+            except Exception as fallback_exc:
+                logger.warning("strategy_learning_trades fetch failed: %s", fallback_exc)
+                return []
+
+    def get_strategy_learning_profiles(
+        self,
+        *,
+        strategy_type: Optional[str] = None,
+        limit: int = 500,
+    ) -> List[Dict]:
+        if not self._sb:
+            return []
+        params: Dict[str, str] = {"order": "sample_size.desc"}
+        if strategy_type:
+            params["strategy_type"] = f"eq.{strategy_type}"
+        try:
+            return self._sb._get("strategy_learning_profiles", params, limit=limit)
+        except Exception as exc:
+            logger.warning("strategy_learning_profiles fetch failed: %s", exc)
+            return []
+
+    def rebuild_strategy_learning_profiles(self, strategy_type: Optional[str] = None) -> Dict[str, int]:
+        trades = [
+            row for row in self.get_strategy_learning_trades(strategy_type=strategy_type, limit=20000)
+            if row.get("learning_valid", True)
+            and row.get("final_result") is not None
+            and row.get("final_pips") is not None
+        ]
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for row in trades:
+            key_parts = [
+                row.get("strategy_type") or "unknown",
+                row.get("session_name") or "unknown",
+                row.get("timeframe") or "unknown",
+                row.get("direction") or "unknown",
+                row.get("dominant_bias") or "unknown",
+                row.get("bias_strength") or "unknown",
+                row.get("confirmation_type") or "unknown",
+            ]
+            grouped["|".join(str(part) for part in key_parts)] = grouped.get("|".join(str(part) for part in key_parts), []) + [row]
+
+        upserts = 0
+        for profile_key, items in grouped.items():
+            wins = sum(1 for item in items if str(item.get("final_result")).upper() != "LOSS")
+            losses = sum(1 for item in items if str(item.get("final_result")).upper() == "LOSS")
+            sample_size = len(items)
+            tp1_hits = sum(1 for item in items if int(item.get("tp_progress") or 0) >= 1)
+            net_pips = sum(float(item.get("final_pips") or 0.0) for item in items)
+            reward_avg = sum(float(item.get("reward_score") or 0.0) for item in items) / sample_size if sample_size else 0.0
+            strategy_name, session_name, timeframe, direction, dominant_bias, bias_strength, confirmation_type = profile_key.split("|", 6)
+            payload = {
+                "strategy_type": strategy_name,
+                "symbol": items[0].get("symbol", "XAUUSD"),
+                "session_name": session_name,
+                "timeframe": timeframe,
+                "direction": direction,
+                "dominant_bias": dominant_bias,
+                "bias_strength": bias_strength,
+                "confirmation_type": confirmation_type,
+                "sample_size": sample_size,
+                "wins": wins,
+                "losses": losses,
+                "win_rate": round((wins / sample_size) * 100, 2) if sample_size else 0.0,
+                "tp1_rate": round((tp1_hits / sample_size) * 100, 2) if sample_size else 0.0,
+                "net_pips": round(net_pips, 2),
+                "avg_pips": round(net_pips / sample_size, 2) if sample_size else 0.0,
+                "reward_score_avg": round(reward_avg, 3),
+                "recommended_weight": round(min(1.35, max(0.65, 0.85 + (((wins / sample_size) if sample_size else 0.5) - 0.5))), 3),
+                "confidence_tier": "high" if sample_size >= 20 and wins / sample_size >= 0.6 else "medium" if sample_size >= 8 else "low",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self.upsert_strategy_learning_profile(profile_key, payload)
+            upserts += 1
+        return {"profiles_upserted": upserts, "trades_considered": len(trades)}
 
     def upsert_performance(self, level_type: str, tf_pair: str,
                            wins: int, losses: int, reward: float):
@@ -1438,7 +2091,12 @@ class Database:
                     id, symbol, direction, timeframe_pair, entry_price, stop_loss,
                     tp1, tp2, tp3, bias, confirmation_type, session, notes,
                     activation_mode, move_sl_to_be_after_tp1, enable_telegram_alerts,
-                    high_priority, status, created_at, updated_at
+                    high_priority, status, source, strategy_type, setup_type,
+                    tracking_enabled, tracking_status, confirmation_required,
+                    telegram_alert_sent, telegram_alert_sent_at, telegram_error,
+                    last_alert_type, last_alert_time, current_price,
+                    distance_to_entry_pips, closed_at, completed_at, cancelled_at,
+                    failed_at, archived_at, completion_note, created_at, updated_at
                 FROM manual_setups
                 ORDER BY updated_at DESC
                 LIMIT %s
@@ -1465,8 +2123,27 @@ class Database:
                     "enable_telegram_alerts": row[15],
                     "high_priority": row[16],
                     "status": row[17],
-                    "created_at": str(row[18]) if row[18] else None,
-                    "updated_at": str(row[19]) if row[19] else None,
+                    "source": row[18],
+                    "strategy_type": row[19],
+                    "setup_type": row[20],
+                    "tracking_enabled": row[21],
+                    "tracking_status": row[22],
+                    "confirmation_required": row[23],
+                    "telegram_alert_sent": row[24],
+                    "telegram_alert_sent_at": str(row[25]) if row[25] else None,
+                    "telegram_error": row[26],
+                    "last_alert_type": row[27],
+                    "last_alert_time": str(row[28]) if row[28] else None,
+                    "current_price": float(row[29]) if row[29] is not None else None,
+                    "distance_to_entry_pips": float(row[30]) if row[30] is not None else None,
+                    "closed_at": str(row[31]) if row[31] else None,
+                    "completed_at": str(row[32]) if row[32] else None,
+                    "cancelled_at": str(row[33]) if row[33] else None,
+                    "failed_at": str(row[34]) if row[34] else None,
+                    "archived_at": str(row[35]) if row[35] else None,
+                    "completion_note": row[36],
+                    "created_at": str(row[37]) if row[37] else None,
+                    "updated_at": str(row[38]) if row[38] else None,
                 }
                 for row in rows
             ]

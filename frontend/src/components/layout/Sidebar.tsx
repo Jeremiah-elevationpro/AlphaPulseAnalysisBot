@@ -15,7 +15,27 @@ import {
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useSidebar } from "@/hooks/use-sidebar"
+import { useBotStatus } from "@/hooks/use-data"
 import { StatusDot } from "@/components/ui/status-dot"
+
+const STRATEGY_SHORT: Record<string, string> = {
+  gap_liquidity_sweep_reclaim: "Gap",
+  engulfing_rejection: "Engulf",
+  standard_break_retest: "BRT",
+  failed_engulf_break_retest: "FE",
+}
+
+function buildStrategyLabel(strategies: string[] | null | undefined): string {
+  if (!strategies || strategies.length === 0) return "Gap Only"
+  if (strategies.length === 1) {
+    const short = STRATEGY_SHORT[strategies[0]] ?? "Strategy"
+    return `${short} Only`
+  }
+  if (strategies.length <= 3) {
+    return strategies.map((s) => STRATEGY_SHORT[s] ?? s).join(" + ")
+  }
+  return `${strategies.length} Strategies`
+}
 
 interface NavItem {
   to: string
@@ -37,6 +57,10 @@ const NAV_SYSTEM: NavItem[] = [{ to: "/settings", icon: Settings, label: "Settin
 
 export function Sidebar() {
   const { collapsed, toggle } = useSidebar()
+  const botStatus = useBotStatus()
+  const liveStrategies = botStatus.data?.data?.liveEnabledStrategies
+  const strategyLabel = buildStrategyLabel(liveStrategies)
+  const symbol = botStatus.data?.symbol ?? "XAUUSD"
 
   return (
     <motion.aside
@@ -88,7 +112,7 @@ export function Sidebar() {
             <StatusDot status="online" pulse size="sm" />
             <div className="min-w-0">
               <div className="text-xs font-semibold leading-tight text-foreground">Spencer Online</div>
-              <div className="mt-0.5 text-[10px] font-mono leading-tight text-muted-foreground">Gap Only · XAUUSD</div>
+              <div className="mt-0.5 text-[10px] font-mono leading-tight text-muted-foreground">{strategyLabel} · {symbol}</div>
             </div>
             <Cpu className="ml-auto h-3 w-3 flex-shrink-0 text-purple-300" />
           </div>

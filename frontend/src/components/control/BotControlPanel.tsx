@@ -12,8 +12,26 @@ export function BotControlPanel() {
   const stopBot = useStopBot()
   const restartBot = useRestartBot()
   const toast = useToast()
+  const statusData = data?.data
   const isRunning = data?.status === "online" || data?.status === "analyzing" || data?.status === "watching"
   const startLabel = isRunning ? "Spencer Running" : data?.status === "starting" ? "Starting Spencer" : "Start Spencer"
+  const rejectReason = statusData?.lastRejectReason ?? null
+  const duplicateLike = rejectReason === "all_alerted" || rejectReason === "duplicate"
+  const lastScanDisplay = duplicateLike
+    ? "All current setups already alerted"
+    : (statusData?.watchlistCandidates ?? 0) > 0
+    ? "Watchlist setups found"
+    : statusData?.lastScanResult ?? data?.last_scan_result ?? "--"
+  const telegramDisplay =
+    statusData?.lastTelegramStatus === "success"
+      ? "Success"
+      : statusData?.lastTelegramStatus === "failed"
+      ? "Failed"
+      : statusData?.lastTelegramStatus === "none" && (statusData?.totalAlertsSent ?? 0) > 0
+      ? "Success"
+      : statusData?.lastTelegramStatus === "none"
+      ? "Idle"
+      : statusData?.lastTelegramStatus ?? "--"
 
   async function handleStart() {
     try {
@@ -110,43 +128,44 @@ export function BotControlPanel() {
           <Info label="Last Stopped" value={formatDateTime(data?.last_stopped_at)} />
           <Info label="Strategy Mode" value={data?.strategy_mode ?? "hybrid"} />
           <Info label="Current Symbol" value={data?.symbol ?? "XAUUSD"} />
-          <Info label="Market Session" value={formatSessionLabel(data?.session ?? data?.data?.currentSession)} />
-          <Info label="Operating Mode" value={data?.data?.operatingMode === "24_7" ? "24/7 — Always Active" : (data?.data?.operatingMode ?? "24/7")} />
-          <Info label="Scan Active" value="Yes — 24/7 Mode" />
-          <Info label="Local Time" value={data?.data?.localTime ?? "--"} />
-          <Info label="Last Heartbeat" value={formatDateTime(data?.data?.lastHeartbeatAt ?? data?.last_heartbeat_at)} />
-          <Info label="Last Scan" value={formatDateTime(data?.data?.lastScanAt ?? data?.last_scan_at)} />
-          <Info label="Last Scan Number" value={data?.data?.lastScanNumber != null ? String(data.data.lastScanNumber) : "--"} />
-          <Info label="Last Scan Result" value={data?.data?.lastScanResult ?? data?.last_scan_result ?? "--"} />
-          <Info label="Candidates Found" value={data?.data?.lastCandidatesCount != null ? String(data.data.lastCandidatesCount) : "--"} />
-          <Info label="Alerts Sent" value={data?.data?.lastAlertsSent != null ? String(data.data.lastAlertsSent) : "--"} />
-          <Info label="Reject Reason" value={data?.data?.lastRejectReason || "--"} />
-          <Info label="Telegram Status" value={data?.data?.lastTelegramStatus || "--"} />
-          {data?.data?.lastTelegramError && (
-            <Info label="Telegram Error" value={data.data.lastTelegramError} />
-          )}
-          {data?.data?.instanceId && (
-            <Info label="Active Instance ID" value={String(data.data.instanceId)} />
-          )}
-          {data?.data?.processId != null && (
-            <Info label="Process ID" value={String(data.data.processId)} />
-          )}
+          <Info label="Market Session" value={formatSessionLabel(data?.session ?? statusData?.marketSession ?? statusData?.currentSession)} />
+          <Info label="Operating Mode" value={statusData?.operatingMode === "24_7" ? "24/7 Always Active" : (statusData?.operatingMode ?? "24/7")} />
+          <Info label="Scan Allowed" value={statusData?.scanAllowed ? "Yes" : "No"} />
+          <Info label="Local Time" value={statusData?.localTime ?? "--"} />
+          <Info label="Last Heartbeat" value={formatDateTime(statusData?.lastHeartbeatAt ?? data?.last_heartbeat_at)} />
+          <Info label="Last Scan" value={formatDateTime(statusData?.lastScanAt ?? data?.last_scan_at)} />
+          <Info label="Last Scan Number" value={statusData?.lastScanNumber != null ? String(statusData.lastScanNumber) : "--"} />
+          <Info label="Last Scan Result" value={lastScanDisplay} />
+          <Info label="Current Scan New Candidates" value={statusData?.watchlistCandidates != null ? String(statusData.watchlistCandidates) : "--"} />
+          <Info label="Already Alerted / Duplicates" value={statusData?.dedupeRejections != null ? String(statusData.dedupeRejections) : "--"} />
+          <Info label="Alerts Sent This Scan" value={statusData?.alertsSentThisScan != null ? String(statusData.alertsSentThisScan) : "--"} />
+          <Info label="Total Alerts This Instance" value={statusData?.totalAlertsSent != null ? String(statusData.totalAlertsSent) : "--"} />
+          <Info label="Telegram Status" value={telegramDisplay} />
+          <Info
+            label="Last Telegram Alert"
+            value={
+              statusData?.lastTelegramAlertType
+                ? `${statusData.lastTelegramAlertType}${statusData.lastTelegramAlertTime ? ` · ${new Date(statusData.lastTelegramAlertTime).toLocaleString()}` : ""}`
+                : "Idle"
+            }
+          />
+          {statusData?.lastTelegramError && <Info label="Telegram Error" value={statusData.lastTelegramError} />}
+          {statusData?.instanceId && <Info label="Active Instance ID" value={String(statusData.instanceId)} />}
+          {statusData?.processId != null && <Info label="Process ID" value={String(statusData.processId)} />}
         </div>
 
-        {data?.data?.sessionBlocking && (
+        {statusData?.sessionBlocking && (
           <div className="rounded-xl border border-sell/25 bg-sell/8 px-4 py-3 text-sm">
             <div className="label-xs text-sell">Session Warning</div>
-            <div className="mt-2 font-medium text-sell">
-              Session blocking is active — check operating mode configuration.
-            </div>
+            <div className="mt-2 font-medium text-sell">Session blocking is active — check operating mode configuration.</div>
           </div>
         )}
 
-        {(data?.data?.lastError || data?.data?.errorMessage || data?.last_error || data?.error_message) && (
+        {(statusData?.lastError || statusData?.errorMessage || data?.last_error || data?.error_message) && (
           <div className="rounded-xl border border-sell/25 bg-sell/8 px-4 py-3 text-sm">
             <div className="label-xs text-sell">Last Error</div>
             <div className="mt-2 font-medium text-sell">
-              {data?.data?.lastError ?? data?.data?.errorMessage ?? data?.last_error ?? data?.error_message}
+              {statusData?.lastError ?? statusData?.errorMessage ?? data?.last_error ?? data?.error_message}
             </div>
           </div>
         )}

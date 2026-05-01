@@ -24,29 +24,39 @@ import {
   useAlerts,
   useAnalytics,
   useBotStatus,
+  useDataHealth,
   useHealth,
+  useLearningProfiles,
   useMarketContext,
   useSignals,
   useTrades,
 } from "@/hooks/use-data"
+import type { LearningProfileSummary } from "@/lib/api"
 import { cn } from "@/lib/utils"
 
 export default function Dashboard() {
   const health = useHealth()
+  const dataHealth = useDataHealth()
   const analytics = useAnalytics()
   const signals = useSignals(6)
   const trades = useActiveTrades(6)
   const allTrades = useTrades("all", 200)
   const alerts = useAlerts(6)
   const botStatus = useBotStatus()
+  const learningProfiles = useLearningProfiles()
   const isBotOnline = ["online", "analyzing", "watching", "starting"].includes(botStatus.data?.status ?? "")
   const market = useMarketContext(botStatus.data?.symbol ?? "XAUUSD", isBotOnline)
 
   const metrics = analytics.data?.metrics
   const marketContext = market.data
   const dominantBias = marketContext?.bias?.dominant ?? "neutral"
-  const botWindowActive = Boolean(marketContext?.session?.botWindowActive)
   const strategyStats = useMemo(() => buildStrategyStats(allTrades.data?.trades ?? []), [allTrades.data?.trades])
+  const learningMap = useMemo(
+    () => Object.fromEntries((learningProfiles.data?.profiles ?? []).map((profile) => [profile.strategy_type, profile])),
+    [learningProfiles.data?.profiles]
+  )
+  const marketPlan = botStatus.data?.data?.marketPlan
+  const fiveLayerStatus = botStatus.data?.data?.fiveLayerStatus
 
   return (
     <div className="space-y-5 p-4 md:p-6">
@@ -94,12 +104,12 @@ export default function Dashboard() {
           icon={Activity}
           title="AlphaPulse Engine Status"
           subtitle={health.isLoading ? "Checking runtime" : `v${health.data?.version ?? "1.0.0"}`}
-          accent={health.data?.status === "ok" ? "buy" : "sell"}
+          accent={isEngineHealthy(health.data?.status) ? "buy" : "sell"}
         >
           <div className="flex items-center justify-between">
             <div className="inline-flex items-center gap-2 text-xs font-semibold">
-              <StatusDot status={health.data?.status === "ok" ? "online" : "offline"} pulse />
-              {health.isLoading ? "Loading..." : health.data?.status === "ok" ? "Online & Running" : "Degraded"}
+              <StatusDot status={isEngineHealthy(health.data?.status) ? "online" : "offline"} pulse />
+              {health.isLoading ? "Loading..." : isEngineHealthy(health.data?.status) ? "Online & Running" : "Degraded"}
             </div>
             <span className="text-[10px] text-muted-foreground">
               {health.data?.timestamp ? new Date(health.data.timestamp).toLocaleTimeString() : "--"}
@@ -107,7 +117,11 @@ export default function Dashboard() {
           </div>
           <InfoRow label="Database" value={health.data?.db_connected ? "Connected" : "Disconnected"} />
           <InfoRow label="Active Trades" value={String(health.data?.active_trades ?? 0)} mono />
-          <InfoRow label="Uptime" value={health.data ? `${Math.floor(health.data.uptime / 60)}m` : "--"} mono />
+          <InfoRow label="Uptime" value={formatUptime(health.data)} mono />
+          <InfoRow label="Data Health" value={dataHealth.data?.warnings?.length ? "Warnings" : "Healthy"} />
+          <div className="pt-1">
+            <Badge variant="outline" className="text-[10px]">Source: Live Bot</Badge>
+          </div>
         </StatusCard>
 
         <StatusCard
@@ -141,12 +155,16 @@ export default function Dashboard() {
           />
           <InfoRow label="Local Time" value={marketContext?.session?.localTime ?? "—"} mono />
           <InfoRow label="Last Updated" value={marketContext?.timestamp ? new Date(marketContext.timestamp).toLocaleTimeString() : "Unavailable"} mono />
+          <div className="pt-1 flex flex-wrap gap-2">
+            <Badge variant="outline" className="text-[10px]">Source: Live Bot</Badge>
+            {marketContext?.source ? <Badge variant="gold" className="text-[10px]">{marketContext.source}</Badge> : null}
+          </div>
         </StatusCard>
 
         <StatusCard
           icon={BarChart2}
-          title="Replay Edge"
-          subtitle={analytics.isLoading ? "Loading performance" : "Latest replay-backed metrics"}
+          title="Learning / Replay Performance"
+          subtitle={analytics.isLoading ? "Loading performance" : "Secondary to live analyst context"}
           accent="gold"
         >
           <InfoRow label="Win Rate" value={`${metrics?.win_rate ?? 0}%`} mono valueClass="text-buy" />
@@ -158,6 +176,13 @@ export default function Dashboard() {
             valueClass={(metrics?.net_pips ?? 0) >= 0 ? "text-buy" : "text-sell"}
           />
           <InfoRow label="Avg Pips / Trade" value={`${metrics?.avg_pips_per_trade ?? 0}`} mono />
+          <div className="pt-1 flex flex-wrap gap-2">
+            {(analytics.data?.sources ?? []).map((source) => (
+              <Badge key={source.key} variant={source.tone === "buy" ? "buy" : source.tone === "gold" ? "gold" : source.tone === "warn" ? "sell" : source.tone === "purple" ? "purple" : "outline"} className="text-[10px]">
+                Source: {source.label}
+              </Badge>
+            ))}
+          </div>
         </StatusCard>
       </div>
 
@@ -173,9 +198,117 @@ export default function Dashboard() {
         <MetricCard label="Replay Trades" value={String(metrics?.total_trades ?? 0)} accent="gold" />
       </div>
 
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle>Strategy Live Status</CardTitle>
+        </CardHeader>
+        <CardContent className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+          {[
+            "gap_liquidity_sweep_reclaim",
+            "engulfing_rejection",
+            "standard_break_retest",
+            "failed_engulf_break_retest",
+          ].map((strategy) => {
+            const scan = botStatus.data?.data?.strategyScans?.[strategy]
+            const enabled = scan?.enabled ?? botStatus.data?.data?.liveEnabledStrategies?.includes(strategy) ?? false
+            const researchOnly = botStatus.data?.data?.researchOnlyStrategies?.includes(strategy) || scan?.mode === "research_only"
+            return (
+              <div key={strategy} className="rounded-lg border border-ap-border bg-ap-surface/35 px-3 py-3">
+                <div className="flex items-center justify-between">
+                  <div className="text-sm font-semibold text-foreground">{formatStrategy(strategy)}</div>
+                  <Badge variant={researchOnly ? "outline" : enabled ? "buy" : "gold"} className="text-[10px]">
+                    {researchOnly ? "Research Only" : enabled ? "Classifier / Live Enabled" : "Disabled"}
+                  </Badge>
+                </div>
+                <div className="mt-3 space-y-1.5 text-[11px] text-muted-foreground">
+                  <div>Scans run: {scan?.scans_run ?? 0}</div>
+                  <div>Candidates: {scan?.candidates_found ?? 0}</div>
+                  <div>Watchlists: {scan?.watchlist_alerts_sent ?? 0}</div>
+                  <div>Entries: {scan?.entry_alerts_sent ?? scan?.alerts_sent ?? 0}</div>
+                  <div>Alerts failed: {scan?.alerts_failed ?? 0}</div>
+                  <div>Duplicates: {scan?.duplicates_blocked ?? 0}</div>
+                  <div>Last result: {scan?.last_result ?? "--"}</div>
+                  <div>Reject: {scan?.last_reject_reason || "--"}</div>
+                </div>
+              </div>
+            )
+          })}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle>Spencer Market Analyst</CardTitle>
+        </CardHeader>
+        <CardContent className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+          <div className="space-y-2 rounded-lg border border-ap-border bg-ap-surface/35 p-4">
+            <div className="text-xs font-semibold text-gold-300">Current Bias</div>
+            <div className={cn("text-sm font-semibold", biasColor(marketPlan?.dominant_bias))}>
+              {formatBiasLabel(marketPlan?.dominant_bias)} {marketPlan?.bias_strength ? `(${marketPlan.bias_strength})` : ""}
+            </div>
+            <Separator />
+            <InfoRow label="H4 Context" value={marketPlan?.h4_context ?? "Waiting for market plan"} />
+            <InfoRow label="H1 Context" value={marketPlan?.h1_context ?? "—"} />
+            <InfoRow label="M15 Context" value={marketPlan?.m15_context ?? "—"} />
+            <InfoRow
+              label="Waiting For"
+              value={(marketPlan?.confirmation_waiting_for ?? []).slice(0, 5).join(" / ") || "sweep reclaim / failed retest / break-retest close / displacement"}
+            />
+          </div>
+          <div className="space-y-2 rounded-lg border border-ap-border bg-ap-surface/35 p-4">
+            <div className="text-xs font-semibold text-gold-300">Scenario Map</div>
+            <InfoRow
+              label="Primary"
+              value={marketPlan?.primary_scenario ? `${marketPlan.primary_scenario.direction} ${marketPlan.primary_scenario.watch_zone}` : "Waiting for primary scenario"}
+            />
+            <InfoRow
+              label="Secondary"
+              value={marketPlan?.secondary_scenario ? `${marketPlan.secondary_scenario.direction} ${marketPlan.secondary_scenario.watch_zone}` : "Waiting for secondary scenario"}
+            />
+            <InfoRow
+              label="Actionable Psych"
+              value={(marketPlan?.actionable_psych_levels ?? marketPlan?.psychological_levels ?? [])
+                .slice(0, 12)
+                .map((v) => v.toFixed(2))
+                .join(" | ") || "—"}
+            />
+            <InfoRow
+              label="Key Levels"
+              value={[
+                ...(marketPlan?.key_supports ?? []).slice(0, 2).map((v) => `S ${v.toFixed(2)}`),
+                ...(marketPlan?.key_resistances ?? []).slice(0, 2).map((v) => `R ${v.toFixed(2)}`),
+              ].join(" | ") || "—"}
+            />
+            <InfoRow
+              label="Active Watch Zones"
+              value={(marketPlan?.active_watch_zones ?? [])
+                .slice(0, 3)
+                .map((zone) => `${zone.direction} ${zone.level_low.toFixed(2)}-${zone.level_high.toFixed(2)} (${zone.status})`)
+                .join(" | ") || "No active watch zones"}
+            />
+            <InfoRow label="Last Scenario Update" value={marketPlan?.last_updated ? new Date(marketPlan.last_updated).toLocaleString() : "—"} />
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle>Five-Layer Intelligence</CardTitle>
+        </CardHeader>
+        <CardContent className="grid grid-cols-1 gap-4 xl:grid-cols-5">
+          <LayerCard title="Market Analyst" value={String((fiveLayerStatus?.market_analyst as Record<string, unknown> | undefined)?.plan_status ?? "waiting")} detail={String((fiveLayerStatus?.market_analyst as Record<string, unknown> | undefined)?.primary_scenario ?? "No scenario yet")} />
+          <LayerCard title="Confirmation Engine" value={String((fiveLayerStatus?.confirmation_engine as Record<string, unknown> | undefined)?.status ?? "waiting")} detail={String((fiveLayerStatus?.confirmation_engine as Record<string, unknown> | undefined)?.reason ?? "Waiting for confirmation")} />
+          <LayerCard title="Learning Score" value={String((fiveLayerStatus?.learning_score as Record<string, unknown> | undefined)?.recommended_action ?? "allow")} detail={`Score ${(fiveLayerStatus?.learning_score as Record<string, unknown> | undefined)?.final_score ?? "--"}`} />
+          <LayerCard title="Decision Engine" value={String((fiveLayerStatus?.decision_engine as Record<string, unknown> | undefined)?.action ?? "wait")} detail={String((fiveLayerStatus?.decision_engine as Record<string, unknown> | undefined)?.reason ?? "Waiting")} />
+          <LayerCard title="Risk Management" value={String((fiveLayerStatus?.risk_management as Record<string, unknown> | undefined)?.current_status ?? "idle")} detail={String((fiveLayerStatus?.risk_management as Record<string, unknown> | undefined)?.final_result ?? "No active setup")} />
+        </CardContent>
+      </Card>
+
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-        <StrategySummaryCard title="Gap Sweep" stats={strategyStats.gap_sweep} />
-        <StrategySummaryCard title="Engulfing Rejection" stats={strategyStats.engulfing_rejection} />
+        <StrategySummaryCard title="Gap Sweep" stats={strategyStats.gap_liquidity_sweep_reclaim} learning={learningMap.gap_liquidity_sweep_reclaim} liveEnabled />
+        <StrategySummaryCard title="Engulfing Rejection" stats={strategyStats.engulfing_rejection} learning={learningMap.engulfing_rejection} liveEnabled />
+        <StrategySummaryCard title="Break + Retest" stats={strategyStats.standard_break_retest} learning={learningMap.standard_break_retest} liveEnabled />
+        <StrategySummaryCard title="Failed Engulf Break + Retest" stats={strategyStats.failed_engulf_break_retest} learning={learningMap.failed_engulf_break_retest} researchOnly lowSampleThreshold={20} />
       </div>
 
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
@@ -321,20 +454,54 @@ function MetricCard({ label, value, accent }: { label: string; value: string; ac
 function StrategySummaryCard({
   title,
   stats,
+  learning,
+  liveEnabled = false,
+  researchOnly = false,
+  lowSampleThreshold = 0,
 }: {
   title: string
   stats: { live: number; closed: number; wins: number; losses: number; netPips: number; winRate: string }
+  learning?: LearningProfileSummary
+  liveEnabled?: boolean
+  researchOnly?: boolean
+  lowSampleThreshold?: number
 }) {
+  const sampleSize = learning?.sample_size ?? 0
+  const isLowSample = lowSampleThreshold > 0 && sampleSize < lowSampleThreshold
+
   return (
     <Card>
       <CardHeader className="pb-3">
         <CardTitle>{title}</CardTitle>
       </CardHeader>
-      <CardContent className="grid grid-cols-2 gap-2 pt-0 md:grid-cols-4">
-        <MetaBox label="Live Setups" value={String(stats.live)} tone="gold" />
-        <MetaBox label="Wins / Losses" value={`${stats.wins}/${stats.losses}`} tone={stats.wins >= stats.losses ? "buy" : "sell"} />
-        <MetaBox label="Net Pips" value={`${stats.netPips >= 0 ? "+" : ""}${stats.netPips.toFixed(1)}`} tone={stats.netPips >= 0 ? "buy" : "sell"} />
-        <MetaBox label="Win Rate" value={stats.winRate} tone="gold" />
+      <CardContent className="space-y-3 pt-0">
+        <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+          <MetaBox label="Live Setups" value={String(stats.live)} tone="gold" />
+          <MetaBox label="Wins / Losses" value={`${stats.wins}/${stats.losses}`} tone={stats.wins >= stats.losses ? "buy" : "sell"} />
+          <MetaBox label="Net Pips" value={`${stats.netPips >= 0 ? "+" : ""}${stats.netPips.toFixed(1)}`} tone={stats.netPips >= 0 ? "buy" : "sell"} />
+          <MetaBox label="Win Rate" value={stats.winRate} tone="gold" />
+        </div>
+        <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+          <MetaBox label="Learning Sample" value={String(sampleSize)} tone="gold" />
+          <MetaBox label="Learning Win Rate" value={learning ? `${learning.win_rate.toFixed(1)}%` : "No data"} tone={learning && learning.win_rate >= 50 ? "buy" : "gold"} />
+          <MetaBox label="Best Session" value={learning?.best_session ? formatSessionName(learning.best_session) : "No data"} tone="gold" />
+          <MetaBox label="Best Timeframe" value={learning?.best_timeframe ?? "No data"} tone="gold" />
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Badge variant="outline" className="text-[10px]">Source: Strategy Learning</Badge>
+          {researchOnly ? (
+            <>
+              <Badge variant="outline" className="text-[10px]">Research Only</Badge>
+              {isLowSample && <Badge variant="gold" className="text-[10px]">Low Sample</Badge>}
+            </>
+          ) : liveEnabled ? (
+            <Badge variant="buy" className="text-[10px]">Live: Enabled</Badge>
+          ) : (
+            <Badge variant="gold" className="text-[10px]">
+              {learning?.status === "ready" ? "Ready" : learning?.status ?? "No data"}
+            </Badge>
+          )}
+        </div>
       </CardContent>
     </Card>
   )
@@ -410,6 +577,16 @@ function MetaBox({ label, value, tone }: { label: string; value: string; tone: "
   )
 }
 
+function LayerCard({ title, value, detail }: { title: string; value: string; detail: string }) {
+  return (
+    <div className="rounded-lg border border-ap-border bg-ap-surface/35 px-3 py-3">
+      <div className="label-xs">{title}</div>
+      <div className="mt-2 text-sm font-semibold text-foreground">{value}</div>
+      <div className="mt-1 text-xs text-muted-foreground">{detail}</div>
+    </div>
+  )
+}
+
 function formatMaybeNumber(value?: number | null) {
   return value != null ? value.toFixed(2) : "Unavailable"
 }
@@ -428,16 +605,35 @@ function formatSessionName(value?: string | null) {
 }
 
 function formatStrategy(value?: string | null) {
-  return (value ?? "gap_sweep").replace(/_/g, " ")
+  const canonical = value ?? "gap_liquidity_sweep_reclaim"
+  const labels: Record<string, string> = {
+    gap_sweep: "Gap Sweep",
+    gap_liquidity_sweep_reclaim: "Gap Sweep",
+    engulfing: "Engulfing Rejection",
+    engulfing_rejection: "Engulfing Rejection",
+    break_retest: "Break + Retest",
+    standard_break_retest: "Break + Retest",
+    failed_engulf: "Failed Engulf Break + Retest",
+    failed_engulf_break_retest: "Failed Engulf Break + Retest",
+  }
+  return labels[canonical] ?? canonical.replace(/_/g, " ")
 }
 
 function buildStrategyStats(trades: Array<{ strategy_type?: string | null; status: string; result: string | null; realized_pips?: number | null }>) {
   const seed = {
-    gap_sweep: { live: 0, closed: 0, wins: 0, losses: 0, netPips: 0 },
+    gap_liquidity_sweep_reclaim: { live: 0, closed: 0, wins: 0, losses: 0, netPips: 0 },
     engulfing_rejection: { live: 0, closed: 0, wins: 0, losses: 0, netPips: 0 },
+    standard_break_retest: { live: 0, closed: 0, wins: 0, losses: 0, netPips: 0 },
+    failed_engulf_break_retest: { live: 0, closed: 0, wins: 0, losses: 0, netPips: 0 },
   }
   for (const trade of trades) {
-    const key = trade.strategy_type === "engulfing_rejection" ? "engulfing_rejection" : "gap_sweep"
+    const key: keyof typeof seed =
+      trade.strategy_type === "gap_liquidity_sweep_reclaim" ||
+      trade.strategy_type === "engulfing_rejection" ||
+      trade.strategy_type === "standard_break_retest" ||
+      trade.strategy_type === "failed_engulf_break_retest"
+        ? trade.strategy_type
+        : "gap_liquidity_sweep_reclaim"
     const bucket = seed[key]
     const closed = ["COMPLETED", "STOP_LOSS_HIT", "CANCELLED"].includes(trade.status) || Boolean(trade.result)
     if (closed) {
@@ -450,10 +646,23 @@ function buildStrategyStats(trades: Array<{ strategy_type?: string | null; statu
     }
   }
   return {
-    gap_sweep: { ...seed.gap_sweep, winRate: seed.gap_sweep.closed ? `${Math.round((seed.gap_sweep.wins / seed.gap_sweep.closed) * 100)}%` : "0%" },
+    gap_liquidity_sweep_reclaim: {
+      ...seed.gap_liquidity_sweep_reclaim,
+      winRate: seed.gap_liquidity_sweep_reclaim.closed ? `${Math.round((seed.gap_liquidity_sweep_reclaim.wins / seed.gap_liquidity_sweep_reclaim.closed) * 100)}%` : "0%",
+    },
     engulfing_rejection: {
       ...seed.engulfing_rejection,
       winRate: seed.engulfing_rejection.closed ? `${Math.round((seed.engulfing_rejection.wins / seed.engulfing_rejection.closed) * 100)}%` : "0%",
+    },
+    standard_break_retest: {
+      ...seed.standard_break_retest,
+      winRate: seed.standard_break_retest.closed ? `${Math.round((seed.standard_break_retest.wins / seed.standard_break_retest.closed) * 100)}%` : "0%",
+    },
+    failed_engulf_break_retest: {
+      ...seed.failed_engulf_break_retest,
+      winRate: seed.failed_engulf_break_retest.closed
+        ? `${Math.round((seed.failed_engulf_break_retest.wins / seed.failed_engulf_break_retest.closed) * 100)}%`
+        : "0%",
     },
   }
 }
@@ -462,4 +671,28 @@ function biasColor(value?: string | null) {
   if (value === "bullish") return "text-buy"
   if (value === "bearish") return "text-sell"
   return "text-gold-300"
+}
+
+function isEngineHealthy(status?: string | null): boolean {
+  return status === "ok" || status === "online"
+}
+
+function formatUptime(health?: { uptime?: string; uptime_seconds?: number } | null): string {
+  if (!health) return "--"
+  // Prefer numeric seconds
+  if (typeof health.uptime_seconds === "number" && isFinite(health.uptime_seconds)) {
+    const totalMin = Math.floor(health.uptime_seconds / 60)
+    const h = Math.floor(totalMin / 60)
+    const m = totalMin % 60
+    return h > 0 ? `${h}h ${m}m` : `${m}m`
+  }
+  // Parse "HH:MM:SS" string
+  if (typeof health.uptime === "string" && health.uptime.includes(":")) {
+    const parts = health.uptime.split(":").map(Number)
+    if (parts.length === 3 && parts.every(isFinite)) {
+      const [h, m] = parts
+      return h > 0 ? `${h}h ${m}m` : `${m}m`
+    }
+  }
+  return "--"
 }

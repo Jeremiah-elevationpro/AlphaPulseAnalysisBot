@@ -27,10 +27,17 @@ import time
 import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, Optional, Set
+from typing import Any, Dict, Optional, Set
+from hashlib import sha1
 
 import pandas as pd
 
+from analysis.gold_confirmation_engine import AnalystTradeSetup, GoldConfirmationEngine, confirmation_is_fresh, quality_label_from_score
+from analysis.market_analyst import MarketAnalyst
+from learning.scoring_engine import ScoringEngine
+from execution.decision_engine import DecisionEngine
+from risk.trade_management import TradeManagementEngine
+from risk.outcome_tracker import OutcomeTracker
 from config.settings import (
     SCAN_INTERVAL_SECONDS, TIMEFRAME_PAIRS, MIN_SIGNAL_CONFIDENCE,
     WATCH_DISTANCE_PIPS, LEVEL_TOLERANCE_PIPS, PIP_SIZE,
@@ -43,6 +50,14 @@ from config.settings import (
     ENGULF_ALLOWED_LIVE_TIMEFRAMES, LIVE_ENABLED_STRATEGIES,
     RESEARCH_ONLY_STRATEGIES,
     MANUAL_SETUP_APPROACH_DISTANCE_PIPS, MANUAL_SETUP_ALERT_COOLDOWN_MINUTES,
+    MARKET_PLAN_ALERT_COOLDOWN_MINUTES, SCENARIO_UPDATE_ALERT_COOLDOWN_MINUTES,
+    LIVE_ALERT_ROUTING,
+    SPENCER_MEMORY_RETENTION_HOURS, SPENCER_RESUME_WATCH_ALERT_ENABLED,
+    MARKET_PLAN_MIN_INTERVAL_MINUTES, MARKET_PLAN_RESEND_ON_MINOR_PRICE_CHANGE,
+    ENTRY_ALERT_COOLDOWN_MINUTES, ENTRY_ZONE_DUPLICATE_TOLERANCE_PIPS,
+    MT5_NO_DATA_ALERT_COOLDOWN_MINUTES,
+    TELEGRAM_RUNTIME_ALERTS_ENABLED,
+    LIVE_ARCHITECTURE_MODE,
 )
 from data.mt5_client import MT5Client
 from strategies.strategy_manager import StrategyManager
@@ -54,6 +69,7 @@ from db.database import Database
 from learning.stats_learner import StatisticalLearner
 from learning.rl_engine import LearningEngine
 from utils.logger import get_logger, get_runtime_logger
+from utils.alert_dedupe import AlertDedupeManager
 
 logger = get_logger("AlphaPulse")
 runtime_logger = get_runtime_logger()
@@ -83,7 +99,17 @@ class AlphaPulse:
         self.context_engine = MarketContextEngine()
         # StrategyManager is created without a learning engine here;
         # _learning is wired in start() after LearningEngine is ready.
-        self.strategy_manager = StrategyManager(learning_engine=None)
+        self.strategy_manager = StrategyManager(learning_engine=None, merge_confluence=False)
+        self.market_analyst = MarketAnalyst()
+        self.gold_confirmation_engine = GoldConfirmationEngine()
+        self.scoring_engine = ScoringEngine()
+        self.decision_engine = DecisionEngine()
+        self.trade_management_engine = TradeManagementEngine()
+        self.outcome_tracker = OutcomeTracker()
+        self._analyst_run_id: Optional[int] = None
+        self._analyst_scenario_rows: Dict[str, int] = {}
+        self._analyst_confirmation_rows: Dict[str, int] = {}
+        self._analyst_reviewed_setups: Set[str] = set()
 
         self.stats_learner: Optional[StatisticalLearner] = None
         self.learning: Optional[LearningEngine] = None
@@ -104,6 +130,23 @@ class AlphaPulse:
         self._startup_time: Optional[datetime] = None
         self._analysis_complete: bool = False
         _ANALYSIS_PHASE_SECONDS = 300  # 5 minutes
+        self._last_market_plan_hash: Optional[str] = None
+        self._last_market_plan_sent_at: Optional[datetime] = None
+        self._last_scenario_update_at: Optional[datetime] = None
+        self._last_session_market_plan: Optional[str] = None
+        self._last_primary_scenario_key: Optional[str] = None
+        self._market_plan: Optional[dict] = None
+        self._watch_zone_state: Dict[str, dict] = {}
+        self._resume_watch_checked: bool = False
+        self._alert_dedupe = AlertDedupeManager(
+            ttl_hours={
+                "market_plan": 24,
+                "scenario_update": 48,
+                "analyst_entry": 48,
+                "gap_watchlist": 24,
+                "watch_zone_update": 48,
+            }
+        )
 
         # ── Signal deduplication ──────────────────────────────────────────────
         # _seen_setups    : fingerprints processed this level-cycle
@@ -130,8 +173,18 @@ class AlphaPulse:
 
         # Heartbeat file for API status sync
         self._heartbeat_file = Path(__file__).resolve().parent / "bot_heartbeat.json"
+        self._memory_file = Path(__file__).resolve().parent / "spencer_memory.json"
+        self._runtime_control_file = Path(__file__).resolve().parent / "bot_runtime_control.json"
+        self._runtime_alerts_disabled_flag = Path(__file__).resolve().parent / "runtime_alerts_disabled.flag"
         # Tracks when the last no-setup status alert was sent
         self._last_no_setup_alert_time: Optional[datetime] = None
+        self._background_tasks: Dict[str, bool] = {
+            "scan_loop": False,
+            "heartbeat_writer": False,
+            "runtime_alerts": False,
+            "market_analyst_loop": False,
+            "watchlist_loop": False,
+        }
         # Per-scan pipeline summary — written to heartbeat and SCAN COMPLETE log
         self._last_scan_summary: dict = {
             "last_candidates_count": 0,
@@ -140,9 +193,85 @@ class AlphaPulse:
             "last_reject_reason":    "",
             "last_telegram_status":  "none",
             "last_telegram_error":   "",
+            "last_telegram_alert_type": "",
+            "last_telegram_alert_time": "",
             "last_scan_number":      0,
             "session_blocking":      False,
+            "levels_detected":       0,
+            "gap_levels":            0,
+            "bias_passed":           0,
+            "sweep_confirmed":       0,
+            "session_passed":        0,
+            "distance_passed":       0,
+            "watchlist_candidates":  0,
+            "dedupe_rejections":     0,
+            "instance_totals": {
+                "total_scans": 0,
+                "total_candidates_found": 0,
+                "watchlist_candidates": 0,
+                "alerts_sent": 0,
+                "alerts_failed": 0,
+                "duplicates_blocked": 0,
+                "manual_alerts_sent": 0,
+                "confirmation_alerts_sent": 0,
+            },
+            "strategy_scans": {
+                "gap_liquidity_sweep_reclaim": {
+                    "enabled": "gap_liquidity_sweep_reclaim" in LIVE_ENABLED_STRATEGIES,
+                    "scans_run": 0,
+                    "candidates_found": 0,
+                    "watchlist_alerts_sent": 0,
+                    "entry_alerts_sent": 0,
+                    "alerts_failed": 0,
+                    "duplicates_blocked": 0,
+                    "last_result": "",
+                    "last_reject_reason": "",
+                    "last_scan_time": "",
+                },
+                "engulfing_rejection": {
+                    "enabled": "engulfing_rejection" in LIVE_ENABLED_STRATEGIES,
+                    "scans_run": 0,
+                    "candidates_found": 0,
+                    "alerts_sent": 0,
+                    "alerts_failed": 0,
+                    "duplicates_blocked": 0,
+                    "last_result": "",
+                    "last_reject_reason": "",
+                    "last_scan_time": "",
+                },
+                "standard_break_retest": {
+                    "enabled": "standard_break_retest" in LIVE_ENABLED_STRATEGIES,
+                    "scans_run": 0,
+                    "candidates_found": 0,
+                    "alerts_sent": 0,
+                    "alerts_failed": 0,
+                    "duplicates_blocked": 0,
+                    "last_result": "",
+                    "last_reject_reason": "",
+                    "last_scan_time": "",
+                },
+                "failed_engulf_break_retest": {
+                    "enabled": False,
+                    "mode": "research_only",
+                },
+            },
+            "market_plan": None,
+            "alert_dedupe": {
+                "market_plan_skipped_duplicate": 0,
+                "scenario_update_skipped_duplicate": 0,
+                "entry_skipped_duplicate": 0,
+                "watchlist_skipped_duplicate": 0,
+                "last_skip_reason": "",
+            },
+            "five_layer_status": {
+                "market_analyst": {},
+                "confirmation_engine": {},
+                "learning_score": {},
+                "decision_engine": {},
+                "risk_management": {},
+            },
         }
+        self._load_memory()
 
     def _bot_window_active(self, _ctx) -> bool:
         # 24/7 mode — always active
@@ -180,6 +309,7 @@ class AlphaPulse:
         # Learning
         self.stats_learner = StatisticalLearner(self.db)
         self.learning = LearningEngine(self.db, self.stats_learner)
+        self.scoring_engine = ScoringEngine(self.learning)
 
         # Wire learning engine into strategy manager now that it's ready
         self.strategy_manager._learning = self.learning
@@ -194,6 +324,18 @@ class AlphaPulse:
         # false TP/SL hits because the market has moved since the last run.
         self.trade_mgr.cancel_stale_trades()
 
+        try:
+            self._analyst_run_id = self.db.create_analyst_replay_run(
+                {
+                    "symbol": "XAUUSD",
+                    "source": "live",
+                    "status": "running",
+                    "notes": "Live Spencer analyst session",
+                }
+            )
+        except Exception as exc:
+            logger.debug("Analyst live run registration skipped: %s", exc)
+
         # Register shutdown handlers
         signal.signal(signal.SIGINT, self._shutdown_handler)
         signal.signal(signal.SIGTERM, self._shutdown_handler)
@@ -207,6 +349,11 @@ class AlphaPulse:
         runtime_logger.info("BOT INSTANCE STARTED: instance_id=%s", self._instance_id)
         runtime_logger.info("BOT STARTED")
         runtime_logger.info("ANALYSIS PHASE STARTED: 5-minute silent phase — no alerts until complete")
+        self._background_tasks["scan_loop"] = True
+        self._background_tasks["heartbeat_writer"] = True
+        self._background_tasks["runtime_alerts"] = True
+        self._background_tasks["market_analyst_loop"] = True
+        self._background_tasks["watchlist_loop"] = True
 
         # Mark startup time — alerts suppressed for first 5 minutes
         self._startup_time = datetime.now(timezone.utc)
@@ -225,7 +372,13 @@ class AlphaPulse:
                 self._scan_cycle()
             except Exception as e:
                 logger.error("Unhandled error in scan cycle: %s", e, exc_info=True)
-                self.telegram.send_system_alert(f"Scan error: {e}")
+                self._send_runtime_system_alert(
+                    f"Scan error: {e}",
+                    alert_type="scan_error",
+                    source_module="main",
+                    source_function="_run_loop",
+                    cooldown_minutes=15,
+                )
 
             # Sleep in small increments so shutdown is responsive
             for _ in range(SCAN_INTERVAL_SECONDS):
@@ -235,6 +388,7 @@ class AlphaPulse:
 
     def _scan_cycle(self):
         self._scan_count += 1
+        self._last_scan_summary["instance_totals"]["total_scans"] = self._scan_count
         now = datetime.now(timezone.utc)
         logger.info("── Scan #%d at %s ──", self._scan_count,
                     now.strftime("%Y-%m-%d %H:%M:%S UTC"))
@@ -264,11 +418,25 @@ class AlphaPulse:
                 "last_reject_reason": "mt5_no_data",
                 "last_scan_number": self._scan_count,
                 "session_blocking": False,
+                "last_candidates_count": 0,
+                "last_alerts_sent": 0,
+                "last_alerts_failed": 0,
+                "levels_detected": 0,
+                "gap_levels": 0,
+                "bias_passed": 0,
+                "sweep_confirmed": 0,
+                "session_passed": 0,
+                "distance_passed": 0,
+                "watchlist_candidates": 0,
+                "dedupe_rejections": 0,
             })
             if not in_silent_phase:
-                self.telegram.send_system_alert(
-                    "⚠️ No market data received from MT5.\n"
-                    "Check MT5 connection. Retrying next scan."
+                self._send_runtime_system_alert(
+                    "⚠️ No market data received from MT5.\nCheck MT5 connection. Retrying next scan.",
+                    alert_type="mt5_no_data",
+                    source_module="main",
+                    source_function="_scan_cycle",
+                    cooldown_minutes=MT5_NO_DATA_ALERT_COOLDOWN_MINUTES,
                 )
             return
 
@@ -310,6 +478,36 @@ class AlphaPulse:
         outlook = run_result.outlook
         signals = run_result.signals
         ctx = outlook.context
+        market_plan = None
+        analyst_confirmations = []
+        if current_price is not None:
+            try:
+                market_plan = self.market_analyst.analyze("XAUUSD", data, float(current_price), context=ctx)
+                self._market_plan = market_plan.to_dict()
+                analyst_confirmations = self.gold_confirmation_engine.analyze(data.get("M15"), market_plan, float(current_price))
+            except Exception as exc:
+                logger.debug("Market analyst generation failed: %s", exc)
+                self._market_plan = None
+        strategy_scans = run_result.strategy_scans or {}
+        cumulative_fields = {
+            "scans_run",
+            "candidates_found",
+            "watchlist_alerts_sent",
+            "entry_alerts_sent",
+            "alerts_sent",
+            "alerts_failed",
+            "duplicates_blocked",
+        }
+        for strategy_name, summary in strategy_scans.items():
+            if strategy_name not in self._last_scan_summary["strategy_scans"]:
+                self._last_scan_summary["strategy_scans"][strategy_name] = {}
+            existing = self._last_scan_summary["strategy_scans"][strategy_name]
+            for key, value in summary.items():
+                if key in cumulative_fields:
+                    existing[key] = int(existing.get(key, 0) or 0) + int(value or 0)
+                else:
+                    existing[key] = value
+            existing["last_scan_time"] = now.isoformat()
 
         # 3b. Log strategy performance and filter states (internal only)
         self._log_strategy_performance(run_result)
@@ -320,23 +518,40 @@ class AlphaPulse:
                 logger.debug("Filter: news window active")
 
         # 3c. Track structural level changes (state management — no Telegram send)
+        if market_plan is not None and getattr(market_plan, "targets_source", "") != "structure_tp_engine":
+            logger.warning(
+                "OLD TARGET PATH BLOCKED: source=%s reason=market_plan_requires_structure_targets",
+                getattr(market_plan, "targets_source", "unknown"),
+            )
+        if market_plan is not None and current_price and not in_silent_phase:
+            self._handle_market_plan_alerts(
+                market_plan,
+                analyst_confirmations,
+                float(current_price),
+                ctx,
+                active_signals=signals,
+            )
+
         outlook_key = self._outlook_fingerprint(outlook)
         if outlook_key != self._last_outlook_hash:
             self._last_outlook_hash = outlook_key
             self._seen_setups.clear()
-            self._watchlist_alerted.clear()
-            self._confirmed_levels.clear()
             self._last_watch_distance.clear()
             logger.info("Structural levels refreshed (%d groups)", len(outlook.timeframe_levels))
             runtime_logger.info(
-                "WATCHLIST DEDUPE CLEARED: structural levels changed — %d timeframe groups",
+                "WATCHLIST STRUCTURE REFRESHED: timeframe_groups=%d | watchlist dedupe preserved for instance_id=%s",
                 len(outlook.timeframe_levels),
+                self._instance_id,
             )
 
         # 3d. Alert layer — always active (24/7 mode)
         if current_price and not in_silent_phase:
             watchlist_sent = self._send_shortlisted_level_alerts(outlook, current_price) or 0
             self._check_watch_levels(outlook, current_price)
+            gap_scan = self._last_scan_summary["strategy_scans"].setdefault("gap_liquidity_sweep_reclaim", {})
+            gap_scan["watchlist_alerts_sent"] = gap_scan.get("watchlist_alerts_sent", 0) + watchlist_sent
+            gap_scan["alerts_failed"] = gap_scan.get("alerts_failed", 0) + int(self._last_scan_summary.get("last_alerts_failed", 0) or 0)
+            gap_scan["duplicates_blocked"] = gap_scan.get("duplicates_blocked", 0) + int(self._last_scan_summary.get("dedupe_rejections", 0) or 0)
 
         # 4. Freshness filter removed — historical rejection candles ARE valid pending
         #    setups (e.g. a level rejection from yesterday is still actionable today).
@@ -405,7 +620,7 @@ class AlphaPulse:
                         # ── Live strategy gate ────────────────────────────────
                         # Research-only strategies are blocked from live alerts
                         # and live trade tracking regardless of confidence score.
-                        _trade_strategy = getattr(trade, "strategy_type", "gap_sweep") or "gap_sweep"
+                        _trade_strategy = getattr(trade, "strategy_type", "gap_liquidity_sweep_reclaim") or "gap_liquidity_sweep_reclaim"
                         if _trade_strategy in RESEARCH_ONLY_STRATEGIES:
                             logger.info(
                                 "LIVE STRATEGY BLOCKED: %s is research-only — "
@@ -427,24 +642,46 @@ class AlphaPulse:
                             "FIRST REJECTION CONFIRMED: %s %s | strategy=%s | level=%.2f | %s rejection closed correctly | pending order ready",
                             trade.direction,
                             trade.pair,
-                            getattr(trade, "strategy_type", "gap_sweep"),
+                            getattr(trade, "strategy_type", "gap_liquidity_sweep_reclaim"),
                             trade.entry_price,
                             trade.lower_tf,
                         )
+
+                        logger.info(
+                            "STRATEGY CLASSIFIED SETUP: strategy=%s analyst_scenario=%s_%.2f_%.2f",
+                            sig.strategy_name,
+                            trade.direction,
+                            min(trade.entry_price, getattr(trade, "level_price", trade.entry_price)),
+                            max(trade.entry_price, getattr(trade, "level_price", trade.entry_price)),
+                        )
+
+                        if LIVE_ARCHITECTURE_MODE == "five_layer":
+                            logger.warning("OLD LIVE ALERT PATH BLOCKED: five_layer mode active")
+                            continue
+                        if LIVE_ALERT_ROUTING == "analyst_layer":
+                            logger.warning("OLD LIVE ALERT ROUTE BLOCKED: use analyst_layer routing")
+                            continue
 
                         # Pending-order alert. Registration below stores the
                         # setup as PENDING until the later retest/fill occurs.
                         alert_sent = self.telegram.send_confirmation(trade, strategy_score=_strat_score)
                         if alert_sent:
+                            self._record_live_alert(sig.strategy_name, trade, alert_stage="entry" if sig.strategy_name == "gap_liquidity_sweep_reclaim" else "setup")
+                        if alert_sent:
                             logger.info(
                                 "PENDING ORDER ALERT SENT: %s %s | strategy=%s | entry=%.2f | SL=%.2f | TP1=%.2f",
                                 trade.direction,
                                 trade.pair,
-                                getattr(trade, "strategy_type", "gap_sweep"),
+                                getattr(trade, "strategy_type", "gap_liquidity_sweep_reclaim"),
                                 trade.entry_price,
                                 trade.sl_price,
                                 trade.tp1,
                             )
+                            strategy_scan = self._last_scan_summary["strategy_scans"].setdefault(sig.strategy_name, {})
+                            if sig.strategy_name == "gap_liquidity_sweep_reclaim":
+                                strategy_scan["entry_alerts_sent"] = int(strategy_scan.get("entry_alerts_sent", 0) or 0) + 1
+                            else:
+                                strategy_scan["alerts_sent"] = int(strategy_scan.get("alerts_sent", 0) or 0) + 1
 
                         # Register for simulated pending-order tracking.
                         self.trade_mgr.register_trade(trade)
@@ -452,7 +689,7 @@ class AlphaPulse:
                         logger.info(
                             "Pending order dispatched: %s %s @ %.2f | strategy=%s | SL %.2f (%dp) | Conf %.0f%%",
                             trade.direction, trade.pair, trade.entry_price,
-                            getattr(trade, "strategy_type", "gap_sweep"),
+                            getattr(trade, "strategy_type", "gap_liquidity_sweep_reclaim"),
                             trade.sl_price,
                             int(abs(trade.entry_price - trade.sl_price)),
                             trade.confidence * 100,
@@ -469,6 +706,7 @@ class AlphaPulse:
         # 6. Update tracked setups against live price (simulated tracking)
         if current_price:
             self.trade_mgr.update(current_price)
+            self._update_analyst_trade_feedback(float(current_price), ctx)
             logger.debug("Price update @ %.2f", current_price)
 
         # 6b. Track manual setups — price proximity and confirmation alerts
@@ -492,16 +730,20 @@ class AlphaPulse:
                     session_name = getattr(ctx, "session_name", "unknown") if ctx else "unknown"
                     bias = getattr(ctx, "h4_bias", "neutral") if ctx else "neutral"
                     if True:
-                        self.telegram.send_system_alert(
+                        if self._send_runtime_system_alert(
                             f"Spencer is watching — no active setups in the last "
                             f"{NO_SETUP_STATUS_INTERVAL_MINUTES} minutes.\n"
-                            f"Session: {session_name} | Bias: {bias}"
-                        )
-                        self._last_no_setup_alert_time = now_ts
-                        logger.info(
-                            "NO WATCHLIST SETUPS FOUND: no-setup alert sent (session=%s bias=%s)",
-                            session_name, bias,
-                        )
+                            f"Session: {session_name} | Bias: {bias}",
+                            alert_type="no_setup_status",
+                            source_module="main",
+                            source_function="_scan_cycle",
+                            cooldown_minutes=NO_SETUP_STATUS_INTERVAL_MINUTES,
+                        ):
+                            self._last_no_setup_alert_time = now_ts
+                            logger.info(
+                                "NO WATCHLIST SETUPS FOUND: no-setup alert sent (session=%s bias=%s)",
+                                session_name, bias,
+                            )
 
         # 10. Write heartbeat so the API can surface richer status
         self._write_heartbeat(in_silent_phase, signals, ctx, current_price, tick)
@@ -596,10 +838,16 @@ class AlphaPulse:
                 sent = self.telegram.send_manual_setup_approaching(setup, current_price, distance_pips)
                 if sent:
                     self._manual_setup_approach_alerted[setup_id] = now
+                    self._last_scan_summary["instance_totals"]["manual_alerts_sent"] += 1
+                    self._last_scan_summary["last_telegram_status"] = "success"
+                    self._last_scan_summary["last_telegram_alert_type"] = "manual_setup"
+                    self._last_scan_summary["last_telegram_alert_time"] = now.isoformat()
                     try:
                         self.db.update_manual_setup(setup_id, {
                             "tracking_status": "approaching_entry",
                             "approach_alert_sent_at": now.isoformat(),
+                            "last_alert_type": "approaching_entry",
+                            "last_alert_time": now.isoformat(),
                         })
                     except Exception as exc:
                         logger.debug("Manual setup status update failed: %s", exc)
@@ -608,9 +856,966 @@ class AlphaPulse:
     # HEARTBEAT
     # ─────────────────────────────────────────────────────
 
+    def _persist_analyst_market_plan(self, plan_dict: dict[str, Any], context) -> None:
+        try:
+            session_name = getattr(context, "session_name", "unknown") if context else "unknown"
+            market_condition = getattr(context, "market_condition", "unknown") if context else "unknown"
+            h4_bias = str(plan_dict.get("dominant_bias", "neutral"))
+            h1_bias = str(plan_dict.get("market_structure_state", "unknown"))
+            for label in ("primary", "secondary"):
+                scenario = (plan_dict.get(f"{label}_scenario") or {})
+                if not scenario:
+                    continue
+                scenario_key = f"{label}:{scenario.get('direction', '')}:{scenario.get('watch_zone', '')}:{plan_dict.get('market_plan_signature', '')}"
+                if scenario_key in self._analyst_scenario_rows:
+                    continue
+                watch_zone = str(scenario.get("watch_zone", "0-0"))
+                zone_low, zone_high = self._split_zone_bounds(watch_zone)
+                row_id = self.db.insert_analyst_scenario_history(
+                    {
+                        "run_id": self._analyst_run_id,
+                        "symbol": plan_dict.get("symbol", "XAUUSD"),
+                        "scenario_key": scenario_key,
+                        "source": "live",
+                        "primary_or_secondary": label,
+                        "scenario_type": f"{scenario.get('direction', '').lower()}_{label}",
+                        "direction": scenario.get("direction", ""),
+                        "zone_low": zone_low,
+                        "zone_high": zone_high,
+                        "trigger_conditions": scenario.get("triggers", []),
+                        "invalidation_level": self._parse_numeric_level(scenario.get("invalidation")),
+                        "tp_targets": scenario.get("targets", []),
+                        "h4_bias": h4_bias,
+                        "h1_bias": h1_bias,
+                        "dominant_bias": plan_dict.get("dominant_bias", "neutral"),
+                        "bias_strength": plan_dict.get("bias_strength", "weak"),
+                        "session_name": session_name,
+                        "psychological_level_context": plan_dict.get("actionable_psych_levels", []),
+                        "market_condition": market_condition,
+                        "status": plan_dict.get("plan_status", "active"),
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "notes": scenario.get("reason", ""),
+                    }
+                )
+                if row_id is not None:
+                    self._analyst_scenario_rows[scenario_key] = row_id
+        except Exception as exc:
+            logger.debug("Analyst scenario persistence skipped: %s", exc)
+
+    def _persist_analyst_confirmation(
+        self,
+        confirmation,
+        *,
+        context,
+        decision: str,
+        rejection_reason: str = "",
+        learning_score=None,
+        final_outcome: str = "",
+        pips_result: float = 0.0,
+        tp1_hit: bool = False,
+        tp2_hit: bool = False,
+        tp3_hit: bool = False,
+        sl_hit: bool = False,
+    ) -> None:
+        try:
+            row_id = self._analyst_confirmation_rows.get(confirmation.confirmation_signature)
+            payload = {
+                "run_id": self._analyst_run_id,
+                "symbol": "XAUUSD",
+                "scenario_key": f"{confirmation.scenario}:{confirmation.direction}:{confirmation.zone_low:.2f}-{confirmation.zone_high:.2f}",
+                "confirmation_key": confirmation.confirmation_signature,
+                "source": "live",
+                "scenario_type": str(getattr(confirmation, "scenario", "primary")),
+                "confirmation_type": confirmation.confirmation_type,
+                "confirmation_grade": getattr(confirmation, "confirmation_grade", confirmation.grade),
+                "confirmation_score": float(getattr(confirmation, "confirmation_score", confirmation.score)),
+                "direction": confirmation.direction,
+                "level": float(confirmation.level),
+                "entry": float(confirmation.suggested_entry),
+                "sl": float(confirmation.suggested_sl),
+                "tp1": float(confirmation.suggested_tps.get("tp1", 0.0)),
+                "tp2": float(confirmation.suggested_tps.get("tp2", 0.0)),
+                "tp3": float(confirmation.suggested_tps.get("tp3", 0.0)),
+                "decision": decision,
+                "rejection_reason": rejection_reason,
+                "session_name": getattr(context, "session_name", "unknown") if context else "unknown",
+                "timeframe": "M15",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "final_outcome": final_outcome or None,
+                "pips_result": pips_result if final_outcome else None,
+                "tp1_hit": tp1_hit,
+                "tp2_hit": tp2_hit,
+                "tp3_hit": tp3_hit,
+                "sl_hit": sl_hit,
+            }
+            if row_id is None:
+                row_id = self.db.insert_analyst_confirmation_history(payload)
+                if row_id is not None:
+                    self._analyst_confirmation_rows[confirmation.confirmation_signature] = row_id
+            elif final_outcome:
+                self.db.update_analyst_confirmation_history(row_id, payload)
+        except Exception as exc:
+            logger.debug("Analyst confirmation persistence skipped: %s", exc)
+
+    def _update_analyst_trade_feedback(self, current_price: float, context) -> None:
+        for setup_id, state in list(self.trade_management_engine._active_setups.items()):
+            previous_status = state.current_status
+            updated = self.trade_management_engine.update_trade(setup_id, current_price)
+            if updated is None:
+                continue
+            self._last_scan_summary["five_layer_status"]["risk_management"] = updated.to_dict()
+            if updated.current_status != previous_status:
+                logger.info("TRADE MANAGEMENT UPDATE: setup_id=%s status=%s", setup_id, updated.current_status)
+            if updated.review_required and setup_id not in self._analyst_reviewed_setups:
+                metadata = dict(updated.metadata or {})
+                review = self.outcome_tracker.store_review(
+                    updated,
+                    str(metadata.get("confirmation_type", "")),
+                    str(metadata.get("confirmation_grade", "")),
+                    float(metadata.get("learning_score", 0.0) or 0.0),
+                    review_notes=str(metadata.get("review_notes", "")),
+                )
+                if review.result == "LOSS":
+                    date_key = review.created_at.split("T", 1)[0] if "T" in review.created_at else "unknown_date"
+                    self.decision_engine.record_loss(symbol=review.symbol, date_key=date_key)
+                self._analyst_reviewed_setups.add(setup_id)
+                try:
+                    self.db.insert_analyst_trade_review(
+                        {
+                            "run_id": review.run_id,
+                            "setup_id": review.setup_id,
+                            "symbol": review.symbol,
+                            "scenario_key": review.scenario_key,
+                            "scenario_type": review.scenario_type,
+                            "direction": review.direction,
+                            "entry": review.entry,
+                            "sl": review.sl,
+                            "tp1": review.tp1,
+                            "tp2": review.tp2,
+                            "tp3": review.tp3,
+                            "confirmation_type": review.confirmation_type,
+                            "confirmation_grade": review.confirmation_grade,
+                            "learning_score": review.learning_score,
+                            "reaction_level": review.reaction_level,
+                            "invalidation_level": review.invalidation_level,
+                            "risk_pips": review.risk_pips,
+                            "tp1_reward_pips": review.tp1_reward_pips,
+                            "tp2_reward_pips": review.tp2_reward_pips,
+                            "tp3_reward_pips": review.tp3_reward_pips,
+                            "tp1_rr": review.tp1_rr,
+                            "tp2_rr": review.tp2_rr,
+                            "tp3_rr": review.tp3_rr,
+                            "sl_source": review.sl_source,
+                            "tp_source": review.tp_source,
+                            "trade_path_source": review.trade_path_source,
+                            "trade_path_rationale": review.trade_path_rationale,
+                            "target_roles": review.target_roles,
+                            "setup_quality_label": review.setup_quality_label,
+                            "decision_reason": review.decision_reason,
+                            "session_name": review.session_name,
+                            "h4_bias": review.h4_bias,
+                            "h1_bias": review.h1_bias,
+                            "market_condition": review.market_condition,
+                            "result": review.result,
+                            "pips_result": review.pips_result,
+                            "tp1_hit": review.tp1_hit,
+                            "tp2_hit": review.tp2_hit,
+                            "tp3_hit": review.tp3_hit,
+                            "protected_after_tp1": review.protected_after_tp1,
+                            "review_notes": review.review_notes,
+                            "created_at": review.created_at,
+                            "closed_at": review.closed_at,
+                        }
+                    )
+                    confirmation_key = str(metadata.get("confirmation_key", ""))
+                    row_id = self._analyst_confirmation_rows.get(confirmation_key)
+                    if row_id is not None:
+                        self.db.update_analyst_confirmation_history(
+                            row_id,
+                            {
+                                "final_outcome": review.result,
+                                "pips_result": review.pips_result,
+                                "tp1_hit": review.tp1_hit,
+                                "tp2_hit": review.tp2_hit,
+                                "tp3_hit": review.tp3_hit,
+                                "sl_hit": review.result == "LOSS",
+                            },
+                        )
+                    scenario_row = self._analyst_scenario_rows.get(str(metadata.get("scenario_db_key", "")))
+                    if scenario_row is not None:
+                        self.db.update_analyst_scenario_history(
+                            scenario_row,
+                            {
+                                "status": "played_out" if review.tp1_hit else "invalidated" if review.result == "LOSS" else "active",
+                                "resolved_at": datetime.now(timezone.utc).isoformat(),
+                                "final_outcome": "TP3_HIT" if review.tp3_hit else "TP2_HIT" if review.tp2_hit else "TP1_HIT" if review.tp1_hit else "SL_HIT" if review.result == "LOSS" else review.result,
+                                "max_favorable_pips": review.pips_result if review.pips_result > 0 else 0.0,
+                                "max_adverse_pips": abs(review.pips_result) if review.pips_result < 0 else 0.0,
+                                "tp1_reached": review.tp1_hit,
+                                "tp2_reached": review.tp2_hit,
+                                "tp3_reached": review.tp3_hit,
+                            },
+                        )
+                except Exception as exc:
+                    logger.debug("Analyst trade review persistence skipped: %s", exc)
+
+    def _handle_market_plan_alerts(self, market_plan, confirmations: list, current_price: float, context, active_signals: list | None = None) -> None:
+        plan_dict = market_plan.to_dict() if hasattr(market_plan, "to_dict") else dict(market_plan or {})
+        signature = self._market_plan_signature(plan_dict)
+        now = datetime.now(timezone.utc)
+        session_name = getattr(context, "session_name", "unknown") if context else "unknown"
+        primary = plan_dict.get("primary_scenario", {}) or {}
+        secondary = plan_dict.get("secondary_scenario", {}) or {}
+        self._persist_analyst_market_plan(plan_dict, context)
+        self._last_scan_summary["five_layer_status"]["market_analyst"] = {
+            "bias": plan_dict.get("dominant_bias"),
+            "plan_status": plan_dict.get("plan_status"),
+            "primary_scenario": primary.get("watch_zone"),
+            "secondary_scenario": secondary.get("watch_zone"),
+            "watch_zones": plan_dict.get("active_watch_zones", []),
+            "signature": plan_dict.get("market_plan_signature", signature),
+        }
+
+        current_primary_key = f"{primary.get('direction')}:{primary.get('watch_zone')}:{primary.get('invalidation')}"
+        should_send_plan = False
+        send_reason = ""
+        if self._last_market_plan_sent_at is None:
+            should_send_plan = True
+            send_reason = "startup_complete"
+        elif self._last_primary_scenario_key and self._last_primary_scenario_key != current_primary_key:
+            should_send_plan = True
+            send_reason = "scenario_changed"
+        elif session_name in {"london", "new_york"} and self._last_session_market_plan != session_name:
+            should_send_plan = True
+            send_reason = "session_transition"
+
+        if should_send_plan:
+            market_plan_key = self._build_market_plan_event_key(plan_dict)
+            allowed, reason = self._alert_dedupe.should_send_alert(
+                "market_plan",
+                market_plan_key,
+                signature,
+                cooldown_seconds=MARKET_PLAN_MIN_INTERVAL_MINUTES * 60,
+            )
+            if not allowed and not MARKET_PLAN_RESEND_ON_MINOR_PRICE_CHANGE:
+                logger.info("MARKET PLAN SKIPPED: %s", reason)
+                self._sync_dedupe_summary()
+            elif self.telegram.send_market_plan_alert(market_plan):
+                self._alert_dedupe.mark_alert_sent(
+                    "market_plan",
+                    market_plan_key,
+                    signature,
+                    metadata={"reason": send_reason, "session_name": session_name},
+                )
+                logger.info("MARKET PLAN SENT: reason=%s", send_reason)
+                self._last_scan_summary["last_telegram_status"] = "success"
+                self._last_scan_summary["last_telegram_alert_type"] = "market_plan"
+                self._last_scan_summary["last_telegram_alert_time"] = now.isoformat()
+                self._last_market_plan_sent_at = now
+                self._last_market_plan_hash = signature
+                self._last_session_market_plan = session_name
+                self._save_memory()
+
+        primary_key = current_primary_key
+        if self._last_primary_scenario_key and self._last_primary_scenario_key != primary_key:
+            logger.info("SCENARIO INVALIDATED: old=%s reason=structure_shift", self._last_primary_scenario_key)
+            self._send_scenario_update(
+                {
+                    "symbol": plan_dict.get("symbol", "XAUUSD"),
+                    "message": "Primary scenario invalidated or flipped on structure.",
+                    "primary": f"{primary.get('direction')} {primary.get('watch_zone')}",
+                    "secondary": f"{secondary.get('direction')} {secondary.get('watch_zone')}",
+                    "waiting_for": " / ".join(plan_dict.get("confirmation_waiting_for", [])[:4]),
+                },
+                now,
+                event_key=self._build_scenario_update_event_key(
+                    symbol=plan_dict.get("symbol", "XAUUSD"),
+                    event_type="scenario_flip",
+                    old_scenario_key=self._last_primary_scenario_key,
+                    new_scenario_key=primary_key,
+                ),
+            )
+            self._save_memory()
+        self._last_primary_scenario_key = primary_key
+
+        self._send_resume_watch_alerts(plan_dict, primary, secondary, now)
+
+        for zone in plan_dict.get("active_watch_zones", []) or []:
+            zone_id = str(zone.get("zone_id"))
+            previous = self._watch_zone_state.get(zone_id)
+            zone_copy = dict(zone)
+            zone_copy["persisted_at"] = now.isoformat()
+            self._watch_zone_state[zone_id] = zone_copy
+            if previous and previous.get("status") != zone.get("status"):
+                logger.info("SCENARIO UPDATED: primary=%s", primary.get("direction"))
+                if zone.get("status") == "active":
+                    logger.info("WATCH ZONE APPROACHED: zone=%s direction=%s", zone_id, zone.get("direction"))
+                    self._send_scenario_update(
+                        {
+                            "symbol": plan_dict.get("symbol", "XAUUSD"),
+                            "message": f"Price entered watch zone {zone.get('level_low', 0.0):.2f}-{zone.get('level_high', 0.0):.2f}.",
+                            "primary": f"{primary.get('direction')} {primary.get('watch_zone')}",
+                            "secondary": f"{secondary.get('direction')} {secondary.get('watch_zone')}",
+                            "waiting_for": " / ".join(plan_dict.get("confirmation_waiting_for", [])[:4]),
+                        },
+                        now,
+                        event_key=self._build_scenario_update_event_key(
+                            symbol=plan_dict.get("symbol", "XAUUSD"),
+                            event_type="watch_zone_update",
+                            new_scenario_key=primary_key,
+                            level=f"{zone.get('level_low', 0.0):.2f}-{zone.get('level_high', 0.0):.2f}",
+                            status="active",
+                        ),
+                    )
+                elif zone.get("status") == "played_out" and zone.get("played_out_note"):
+                    self._send_scenario_update(
+                        {
+                            "symbol": plan_dict.get("symbol", "XAUUSD"),
+                            "message": str(zone.get("played_out_note")),
+                            "primary": f"{primary.get('direction')} {primary.get('watch_zone')}",
+                            "secondary": f"{secondary.get('direction')} {secondary.get('watch_zone')}",
+                            "waiting_for": " / ".join(plan_dict.get("confirmation_waiting_for", [])[:4]),
+                        },
+                        now,
+                        event_key=self._build_scenario_update_event_key(
+                            symbol=plan_dict.get("symbol", "XAUUSD"),
+                            event_type="played_out",
+                            new_scenario_key=primary_key,
+                            level=f"{zone.get('level_low', 0.0):.2f}-{zone.get('level_high', 0.0):.2f}",
+                            status="played_out",
+                        ),
+                    )
+        self._save_memory()
+
+        for confirmation in confirmations:
+            allowed, reason = confirmation_is_fresh(confirmation, current_price)
+            if not allowed:
+                logger.info("SETUP NOT SENT: already played out / chase distance exceeded")
+                logger.info(reason)
+                self._persist_analyst_confirmation(
+                    confirmation,
+                    context=context,
+                    decision="reject",
+                    rejection_reason=reason,
+                )
+                self._last_scan_summary["five_layer_status"]["confirmation_engine"] = {
+                    "last_confirmation": confirmation.to_dict(),
+                    "status": "rejected",
+                    "reason": reason,
+                }
+                continue
+            if confirmation.grade not in {"A", "A+"}:
+                self._persist_analyst_confirmation(
+                    confirmation,
+                    context=context,
+                    decision="wait",
+                    rejection_reason="grade_b_or_lower",
+                )
+                self._last_scan_summary["five_layer_status"]["confirmation_engine"] = {
+                    "last_confirmation": confirmation.to_dict(),
+                    "status": "waiting",
+                    "reason": "grade_b_or_lower",
+                }
+                continue
+            scenario_key = f"{confirmation.direction}:{confirmation.zone_low:.2f}-{confirmation.zone_high:.2f}"
+            confirm_key = self._build_entry_event_key(confirmation, scenario_key)
+            payload_signature = self._event_signature(
+                {
+                    "direction": confirmation.direction,
+                    "scenario_key": scenario_key,
+                    "confirmation_type": confirmation.confirmation_type,
+                    "entry": round(float(confirmation.suggested_entry), 2),
+                    "sl": round(float(confirmation.suggested_sl), 2),
+                    "tp1": round(float(confirmation.suggested_tps.get("tp1", 0.0)), 2),
+                    "grade": confirmation.grade,
+                }
+            )
+            strategy_context = self._classify_analyst_setup(confirmation, active_signals or [])
+            learning_context = {
+                "session_name": session_name,
+                "timeframe": "M15",
+                "direction": confirmation.direction,
+                "dominant_bias": plan_dict.get("dominant_bias", "neutral"),
+                "bias_strength": plan_dict.get("bias_strength", "weak"),
+                "confirmation_type": confirmation.confirmation_type,
+            }
+            learning_score = self.scoring_engine.score_confirmation(
+                market_plan,
+                confirmation,
+                strategy_context.get("strategy_type", "analyst_layer"),
+                learning_context,
+            )
+            self._last_scan_summary["five_layer_status"]["learning_score"] = learning_score.to_dict()
+            duplicate_zone, existing_key = self._alert_dedupe.find_recent_matching(
+                "analyst_entry",
+                lambda _event_key, entry: (
+                    (entry.get("metadata") or {}).get("symbol") == "XAUUSD"
+                    and (entry.get("metadata") or {}).get("direction") == confirmation.direction
+                    and (entry.get("metadata") or {}).get("scenario_key") == scenario_key
+                    and abs(float((entry.get("metadata") or {}).get("entry", 0.0)) - float(confirmation.suggested_entry)) <= ENTRY_ZONE_DUPLICATE_TOLERANCE_PIPS
+                ),
+                cooldown_seconds=ENTRY_ALERT_COOLDOWN_MINUTES * 60,
+            )
+            decision = self.decision_engine.decide(
+                market_plan,
+                confirmation,
+                learning_score,
+                duplicate_blocked=duplicate_zone,
+                stale_reason="" if allowed else reason,
+                gate_context={
+                    "symbol": "XAUUSD",
+                    "session_name": session_name,
+                    "candle_time": getattr(confirmation, "candle_time", ""),
+                    "zone_key": scenario_key,
+                },
+            )
+            self._last_scan_summary["five_layer_status"]["decision_engine"] = decision.to_dict()
+            if duplicate_zone:
+                self._persist_analyst_confirmation(
+                    confirmation,
+                    context=context,
+                    decision="ignore",
+                    rejection_reason="same_zone_cooldown",
+                    learning_score=learning_score,
+                )
+                logger.info("ENTRY ALERT SKIPPED: same zone cooldown")
+                self._sync_dedupe_summary()
+                continue
+            can_send_entry, entry_reason = self._alert_dedupe.should_send_alert(
+                "analyst_entry",
+                confirm_key,
+                payload_signature,
+                cooldown_seconds=ENTRY_ALERT_COOLDOWN_MINUTES * 60,
+            )
+            if not can_send_entry:
+                self._persist_analyst_confirmation(
+                    confirmation,
+                    context=context,
+                    decision="ignore",
+                    rejection_reason=entry_reason,
+                    learning_score=learning_score,
+                )
+                logger.info("ENTRY ALERT SKIPPED: %s", "duplicate confirmation" if entry_reason != "cooldown_active" else "same zone cooldown")
+                self._sync_dedupe_summary()
+                continue
+            logger.info(
+                "CONFIRMATION DETECTED: type=%s grade=%s direction=%s",
+                confirmation.confirmation_type,
+                confirmation.grade,
+                confirmation.direction,
+            )
+            logger.info(
+                "ENTRY CONFIRMED: direction=%s entry=%.2f sl=%.2f tp1=%.2f tp2=%.2f tp3=%.2f",
+                confirmation.direction,
+                confirmation.suggested_entry,
+                confirmation.suggested_sl,
+                confirmation.suggested_tps.get("tp1", 0.0),
+                confirmation.suggested_tps.get("tp2", 0.0),
+                confirmation.suggested_tps.get("tp3", 0.0),
+            )
+            analyst_setup = AnalystTradeSetup(
+                strategy_type=strategy_context.get("strategy_type", "analyst_layer"),
+                scenario_id=confirmation.watch_zone_id,
+                direction=confirmation.direction,
+                entry=confirmation.suggested_entry,
+                sl=confirmation.suggested_sl,
+                tp1=confirmation.suggested_tps.get("tp1", 0.0),
+                tp2=confirmation.suggested_tps.get("tp2", 0.0),
+                tp3=confirmation.suggested_tps.get("tp3", 0.0),
+                confirmation_type=confirmation.confirmation_type,
+                confirmation_grade=confirmation.grade,
+                entry_reason=confirmation.reason,
+                sl_rationale=confirmation.sl_rationale,
+                tp_rationale=confirmation.tp_rationale,
+                invalidation=confirmation.invalidation,
+                no_chase_status="fresh_or_active_only",
+                reaction_level=float(getattr(confirmation, "reaction_level", 0.0) or 0.0),
+                invalidation_level=float(getattr(confirmation, "invalidation_level", 0.0) or 0.0),
+                risk_pips=float(getattr(confirmation, "risk_pips", 0.0) or 0.0),
+                tp1_reward_pips=float(getattr(confirmation, "tp1_reward_pips", 0.0) or 0.0),
+                tp2_reward_pips=float(getattr(confirmation, "tp2_reward_pips", 0.0) or 0.0),
+                tp3_reward_pips=float(getattr(confirmation, "tp3_reward_pips", 0.0) or 0.0),
+                tp1_rr=float(getattr(confirmation, "tp1_rr", 0.0) or 0.0),
+                tp2_rr=float(getattr(confirmation, "tp2_rr", 0.0) or 0.0),
+                tp3_rr=float(getattr(confirmation, "tp3_rr", 0.0) or 0.0),
+                sl_source=str(getattr(confirmation, "sl_source", "structure_sl_engine")),
+                tp_source=str(getattr(confirmation, "tp_source", "structure_tp_engine")),
+                trade_path_source=str(getattr(confirmation, "trade_path_source", "trade_path_engine")),
+                trade_path_rationale=str(getattr(confirmation, "trade_path_rationale", "")),
+                target_roles=dict(getattr(confirmation, "target_roles", {}) or {}),
+                setup_quality_label=quality_label_from_score(float(decision.setup_payload.get("candidate_rank_score", 0.0) or 0.0)),
+                candidate_rank_score=float(decision.setup_payload.get("candidate_rank_score", 0.0) or 0.0),
+                strategy_suggested_entry=strategy_context.get("strategy_suggested_entry"),
+                strategy_suggested_sl=strategy_context.get("strategy_suggested_sl"),
+                strategy_suggested_tp1=strategy_context.get("strategy_suggested_tp1"),
+                strategy_suggested_tp2=strategy_context.get("strategy_suggested_tp2"),
+                strategy_suggested_tp3=strategy_context.get("strategy_suggested_tp3"),
+            )
+            if self.telegram.send_analyst_entry_alert(analyst_setup.to_dict()):
+                scenario_db_key = f"{confirmation.scenario}:{confirmation.direction}:{confirmation.zone_low:.2f}-{confirmation.zone_high:.2f}:{plan_dict.get('market_plan_signature', '')}"
+                self._persist_analyst_confirmation(
+                    confirmation,
+                    context=context,
+                    decision="alert",
+                    learning_score=learning_score,
+                )
+                self._alert_dedupe.mark_alert_sent(
+                    "analyst_entry",
+                    confirm_key,
+                    payload_signature,
+                    metadata={
+                        "symbol": "XAUUSD",
+                        "direction": confirmation.direction,
+                        "scenario_key": scenario_key,
+                        "entry": round(float(confirmation.suggested_entry), 2),
+                    },
+                )
+                management_state = self.trade_management_engine.register_setup(
+                    confirm_key,
+                    analyst_setup,
+                    metadata={
+                        "run_id": self._analyst_run_id,
+                        "scenario_key": scenario_key,
+                        "scenario_db_key": scenario_db_key,
+                        "scenario_type": str(getattr(confirmation, "scenario", "primary")),
+                        "confirmation_key": confirmation.confirmation_signature,
+                        "confirmation_type": confirmation.confirmation_type,
+                        "confirmation_grade": confirmation.grade,
+                        "learning_score": learning_score.final_score,
+                        "decision_reason": decision.reason,
+                        "session_name": session_name,
+                        "h4_bias": plan_dict.get("dominant_bias", "neutral"),
+                        "h1_bias": plan_dict.get("market_structure_state", "unknown"),
+                        "market_condition": getattr(context, "market_condition", "unknown") if context else "unknown",
+                        "reaction_level": analyst_setup.reaction_level,
+                        "invalidation_level": analyst_setup.invalidation_level,
+                        "risk_pips": analyst_setup.risk_pips,
+                        "tp1_reward_pips": analyst_setup.tp1_reward_pips,
+                        "tp2_reward_pips": analyst_setup.tp2_reward_pips,
+                        "tp3_reward_pips": analyst_setup.tp3_reward_pips,
+                        "tp1_rr": analyst_setup.tp1_rr,
+                        "tp2_rr": analyst_setup.tp2_rr,
+                        "tp3_rr": analyst_setup.tp3_rr,
+                        "sl_source": analyst_setup.sl_source,
+                        "tp_source": analyst_setup.tp_source,
+                        "trade_path_source": analyst_setup.trade_path_source,
+                        "trade_path_rationale": analyst_setup.trade_path_rationale,
+                        "target_roles": analyst_setup.target_roles,
+                        "setup_quality_label": analyst_setup.setup_quality_label,
+                    },
+                )
+                self._last_scan_summary["five_layer_status"]["risk_management"] = management_state.to_dict()
+                candle_time = str(getattr(confirmation, "candle_time", ""))
+                date_key = candle_time.split("T", 1)[0] if "T" in candle_time else "unknown_date"
+                self.decision_engine.record_entry(
+                    symbol="XAUUSD",
+                    date_key=date_key,
+                    session_name=session_name,
+                    zone_key=scenario_key,
+                )
+                logger.info("ENTRY ALERT SENT: event_key=%s", confirm_key)
+                self._last_scan_summary["last_telegram_status"] = "success"
+                self._last_scan_summary["last_telegram_alert_type"] = "analyst_entry"
+                self._last_scan_summary["last_telegram_alert_time"] = now.isoformat()
+                self._save_memory()
+
+    def _send_scenario_update(self, payload: dict, now: datetime, event_key: str) -> None:
+        payload_signature = self._event_signature(payload)
+        can_send, reason = self._alert_dedupe.should_send_alert(
+            "scenario_update",
+            event_key,
+            payload_signature,
+            cooldown_seconds=SCENARIO_UPDATE_ALERT_COOLDOWN_MINUTES * 60,
+        )
+        if not can_send:
+            logger.info("SCENARIO UPDATE SKIPPED: %s event_key=%s", reason if reason != "unchanged_signature" else "duplicate", event_key)
+            self._sync_dedupe_summary()
+            return
+        if self.telegram.send_scenario_update_alert(payload):
+            self._last_scenario_update_at = now
+            self._alert_dedupe.mark_alert_sent("scenario_update", event_key, payload_signature)
+            logger.info("SCENARIO UPDATE SENT: event_key=%s", event_key)
+            self._last_scan_summary["last_telegram_status"] = "success"
+            self._last_scan_summary["last_telegram_alert_type"] = "scenario_update"
+            self._last_scan_summary["last_telegram_alert_time"] = now.isoformat()
+            self._save_memory()
+
+    def _read_runtime_control(self) -> dict:
+        try:
+            if self._runtime_control_file.exists():
+                return json.loads(self._runtime_control_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.debug("Runtime control read failed: %s", exc)
+        return {
+            "status": "offline",
+            "active_instance_id": None,
+            "runtime_alerts_enabled": False,
+            "shutdown_requested": False,
+        }
+
+    def can_send_runtime_alert(self, alert_type: str, instance_id: str | None = None) -> bool:
+        runtime_control = self._read_runtime_control()
+        active_instance_id = str(runtime_control.get("active_instance_id") or "")
+        current_instance_id = str(instance_id or self._instance_id)
+        if not self._running:
+            logger.info("SYSTEM ALERT SKIPPED: bot_not_running alert_type=%s", alert_type)
+            return False
+        if runtime_control.get("shutdown_requested"):
+            logger.info("SYSTEM ALERT SKIPPED: bot_not_running alert_type=%s", alert_type)
+            return False
+        if self._runtime_alerts_disabled_flag.exists():
+            logger.info("SYSTEM ALERT SKIPPED: runtime_alerts_disabled_flag alert_type=%s", alert_type)
+            return False
+        if not TELEGRAM_RUNTIME_ALERTS_ENABLED or not runtime_control.get("runtime_alerts_enabled", False):
+            logger.info("SYSTEM ALERT SKIPPED: runtime_alerts_disabled alert_type=%s", alert_type)
+            return False
+        if active_instance_id and active_instance_id != current_instance_id:
+            logger.info("ALERT SKIPPED: stale instance old=%s active=%s", current_instance_id, active_instance_id)
+            return False
+        if runtime_control.get("status") not in {"starting", "running", "watching", "analyzing"}:
+            logger.info("SYSTEM ALERT SKIPPED: bot_not_running alert_type=%s", alert_type)
+            return False
+        return True
+
+    def _send_runtime_system_alert(
+        self,
+        message: str,
+        *,
+        alert_type: str,
+        source_module: str,
+        source_function: str,
+        cooldown_minutes: int,
+    ) -> bool:
+        runtime_control_snapshot = self._read_runtime_control()
+        logger.info(
+            "MT5 NO DATA ALERT SOURCE TRACE: module=%s function=%s instance_id=%s "
+            "state_status=%s runtime_alerts_enabled=%s process_id=%d thread=%s bot_running=%s",
+            source_module,
+            source_function,
+            self._instance_id,
+            runtime_control_snapshot.get("status", "unknown"),
+            str(runtime_control_snapshot.get("runtime_alerts_enabled", False)),
+            os.getpid(),
+            threading.current_thread().name,
+            str(self._running).lower(),
+        )
+        if not self.can_send_runtime_alert(alert_type, self._instance_id):
+            return False
+        payload = {"message": message, "alert_type": alert_type}
+        event_key = f"system_alert:{alert_type}:{self._instance_id}"
+        payload_signature = self._event_signature(payload)
+        can_send, reason = self._alert_dedupe.should_send_alert(
+            "system_alert",
+            event_key,
+            payload_signature,
+            cooldown_seconds=cooldown_minutes * 60,
+        )
+        if not can_send:
+            if alert_type == "mt5_no_data" and reason == "cooldown_active":
+                logger.info("MT5 NO DATA ALERT SKIPPED: cooldown active")
+            else:
+                logger.info("SYSTEM ALERT SKIPPED: %s alert_type=%s", reason, alert_type)
+            self._sync_dedupe_summary()
+            return False
+        if self.telegram.send_system_alert(message):
+            self._alert_dedupe.mark_alert_sent("system_alert", event_key, payload_signature)
+            self._save_memory()
+            return True
+        return False
+
+    def _send_resume_watch_alerts(self, plan_dict: dict, primary: dict, secondary: dict, now: datetime) -> None:
+        if self._resume_watch_checked or not SPENCER_RESUME_WATCH_ALERT_ENABLED:
+            return
+
+        for zone in plan_dict.get("active_watch_zones", []) or []:
+            zone_id = str(zone.get("zone_id"))
+            previous = self._watch_zone_state.get(zone_id) or {}
+            previous_status = str(previous.get("status") or "").lower()
+            current_status = str(zone.get("status") or "").lower()
+            if previous_status not in {"fresh", "active"} or current_status not in {"fresh", "active"}:
+                continue
+            if previous.get("direction") != zone.get("direction"):
+                continue
+
+            watch_zone = f"{zone.get('level_low', 0.0):.2f}-{zone.get('level_high', 0.0):.2f}"
+            self._send_scenario_update(
+                {
+                    "symbol": plan_dict.get("symbol", "XAUUSD"),
+                    "message": (
+                        f"Still watching {zone.get('direction', '?')} {watch_zone}. "
+                        "This scenario has not played yet from the last run and remains valid while fresh confirmation is pending."
+                    ),
+                    "primary": f"{primary.get('direction')} {primary.get('watch_zone')}",
+                    "secondary": f"{secondary.get('direction')} {secondary.get('watch_zone')}",
+                    "waiting_for": " / ".join(plan_dict.get("confirmation_waiting_for", [])[:4]),
+                },
+                now,
+                event_key=self._build_scenario_update_event_key(
+                    symbol=plan_dict.get("symbol", "XAUUSD"),
+                    event_type="resume_watch",
+                    new_scenario_key=f"{primary.get('direction')}:{primary.get('watch_zone')}",
+                    level=watch_zone,
+                    status=current_status,
+                ),
+            )
+        self._resume_watch_checked = True
+
+    @staticmethod
+    def _market_plan_signature(plan: dict) -> str:
+        raw = json.dumps(
+            {
+                "bias": plan.get("dominant_bias"),
+                "primary": plan.get("primary_scenario"),
+                "secondary": plan.get("secondary_scenario"),
+                "supports": plan.get("key_supports", [])[:4],
+                "resistances": plan.get("key_resistances", [])[:4],
+            },
+            sort_keys=True,
+            default=str,
+        )
+        return sha1(raw.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _event_signature(payload: dict) -> str:
+        return sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _split_zone_bounds(raw_zone: str) -> tuple[float, float]:
+        try:
+            cleaned = str(raw_zone).replace(" ", "")
+            if "-" not in cleaned:
+                value = float(cleaned)
+                return value, value
+            low, high = cleaned.split("-", 1)
+            return float(low), float(high)
+        except Exception:
+            return 0.0, 0.0
+
+    @staticmethod
+    def _parse_numeric_level(raw_value: Any) -> float:
+        try:
+            match = str(raw_value or "").replace(",", "")
+            found = "".join(ch for ch in match if ch.isdigit() or ch in ".-")
+            return float(found) if found else 0.0
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _scenario_zone_bounds(scenario: dict) -> tuple[str, str]:
+        zone = str(scenario.get("watch_zone") or "").replace(" ", "")
+        if "-" in zone:
+            low, high = zone.split("-", 1)
+            return low, high
+        level = zone or "n/a"
+        return level, level
+
+    def _build_market_plan_event_key(self, plan: dict) -> str:
+        primary = plan.get("primary_scenario", {}) or {}
+        secondary = plan.get("secondary_scenario", {}) or {}
+        p_low, p_high = self._scenario_zone_bounds(primary)
+        s_low, s_high = self._scenario_zone_bounds(secondary)
+        return (
+            f"market_plan:{plan.get('symbol', 'XAUUSD')}:{plan.get('dominant_bias', 'neutral')}:"
+            f"{primary.get('direction', '?')}:{p_low}:{p_high}:"
+            f"{secondary.get('direction', '?')}:{s_low}:{s_high}"
+        )
+
+    def _build_scenario_update_event_key(
+        self,
+        *,
+        symbol: str,
+        event_type: str,
+        old_scenario_key: str = "",
+        new_scenario_key: str = "",
+        level: str = "",
+        status: str = "",
+    ) -> str:
+        return f"scenario_update:{symbol}:{event_type}:{old_scenario_key}:{new_scenario_key}:{level}:{status}"
+
+    def _build_entry_event_key(self, confirmation, scenario_key: str) -> str:
+        zone_level = f"{confirmation.zone_low:.2f}-{confirmation.zone_high:.2f}"
+        candle_time = str(confirmation.candle_time)
+        return (
+            f"entry:XAUUSD:{confirmation.direction}:{scenario_key}:{confirmation.confirmation_type}:"
+            f"{zone_level}:{candle_time}"
+        )
+
+    @staticmethod
+    def _build_watch_zone_key(symbol: str, direction: str, zone_low: float, zone_high: float, status: str) -> str:
+        return f"watch_zone:{symbol}:{direction}:{zone_low:.2f}:{zone_high:.2f}:{status}"
+
+    @staticmethod
+    def _build_gap_watchlist_key(symbol: str, direction: str, level_price: float, timeframe_pair: str) -> str:
+        return f"gap_watchlist:{symbol}:{direction}:{level_price:.2f}:{timeframe_pair}"
+
+    def _load_memory(self) -> None:
+        try:
+            if not self._memory_file.exists():
+                self._save_memory()
+                return
+            payload = json.loads(self._memory_file.read_text(encoding="utf-8"))
+            self._last_market_plan_hash = payload.get("last_market_plan_hash")
+            self._last_session_market_plan = payload.get("last_session_market_plan")
+            self._last_primary_scenario_key = payload.get("last_primary_scenario_key")
+            self._watch_zone_state = {
+                str(key): value for key, value in (payload.get("watch_zone_state") or {}).items()
+            }
+            dedupe_payload = payload.get("alert_dedupe")
+            if dedupe_payload:
+                self._alert_dedupe.load_payload(dedupe_payload)
+            else:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                legacy_sent = {
+                    "scenario_update": {
+                        key: {"signature": key, "sent_at": value or now_iso, "metadata": {}}
+                        for key, value in self._normalize_memory_key_map(payload.get("analyst_scenario_update_keys")).items()
+                    },
+                    "analyst_entry": {
+                        key: {"signature": key, "sent_at": value or now_iso, "metadata": {}}
+                        for key, value in self._normalize_memory_key_map(payload.get("analyst_alerted_confirmations")).items()
+                    },
+                    "gap_watchlist": {
+                        key: {"signature": key, "sent_at": now_iso, "metadata": {}}
+                        for key in (payload.get("watchlist_keys") or [])
+                    },
+                }
+                self._alert_dedupe.load_payload({"sent": legacy_sent})
+            self._prune_memory()
+            self._sync_dedupe_summary()
+            logger.info(
+                "SPENCER MEMORY LOADED: market_plans=%d scenario_updates=%d entries=%d watchlists=%d watch_zones=%d",
+                len(self._alert_dedupe.sent.get("market_plan", {})),
+                len(self._alert_dedupe.sent.get("scenario_update", {})),
+                len(self._alert_dedupe.sent.get("analyst_entry", {})),
+                len(self._alert_dedupe.sent.get("gap_watchlist", {})),
+                len(self._watch_zone_state),
+            )
+        except Exception as exc:
+            try:
+                broken = self._memory_file.with_suffix(".broken.json")
+                if self._memory_file.exists():
+                    self._memory_file.replace(broken)
+            except Exception:
+                pass
+            logger.debug("Spencer memory load failed: %s", exc)
+            self._save_memory()
+
+    def _save_memory(self) -> None:
+        try:
+            self._prune_memory()
+            watch_zone_items = list((self._watch_zone_state or {}).items())[-100:]
+            payload = {
+                "last_market_plan_hash": self._last_market_plan_hash,
+                "last_session_market_plan": self._last_session_market_plan,
+                "last_primary_scenario_key": self._last_primary_scenario_key,
+                "watch_zone_state": dict(watch_zone_items),
+                "alert_dedupe": self._alert_dedupe.to_payload(),
+                "market_plan_signatures": self._alert_dedupe.sent.get("market_plan", {}),
+                "scenario_keys": self._alert_dedupe.sent.get("scenario_update", {}),
+                "watch_zone_states": dict(watch_zone_items),
+                "confirmation_keys": self._alert_dedupe.sent.get("analyst_entry", {}),
+                "decision_keys": self._alert_dedupe.sent.get("decision_engine", {}),
+                "active_trade_setups": {
+                    key: value.to_dict() for key, value in self.trade_management_engine._active_setups.items()
+                },
+                "trade_management_keys": self._alert_dedupe.sent.get("trade_management", {}),
+                "scenario_outcomes": {},
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._memory_file.write_text(json.dumps(payload), encoding="utf-8")
+            logger.info(
+                "SPENCER MEMORY SAVED: market_plans=%d scenario_updates=%d entries=%d watchlists=%d",
+                len(self._alert_dedupe.sent.get("market_plan", {})),
+                len(self._alert_dedupe.sent.get("scenario_update", {})),
+                len(self._alert_dedupe.sent.get("analyst_entry", {})),
+                len(self._alert_dedupe.sent.get("gap_watchlist", {})),
+            )
+        except Exception as exc:
+            logger.debug("Spencer memory save failed: %s", exc)
+
+    @staticmethod
+    def _normalize_memory_key_map(raw) -> Dict[str, str]:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if isinstance(raw, dict):
+            return {str(key): str(value) for key, value in raw.items()}
+        if isinstance(raw, list):
+            return {str(item): now_iso for item in raw}
+        return {}
+
+    @staticmethod
+    def _parse_iso_timestamp(raw: str | None) -> Optional[datetime]:
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    def _prune_memory(self) -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=SPENCER_MEMORY_RETENTION_HOURS)
+        removed = self._alert_dedupe.cleanup()
+        pruned_watch_zones: Dict[str, dict] = {}
+        for key, value in (self._watch_zone_state or {}).items():
+            persisted_at = self._parse_iso_timestamp((value or {}).get("persisted_at"))
+            if persisted_at is None or persisted_at >= cutoff:
+                pruned_watch_zones[str(key)] = value
+        self._watch_zone_state = pruned_watch_zones
+        if removed:
+            logger.info("SPENCER MEMORY CLEANUP: removed=%d expired_keys", removed)
+
+    def _sync_dedupe_summary(self) -> None:
+        skipped = self._alert_dedupe.skipped
+        self._last_scan_summary["alert_dedupe"] = {
+            "market_plan_skipped_duplicate": int(skipped.get("market_plan_unchanged_signature", 0) or 0),
+            "scenario_update_skipped_duplicate": int(skipped.get("scenario_update_unchanged_signature", 0) or 0),
+            "entry_skipped_duplicate": int(skipped.get("analyst_entry_unchanged_signature", 0) or 0) + int(skipped.get("analyst_entry_cooldown_active", 0) or 0),
+            "watchlist_skipped_duplicate": int(skipped.get("gap_watchlist_unchanged_signature", 0) or 0) + int(skipped.get("gap_watchlist_cooldown_active", 0) or 0),
+            "last_skip_reason": self._alert_dedupe.last_skip_reason,
+        }
+
+    @staticmethod
+    def _classify_analyst_setup(confirmation, active_signals: list) -> dict:
+        best = None
+        best_distance = 999999.0
+        for sig in active_signals or []:
+            if getattr(sig, "direction", "").upper() != confirmation.direction.upper():
+                continue
+            setup = getattr(sig, "setup", None)
+            if setup is None:
+                continue
+            sig_level = float(getattr(setup.level, "price", 0.0) or 0.0)
+            distance = min(
+                abs(sig_level - confirmation.zone_low),
+                abs(sig_level - confirmation.zone_high),
+                abs(sig_level - confirmation.suggested_entry),
+            )
+            if distance < best_distance:
+                best_distance = distance
+                best = sig
+
+        if best and best_distance <= LEVEL_CROWDING_PIPS:
+            setup = getattr(best, "setup", None)
+            strategy_name = getattr(best, "strategy_name", "analyst_layer")
+            logger.info(
+                "STRATEGY CLASSIFIED SETUP: strategy=%s analyst_scenario=%s_%s",
+                strategy_name,
+                confirmation.direction,
+                f"{confirmation.zone_low:.2f}_{confirmation.zone_high:.2f}",
+            )
+            return {
+                "strategy_type": strategy_name,
+                "strategy_suggested_entry": float(getattr(getattr(setup, "confirmation", None), "entry_price", confirmation.suggested_entry) or confirmation.suggested_entry),
+                "strategy_suggested_sl": float(getattr(getattr(setup, "confirmation", None), "sl_price", confirmation.suggested_sl) or confirmation.suggested_sl),
+                "strategy_suggested_tp1": float(getattr(getattr(setup, "confirmation", None), "tp1", confirmation.suggested_tps.get("tp1", 0.0)) or confirmation.suggested_tps.get("tp1", 0.0)),
+                "strategy_suggested_tp2": float(getattr(getattr(setup, "confirmation", None), "tp2", confirmation.suggested_tps.get("tp2", 0.0)) or confirmation.suggested_tps.get("tp2", 0.0)),
+                "strategy_suggested_tp3": float(getattr(getattr(setup, "confirmation", None), "tp3", confirmation.suggested_tps.get("tp3", 0.0)) or confirmation.suggested_tps.get("tp3", 0.0)),
+            }
+        return {"strategy_type": "analyst_layer"}
+
     def _write_heartbeat(self, in_silent_phase: bool, signals: list, ctx, current_price: Optional[float], tick: Optional[dict]) -> None:
         """Write bot_heartbeat.json so the API can surface analyzing/watching status."""
         try:
+            runtime_control = self._read_runtime_control()
             status = "analyzing" if in_silent_phase else "watching"
             message = "Spencer is analyzing charts" if in_silent_phase else "Spencer is watching the market"
             session = getattr(ctx, "session_name", None) if ctx else None
@@ -620,8 +1825,30 @@ class AlphaPulse:
             scan_result = (
                 f"{alerts_sent} watchlist alert(s) sent"
                 if alerts_sent > 0
+                else f"all current setups already alerted" if reject_reason in {"all_alerted", "duplicate"}
                 else f"no setups — {reject_reason}" if reject_reason else "watching for setups"
             )
+            telegram_block = {
+                "last_status": ss.get("last_telegram_status", "none"),
+                "last_alert_type": ss.get("last_telegram_alert_type") or None,
+                "last_alert_time": ss.get("last_telegram_alert_time") or None,
+                "last_error": ss.get("last_telegram_error") or None,
+            }
+            scan_summary = {
+                "levels_detected": ss.get("levels_detected", 0),
+                "gap_levels": ss.get("gap_levels", 0),
+                "bias_passed": ss.get("bias_passed", 0),
+                "sweep_confirmed": ss.get("sweep_confirmed", 0),
+                "session_passed": ss.get("session_passed", 0),
+                "distance_passed": ss.get("distance_passed", 0),
+                "watchlist_candidates": ss.get("watchlist_candidates", 0),
+                "alerts_sent": ss.get("last_alerts_sent", 0),
+                "alerts_failed": ss.get("last_alerts_failed", 0),
+                "reject_reasons": {
+                    ss.get("last_reject_reason", "unknown") or "unknown": 1,
+                    "duplicate": ss.get("dedupe_rejections", 0),
+                },
+            }
             data = {
                 "status":               status,
                 "message":              message,
@@ -632,9 +1859,12 @@ class AlphaPulse:
                 "last_scan_symbol":     "XAUUSD",
                 "last_candidates_count": ss.get("last_candidates_count", 0),
                 "last_alerts_sent":     ss.get("last_alerts_sent", 0),
+                "last_alerts_failed":   ss.get("last_alerts_failed", 0),
                 "last_reject_reason":   ss.get("last_reject_reason", ""),
                 "last_telegram_status": ss.get("last_telegram_status", "none"),
                 "last_telegram_error":  ss.get("last_telegram_error", ""),
+                "last_telegram_alert_type": ss.get("last_telegram_alert_type", ""),
+                "last_telegram_alert_time": ss.get("last_telegram_alert_time", ""),
                 "last_scan_number":     ss.get("last_scan_number", self._scan_count),
                 "session_blocking":     ss.get("session_blocking", False),
                 "instance_id":          self._instance_id,
@@ -658,6 +1888,23 @@ class AlphaPulse:
                 "last_market_update_at": datetime.now(timezone.utc).isoformat(),
                 "live_enabled_strategies": list(LIVE_ENABLED_STRATEGIES),
                 "research_only_strategies": list(RESEARCH_ONLY_STRATEGIES),
+                "market_session":       session,
+                "scan_allowed":         True,
+                "last_scan_summary":    scan_summary,
+                "instance_totals":      ss.get("instance_totals", {}),
+                "strategy_scans":       ss.get("strategy_scans", {}),
+                "market_plan":          self._market_plan,
+                "alert_dedupe":         ss.get("alert_dedupe", {}),
+                "five_layer_status":    ss.get("five_layer_status", {}),
+                "active_instance_id":   runtime_control.get("active_instance_id"),
+                "background_tasks_active": sum(1 for active in self._background_tasks.values() if active),
+                "runtime_alerts_enabled": bool(
+                    TELEGRAM_RUNTIME_ALERTS_ENABLED
+                    and runtime_control.get("runtime_alerts_enabled", False)
+                    and not self._runtime_alerts_disabled_flag.exists()
+                ),
+                "shutdown_event_set":   bool(runtime_control.get("shutdown_requested", False)),
+                "telegram":             telegram_block,
             }
             self._heartbeat_file.write_text(json.dumps(data), encoding="utf-8")
         except Exception as exc:
@@ -925,9 +2172,13 @@ class AlphaPulse:
                     _gap_levels += 1
 
                 direction = self._level_trade_direction(level, current_price)
-                alert_key = self._watchlist_key(outlook.pair, level, direction)
+                alert_key = self._watchlist_key(outlook.pair, level, direction, tf_pair)
                 level_id = self._watch_key(outlook.pair, level.price)
-                already_alerted = alert_key in self._watchlist_alerted
+                already_alerted, _ = self._alert_dedupe.find_recent_matching(
+                    "gap_watchlist",
+                    lambda event_key, _entry: event_key == alert_key,
+                    cooldown_seconds=24 * 60 * 60,
+                )
                 runtime_logger.info(
                     "WATCHLIST DEDUPE CHECK: setup_key=%s | already_alerted=%s",
                     alert_key,
@@ -1007,11 +2258,18 @@ class AlphaPulse:
                 "last_alerts_sent": 0,
                 "last_alerts_failed": 0,
                 "last_reject_reason": _no_reason,
-                "last_telegram_status": "none",
-                "last_telegram_error": "",
                 "last_scan_number": self._scan_count,
                 "session_blocking": False,
+                "levels_detected": _levels_scanned,
+                "gap_levels": _gap_levels,
+                "bias_passed": 0,
+                "sweep_confirmed": 0,
+                "session_passed": 0 if _no_reason == "session_blocked" else 1,
+                "distance_passed": 0,
+                "watchlist_candidates": 0,
+                "dedupe_rejections": _already_alerted,
             })
+            self._last_scan_summary["instance_totals"]["duplicates_blocked"] += _already_alerted
             runtime_logger.info(
                 "SCAN SUMMARY: %s",
                 json.dumps({
@@ -1033,6 +2291,12 @@ class AlphaPulse:
                         "unknown": 1 if _no_reason not in {"no_gap_level", "session_blocked", "distance_rejected", "score_too_low"} else 0,
                     },
                 }),
+            )
+            runtime_logger.info(
+                "DASHBOARD STATUS UPDATED: alerts_sent_this_scan=%d total_alerts=%d telegram=%s",
+                0,
+                self._last_scan_summary["instance_totals"]["alerts_sent"],
+                self._last_scan_summary.get("last_telegram_status", "none"),
             )
             return 0
 
@@ -1107,7 +2371,15 @@ class AlphaPulse:
                 psych_strength=getattr(level, "psych_strength", ""),
             )
             if sent:
-                self._watchlist_alerted.add(candidate["alert_key"])
+                self._alert_dedupe.mark_alert_sent(
+                    "gap_watchlist",
+                    candidate["alert_key"],
+                    candidate["alert_key"],
+                    metadata={"symbol": outlook.pair, "direction": candidate["direction"], "timeframe_pair": candidate["tf_pair"]},
+                )
+                logger.info("WATCHLIST MEMORY SAVED: setup_key=%s", candidate["alert_key"])
+                self._save_memory()
+                self._persist_gap_watchlist_candidate(outlook, candidate, bias)
                 horizon_counts[horizon] = horizon_counts.get(horizon, 0) + 1
                 sent_count += 1
                 logger.info(
@@ -1153,9 +2425,24 @@ class AlphaPulse:
             "last_reject_reason":    "" if sent_count > 0 else ("telegram_failed" if failed_count > 0 else ""),
             "last_telegram_status":  _tg_status,
             "last_telegram_error":   _tg_error,
+            "last_telegram_alert_type": "watchlist" if (sent_count or failed_count) else self._last_scan_summary.get("last_telegram_alert_type", ""),
+            "last_telegram_alert_time": datetime.now(timezone.utc).isoformat() if (sent_count or failed_count) else self._last_scan_summary.get("last_telegram_alert_time", ""),
             "last_scan_number":      self._scan_count,
             "session_blocking":      False,
+            "levels_detected":       _levels_scanned,
+            "gap_levels":            _gap_levels,
+            "bias_passed":           len(candidates),
+            "sweep_confirmed":       0,
+            "session_passed":        1,
+            "distance_passed":       len(ranked),
+            "watchlist_candidates":  len(ranked),
+            "dedupe_rejections":     _already_alerted,
         })
+        self._last_scan_summary["instance_totals"]["total_candidates_found"] += len(candidates)
+        self._last_scan_summary["instance_totals"]["watchlist_candidates"] += len(ranked)
+        self._last_scan_summary["instance_totals"]["alerts_sent"] += sent_count
+        self._last_scan_summary["instance_totals"]["alerts_failed"] += failed_count
+        self._last_scan_summary["instance_totals"]["duplicates_blocked"] += _already_alerted
         runtime_logger.info(
             "SCAN SUMMARY: %s",
             json.dumps({
@@ -1176,8 +2463,125 @@ class AlphaPulse:
                 },
             }),
         )
+        runtime_logger.info(
+            "DASHBOARD STATUS UPDATED: alerts_sent_this_scan=%d total_alerts=%d telegram=%s",
+            sent_count,
+            self._last_scan_summary["instance_totals"]["alerts_sent"],
+            _tg_status,
+        )
 
         return sent_count
+
+    def _persist_gap_watchlist_candidate(self, outlook, candidate: dict, bias: str) -> None:
+        try:
+            level = candidate["level"]
+            context = getattr(outlook, "context", None)
+            payload = {
+                "setup_key": candidate["alert_key"],
+                "source": "live_bot",
+                "strategy_type": "gap_liquidity_sweep_reclaim",
+                "alert_stage": "watchlist",
+                "setup_status": "watching",
+                "symbol": outlook.pair,
+                "direction": candidate["direction"],
+                "level_type": getattr(level, "level_type", "Gap"),
+                "level_price": float(getattr(level, "price", 0.0) or 0.0),
+                "level_high": float(getattr(level, "zone_high", getattr(level, "price", 0.0)) or 0.0),
+                "level_low": float(getattr(level, "zone_low", getattr(level, "price", 0.0)) or 0.0),
+                "timeframe": getattr(level, "timeframe", ""),
+                "timeframe_pair": candidate["tf_pair"],
+                "session_name": getattr(context, "session_name", "off_session") if context else "off_session",
+                "dominant_bias": getattr(context, "dominant_bias", "neutral") if context else "neutral",
+                "bias_strength": getattr(context, "bias_strength", "weak") if context else "weak",
+                "pd_location": "",
+                "distance_to_level_pips": round(float(candidate["distance_pips"]), 2),
+                "quality_score": round(float(candidate["score"]), 2),
+                "learning_score": 0.0,
+                "learning_context": "",
+                "watchlist_alert_sent": True,
+                "watchlist_alert_sent_at": datetime.now(timezone.utc).isoformat(),
+                "entry_alert_sent": False,
+                "telegram_alert_sent": True,
+                "telegram_alert_sent_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self.db.upsert_live_setup(payload)
+        except Exception as exc:
+            logger.debug("Gap watchlist persistence skipped: %s", exc)
+
+    def _record_live_alert(self, strategy_name: str, trade, *, alert_stage: str) -> None:
+        if self.learning is not None:
+            profile = self.learning.get_strategy_learning_profile(
+                strategy_name,
+                {
+                    "session_name": getattr(trade, "session_name", ""),
+                    "timeframe": getattr(trade, "lower_tf", ""),
+                    "direction": getattr(trade, "direction", ""),
+                    "dominant_bias": getattr(trade, "dominant_bias", ""),
+                    "bias_strength": getattr(trade, "bias_strength", ""),
+                    "confirmation_type": getattr(trade, "confirmation_type", ""),
+                },
+            )
+        else:
+            profile = {
+                "sample_size": 0,
+                "win_rate": 0.0,
+                "net_pips": 0.0,
+                "confidence_tier": "low",
+                "recommended_weight": 0.85,
+                "warning": "low sample",
+            }
+
+        learning_context = (
+            f"Historical profile: {strategy_name} | sample={profile.get('sample_size', 0)} "
+            f"| WR={profile.get('win_rate', 0.0)}% | net={profile.get('net_pips', 0.0):+}p "
+            f"| confidence={profile.get('warning') or profile.get('confidence_tier', 'low')}"
+        )
+        setattr(trade, "learning_context", learning_context)
+
+        try:
+            if strategy_name == "gap_liquidity_sweep_reclaim":
+                setup_key = f"{trade.pair}_{trade.direction}_{round(float(getattr(trade, 'level_price', getattr(trade, 'entry_price', 0.0)) or 0.0), 2)}"
+            else:
+                setup_key = f"{trade.pair}_{trade.direction}_{round(float(getattr(trade, 'entry_price', 0.0) or 0.0), 2)}_{strategy_name}"
+            payload = {
+                "setup_key": setup_key,
+                "source": "live_bot",
+                "strategy_type": strategy_name,
+                "alert_stage": alert_stage,
+                "setup_status": "entry_confirmed" if alert_stage == "entry" else "watching",
+                "symbol": trade.pair,
+                "direction": trade.direction,
+                "entry": trade.entry_price,
+                "sl": trade.sl_price,
+                "tp1": trade.tp1,
+                "tp2": trade.tp2,
+                "tp3": trade.tp3,
+                "level_type": getattr(trade, "level_type", ""),
+                "level_price": getattr(trade, "level_price", None),
+                "level_high": getattr(trade, "level_price", None),
+                "level_low": getattr(trade, "level_price", None),
+                "timeframe": getattr(trade, "lower_tf", ""),
+                "timeframe_pair": f"{getattr(trade, 'higher_tf', '')}->{getattr(trade, 'lower_tf', '')}",
+                "session_name": getattr(trade, "session_name", ""),
+                "dominant_bias": getattr(trade, "dominant_bias", ""),
+                "bias_strength": getattr(trade, "bias_strength", ""),
+                "confirmation_type": getattr(trade, "confirmation_type", ""),
+                "confirmation_score": getattr(trade, "confirmation_score", 0.0),
+                "pd_location": getattr(trade, "pd_location", ""),
+                "learning_score": profile.get("recommended_weight", 0.85),
+                "learning_context": learning_context,
+                "quality_rejection_count": getattr(trade, "quality_rejection_count", 0),
+                "structure_break_count": getattr(trade, "structure_break_count", 0),
+                "entry_alert_sent": alert_stage == "entry",
+                "entry_alert_sent_at": datetime.now(timezone.utc).isoformat() if alert_stage == "entry" else None,
+                "telegram_alert_sent": True,
+                "telegram_alert_sent_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self.db.upsert_live_setup(payload)
+        except Exception as exc:
+            logger.debug("Live setup persistence skipped: %s", exc)
 
     @staticmethod
     def _outlook_fingerprint(outlook) -> str:
@@ -1442,13 +2846,16 @@ class AlphaPulse:
         return f"{symbol}_{round(level_price, 2)}"
 
     @staticmethod
-    def _watchlist_key(symbol: str, level, direction: str) -> str:
+    def _watchlist_key(symbol: str, level, direction: str, timeframe_pair: str) -> str:
         """
         Deduplication key for pre-confirmation setup/watchlist alerts.
         This is separate from signal fingerprints because selected levels are
-        not full trade signals yet.
+        not full trade signals yet. It intentionally stays stable across
+        timeframe-group reshuffles so the same price/direction is only
+        announced once per bot instance; the next alert for that setup should
+        be the confirmation / pending-order flow.
         """
-        return f"{symbol}_{direction}_{round(level.price, 2)}"
+        return AlphaPulse._build_gap_watchlist_key(symbol, direction, float(level.price), timeframe_pair)
 
     def _mark_level_confirmed(self, level_id: str):
         """Level has produced a confirmed trade — suppress further watch alerts."""
@@ -1470,6 +2877,18 @@ class AlphaPulse:
 
     def stop(self):
         self._running = False
+        self._background_tasks["scan_loop"] = False
+        self._background_tasks["heartbeat_writer"] = False
+        self._background_tasks["runtime_alerts"] = False
+        self._background_tasks["market_analyst_loop"] = False
+        self._background_tasks["watchlist_loop"] = False
+        logger.info("BACKGROUND TASK CANCELLED: name=scan_loop")
+        logger.info("BACKGROUND TASK CANCELLED: name=heartbeat_writer")
+        logger.info("BACKGROUND TASK CANCELLED: name=runtime_alerts")
+        logger.info("BACKGROUND TASK CANCELLED: name=market_analyst_loop")
+        logger.info("BACKGROUND TASK CANCELLED: name=watchlist_loop")
+        logger.info("MT5 MONITOR STOPPED")
+        logger.info("MARKET DATA MONITOR STOPPED")
         logger.info("Shutting down AlphaPulse...")
         runtime_logger.info("BOT INSTANCE STOPPED: instance_id=%s", self._instance_id)
         runtime_logger.info("BOT STOPPED")

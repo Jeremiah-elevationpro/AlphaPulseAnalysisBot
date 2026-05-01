@@ -165,7 +165,18 @@ export default function Signals() {
 }
 
 function formatStrategy(value?: string | null) {
-  return (value ?? "gap_sweep").replace(/_/g, " ")
+  const canonical = value ?? "gap_liquidity_sweep_reclaim"
+  const labels: Record<string, string> = {
+    gap_sweep: "Gap Sweep",
+    gap_liquidity_sweep_reclaim: "Gap Sweep",
+    engulfing: "Engulfing Rejection",
+    engulfing_rejection: "Engulfing Rejection",
+    break_retest: "Break + Retest",
+    standard_break_retest: "Break + Retest",
+    failed_engulf: "Failed Engulf Break + Retest",
+    failed_engulf_break_retest: "Failed Engulf Break + Retest",
+  }
+  return labels[canonical] ?? canonical.replace(/_/g, " ")
 }
 
 function Pill({ options, active, onChange }: { options: string[]; active: string; onChange: (value: string) => void }) {

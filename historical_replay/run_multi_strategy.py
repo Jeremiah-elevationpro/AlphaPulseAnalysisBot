@@ -69,6 +69,7 @@ def main() -> None:
         help="End date ISO8601 (overrides --months)",
     )
     args = parser.parse_args()
+    print("MULTI-STRATEGY REPLAY IS EXPERIMENTAL — not used for approved learning")
 
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
     if not strategies:

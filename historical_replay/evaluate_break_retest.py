@@ -14,6 +14,8 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from typing import Dict, Iterable, List
 
+from config.settings import STANDARD_BRT_ALLOWED_CONFIRMATIONS
+
 
 def build_report(run: Dict, stats_rows: List[Dict], trades: List[Dict], *, show_trades: int = 20) -> str:
     activated = [
@@ -30,6 +32,11 @@ def build_report(run: Dict, stats_rows: List[Dict], trades: List[Dict], *, show_
     net_pips = sum(_to_float(t.get("final_pips")) for t in activated)
 
     strategy_type = run.get("strategy_type") or run.get("strategy_group") or "break_retest"
+    approved_confirmation_types = set(STANDARD_BRT_ALLOWED_CONFIRMATIONS)
+    approved_trades = [
+        t for t in activated
+        if (t.get("retest_confirmation_type") or t.get("confirmation_path")) in approved_confirmation_types
+    ]
 
     lines = [
         "AlphaPulse Break + Retest Research Report",
@@ -37,7 +44,7 @@ def build_report(run: Dict, stats_rows: List[Dict], trades: List[Dict], *, show_
         f"Run ID:   {run.get('id')}",
         f"Strategy: {strategy_type}",
         f"Symbol:   {run.get('symbol')} | Status: {run.get('status')}",
-        f"Period:   {run.get('replay_start')} → {run.get('replay_end')}",
+        f"Period:   {run.get('replay_start')} -> {run.get('replay_end')}",
         "",
         "─" * 44,
         "SUMMARY",
@@ -90,6 +97,8 @@ def build_report(run: Dict, stats_rows: List[Dict], trades: List[Dict], *, show_
         "",
         _format_breakdown("By Confirmation Type",   _group(activated, "retest_confirmation_type")),
         "",
+        _format_approved_mode_estimate(strategy_type, approved_trades),
+        "",
         _format_breakdown("By Source Level Type",   _group(activated, "source_level_type")),
         "",
         "─" * 44,
@@ -122,6 +131,26 @@ def build_report(run: Dict, stats_rows: List[Dict], trades: List[Dict], *, show_
             )
 
     return "\n".join(lines)
+
+
+def _format_approved_mode_estimate(strategy_type: str, approved_trades: List[Dict]) -> str:
+    if strategy_type != "standard_break_retest":
+        return "Approved Mode Estimate: not applicable"
+    wins = sum(1 for t in approved_trades if t.get("final_result") != "LOSS")
+    losses = sum(1 for t in approved_trades if t.get("final_result") == "LOSS")
+    trades = len(approved_trades)
+    net_pips = sum(_to_float(t.get("final_pips")) for t in approved_trades)
+    avg_pips = (net_pips / trades) if trades else 0.0
+    win_rate = (wins / trades * 100) if trades else 0.0
+    return "\n".join([
+        "Approved Mode Estimate:",
+        "  confirmation_type: close_confirmation only",
+        f"  trades: {trades}",
+        f"  wins/losses: {wins}/{losses}",
+        f"  win_rate: {win_rate:.1f}%",
+        f"  net_pips: {net_pips:.1f}",
+        f"  avg_pips: {avg_pips:.1f}",
+    ])
 
 
 # ─────────────────────────────────────────────────────────────────────────────

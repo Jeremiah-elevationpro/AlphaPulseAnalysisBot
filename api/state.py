@@ -18,6 +18,8 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 # richer status (analyzing / watching) without needing shared memory.
 HEARTBEAT_FILE = ROOT_DIR / "bot_heartbeat.json"
 RUNTIME_LOG_FILE = ROOT_DIR / "logs" / "spencer_runtime.log"
+BOT_RUNTIME_CONTROL_FILE = ROOT_DIR / "bot_runtime_control.json"
+RUNTIME_ALERTS_DISABLED_FLAG = ROOT_DIR / "runtime_alerts_disabled.flag"
 
 bot_process: Optional[Popen] = None
 
@@ -39,12 +41,34 @@ bot_state: dict = {
     "last_scan_symbol":       "XAUUSD",
     "last_candidates_count":  0,
     "last_alerts_sent":       0,
+    "last_alerts_failed":     0,
     "last_reject_reason":     None,
     "last_telegram_status":   None,
     "last_telegram_error":    None,
+    "last_telegram_alert_type": None,
+    "last_telegram_alert_time": None,
     "last_scan_number":       0,
     "session_blocking":       False,
     "instance_id":            None,
+    "scan_allowed":           True,
+    "levels_detected":        0,
+    "gap_levels":             0,
+    "bias_passed":            0,
+    "sweep_confirmed":        0,
+    "session_passed":         0,
+    "distance_passed":        0,
+    "watchlist_candidates":   0,
+    "alerts_sent_this_scan":  0,
+    "alerts_failed_this_scan": 0,
+    "dedupe_rejections":      0,
+    "total_scans":            0,
+    "total_candidates_found": 0,
+    "total_watchlist_candidates": 0,
+    "total_alerts_sent":      0,
+    "total_alerts_failed":    0,
+    "total_duplicates_blocked": 0,
+    "total_manual_alerts_sent": 0,
+    "total_confirmation_alerts_sent": 0,
     "bot_window_active":      None,
     "local_time":             None,
     "active_until":           None,
@@ -59,9 +83,24 @@ bot_state: dict = {
     "dominant_bias":          None,
     "bias_strength":          None,
     "last_market_update_at":      None,
-    "live_enabled_strategies":    ["gap_sweep"],
-    "research_only_strategies":   None,
+    "live_enabled_strategies":    ["gap_liquidity_sweep_reclaim", "engulfing_rejection", "standard_break_retest"],
+    "research_only_strategies":   ["failed_engulf_break_retest"],
+    "strategy_scans":             {},
     "operating_mode":             "24_7",
+    "market_plan":                None,
+    "five_layer_status":          {},
+    "active_instance_id":         None,
+    "bot_process_alive":          False,
+    "background_tasks_active":    0,
+    "runtime_alerts_enabled":     False,
+    "last_shutdown_time":         None,
+    "alert_dedupe":               {
+        "market_plan_skipped_duplicate": 0,
+        "scenario_update_skipped_duplicate": 0,
+        "entry_skipped_duplicate": 0,
+        "watchlist_skipped_duplicate": 0,
+        "last_skip_reason": None,
+    },
 }
 
 replay_runs: dict[int, dict] = {}
@@ -108,6 +147,40 @@ def clear_heartbeat() -> None:
             HEARTBEAT_FILE.unlink()
     except Exception:
         pass
+
+
+def read_runtime_control() -> dict:
+    try:
+        if BOT_RUNTIME_CONTROL_FILE.exists():
+            return json.loads(BOT_RUNTIME_CONTROL_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {
+        "status": "offline",
+        "active_instance_id": None,
+        "runtime_alerts_enabled": False,
+        "shutdown_requested": False,
+        "last_shutdown_time": None,
+    }
+
+
+def write_runtime_control(
+    *,
+    status: str,
+    active_instance_id: str | None,
+    runtime_alerts_enabled: bool,
+    shutdown_requested: bool,
+    last_shutdown_time: str | None = None,
+) -> None:
+    payload = {
+        "status": status,
+        "active_instance_id": active_instance_id,
+        "runtime_alerts_enabled": runtime_alerts_enabled,
+        "shutdown_requested": shutdown_requested,
+        "last_shutdown_time": last_shutdown_time,
+        "updated_at": now_iso(),
+    }
+    BOT_RUNTIME_CONTROL_FILE.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def mark_db_failure() -> None:

@@ -63,13 +63,13 @@ class HistoricalReplayEngine:
         self.mt5 = mt5 or MT5Client()
         self.strategy_manager = strategy_manager or StrategyManager(
             learning_engine=None,
-            enabled_strategies=["gap_sweep"],
+            enabled_strategies=["gap_liquidity_sweep_reclaim"],
         )
         self.signal_generator = signal_generator or SignalGenerator(learning_engine=None)
         self.session_filter = SessionFilter()
         self._engulfing_adapter = EngulfingReplayAdapter()
         self.storage = ReplayStorage(self.db)
-        self._enabled_replay_strategies = list(getattr(self.strategy_manager, "enabled_strategies", ["gap_sweep"]))
+        self._enabled_replay_strategies = list(getattr(self.strategy_manager, "enabled_strategies", ["gap_liquidity_sweep_reclaim"]))
         if DISABLED_TIMEFRAME_PAIRS:
             disabled = ", ".join(f"{high}->{low}" for high, low in DISABLED_TIMEFRAME_PAIRS)
             logger.info("Historical replay disabled timeframe pair(s): %s", disabled)
@@ -241,7 +241,7 @@ class HistoricalReplayEngine:
                     continue
 
                 # ── Gap-specific replay filters ───────────────────────────────
-                if signal.strategy_name == "gap_sweep":
+                if signal.strategy_name == "gap_liquidity_sweep_reclaim":
                     # Hard block: no counter-bias Gap trades in replay
                     bias_gate = getattr(signal.setup, "bias_gate_result", "") or ""
                     if "passed_counter_" in bias_gate:
@@ -251,21 +251,11 @@ class HistoricalReplayEngine:
                         )
                         continue
 
-                    # Hard block: PD location safety
                     pd_loc = getattr(signal.setup, "pd_location", "") or "unknown"
-                    sig_dir = (getattr(signal.setup, "direction", "") or "").upper()
-                    bias_strength = getattr(signal.setup, "bias_strength", "") or "weak"
-                    if sig_dir == "SELL" and pd_loc == "discount":
-                        logger.info(
-                            "GAP PD SAFETY REJECT: SELL in discount | unfavorable PD zone"
-                        )
-                        continue
-                    if sig_dir == "BUY" and pd_loc == "premium" and bias_strength != "strong":
-                        logger.info(
-                            "GAP PD SAFETY REJECT: BUY in premium without strong bias | strength=%s",
-                            bias_strength,
-                        )
-                        continue
+                    logger.info(
+                        "GAP PD CONTEXT: pd_location=%s used as scoring context only",
+                        pd_loc,
+                    )
 
                 key = signal.fingerprint()
                 if key in seen_pending or key in pending or key in activated_or_closed:
@@ -330,11 +320,11 @@ class HistoricalReplayEngine:
             strategy_balance=strategy_balance,
         )
         logger.info(
-            "MULTI STRATEGY SCAN BALANCE: gap_sweep scans_run=%d candidates=%d activated=%d | "
+            "MULTI STRATEGY SCAN BALANCE: gap_liquidity_sweep_reclaim scans_run=%d candidates=%d activated=%d | "
             "engulfing_rejection scans_run=%d candidates=%d activated=%d",
-            strategy_balance["gap_sweep"]["scans_run"],
-            strategy_balance["gap_sweep"]["candidates_found"],
-            strategy_balance["gap_sweep"]["activated_trades"],
+            strategy_balance["gap_liquidity_sweep_reclaim"]["scans_run"],
+            strategy_balance["gap_liquidity_sweep_reclaim"]["candidates_found"],
+            strategy_balance["gap_liquidity_sweep_reclaim"]["activated_trades"],
             strategy_balance["engulfing_rejection"]["scans_run"],
             strategy_balance["engulfing_rejection"]["candidates_found"],
             strategy_balance["engulfing_rejection"]["activated_trades"],
@@ -581,7 +571,7 @@ class HistoricalReplayEngine:
     @staticmethod
     def _init_strategy_balance() -> Dict[str, Dict[str, float]]:
         return {
-            "gap_sweep": {
+            "gap_liquidity_sweep_reclaim": {
                 "scans_run": 0,
                 "candidates_found": 0,
                 "pending_ready": 0,
@@ -609,7 +599,7 @@ class HistoricalReplayEngine:
 
     @staticmethod
     def _record_closed_trade(strategy_balance: Dict[str, Dict[str, float]], replay_trade: PendingReplayTrade) -> None:
-        strategy_name = getattr(replay_trade.trade, "strategy_type", "gap_sweep") or "gap_sweep"
+        strategy_name = getattr(replay_trade.trade, "strategy_type", "gap_liquidity_sweep_reclaim") or "gap_liquidity_sweep_reclaim"
         if strategy_name not in strategy_balance:
             return
         bucket = strategy_balance[strategy_name]

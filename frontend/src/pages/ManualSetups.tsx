@@ -31,7 +31,14 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
 import { Switch } from "@/components/ui/switch"
-import { useCreateSetup, useSetups, useUpdateSetup } from "@/hooks/use-data"
+import {
+  useActiveSetups,
+  useCreateSetup,
+  useResendSetupAlert,
+  useSetupHistory,
+  useUpdateSetup,
+  useUpdateSetupStatus,
+} from "@/hooks/use-data"
 
 type Direction = "BUY" | "SELL"
 type TimeframePair = "M30 -> M15" | "H1 -> M15" | "H4 -> H1"
@@ -50,6 +57,11 @@ type ActivationMode =
 type ManualSetupStatus =
   | "draft"
   | "watching"
+  | "approaching_entry"
+  | "entry_touched"
+  | "confirmation_waiting"
+  | "confirmed"
+  | "active"
   | "pending-order-ready"
   | "activated"
   | "TP1 hit"
@@ -59,6 +71,11 @@ type ManualSetupStatus =
   | "stopped out"
   | "closed manually"
   | "expired"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "invalidated"
+  | "archived"
 
 interface ManualSetup {
   id: number
@@ -83,6 +100,12 @@ interface ManualSetup {
   trackingStatus: string
   telegramAlertSent: boolean
   telegramError?: string | null
+  lastAlertType?: string | null
+  lastAlertTime?: string | null
+  currentPrice?: number | null
+  distanceToEntryPips?: number | null
+  completionNote?: string | null
+  closedAt?: string | null
   createdAt: string
   updatedAt: string
 }
@@ -126,6 +149,11 @@ const STATUS_ORDER: ManualSetupStatus[] = [
   "draft",
   "watching",
   "pending-order-ready",
+  "approaching_entry",
+  "entry_touched",
+  "confirmation_waiting",
+  "confirmed",
+  "active",
   "activated",
   "TP1 hit",
   "BE protected",
@@ -134,12 +162,22 @@ const STATUS_ORDER: ManualSetupStatus[] = [
   "stopped out",
   "closed manually",
   "expired",
+  "completed",
+  "failed",
+  "cancelled",
+  "invalidated",
+  "archived",
 ]
 
 const STATUS_CFG: Record<ManualSetupStatus, { variant: "gold" | "buy" | "sell" | "warn" | "muted" | "outline"; glow: string }> = {
   draft: { variant: "muted", glow: "border-ap-border" },
   watching: { variant: "outline", glow: "border-gold-500/25" },
   "pending-order-ready": { variant: "gold", glow: "border-gold-500/35" },
+  approaching_entry: { variant: "outline", glow: "border-gold-500/25" },
+  entry_touched: { variant: "gold", glow: "border-gold-500/35" },
+  confirmation_waiting: { variant: "outline", glow: "border-purple-400/25" },
+  confirmed: { variant: "outline", glow: "border-purple-400/30" },
+  active: { variant: "buy", glow: "border-buy/30" },
   activated: { variant: "buy", glow: "border-buy/30" },
   "TP1 hit": { variant: "buy", glow: "border-buy/35" },
   "BE protected": { variant: "gold", glow: "border-gold-500/35" },
@@ -148,6 +186,11 @@ const STATUS_CFG: Record<ManualSetupStatus, { variant: "gold" | "buy" | "sell" |
   "stopped out": { variant: "sell", glow: "border-sell/35" },
   "closed manually": { variant: "warn", glow: "border-warn/35" },
   expired: { variant: "muted", glow: "border-ap-border" },
+  completed: { variant: "buy", glow: "border-buy/35" },
+  failed: { variant: "sell", glow: "border-sell/35" },
+  cancelled: { variant: "warn", glow: "border-warn/35" },
+  invalidated: { variant: "sell", glow: "border-sell/35" },
+  archived: { variant: "muted", glow: "border-ap-border" },
 }
 
 const DEFAULT_FORM: SetupForm = {
@@ -170,18 +213,19 @@ const DEFAULT_FORM: SetupForm = {
 }
 
 export default function ManualSetups() {
-  const setupsQuery = useSetups()
+  const activeSetupsQuery = useActiveSetups()
+  const historySetupsQuery = useSetupHistory()
   const createSetup = useCreateSetup()
   const updateSetup = useUpdateSetup()
+  const updateSetupStatus = useUpdateSetupStatus()
+  const resendSetupAlert = useResendSetupAlert()
   const [form, setForm] = useState<SetupForm>(DEFAULT_FORM)
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [editingId, setEditingId] = useState<number | null>(null)
   const [successMessage, setSuccessMessage] = useState<string | null>(null)
 
   const preview = useMemo(() => buildPreview(form), [form])
-  const setups = useMemo<ManualSetup[]>(
-    () =>
-      (setupsQuery.data?.setups ?? []).map((setup) => ({
+  const mapSetup = (setup: any): ManualSetup => ({
         id: setup.id,
         symbol: setup.symbol,
         direction: setup.direction,
@@ -204,12 +248,19 @@ export default function ManualSetups() {
         trackingStatus: (setup as any).tracking_status ?? "watching",
         telegramAlertSent: (setup as any).telegram_alert_sent ?? false,
         telegramError: (setup as any).telegram_error ?? null,
+        lastAlertType: (setup as any).last_alert_type ?? null,
+        lastAlertTime: (setup as any).last_alert_time ? formatApiDate((setup as any).last_alert_time) : null,
+        currentPrice: (setup as any).current_price ?? null,
+        distanceToEntryPips: (setup as any).distance_to_entry_pips ?? null,
+        completionNote: (setup as any).completion_note ?? null,
+        closedAt: (setup as any).closed_at ? formatApiDate((setup as any).closed_at) : null,
         createdAt: setup.created_at ? formatApiDate(setup.created_at) : "--",
         updatedAt: setup.updated_at ? formatApiDate(setup.updated_at) : "--",
-      })),
-    [setupsQuery.data?.setups]
-  )
-  const selected = setups.find((setup) => setup.id === selectedId) ?? setups[0] ?? null
+      })
+  const activeSetups = useMemo<ManualSetup[]>(() => (activeSetupsQuery.data?.setups ?? []).map(mapSetup), [activeSetupsQuery.data?.setups])
+  const historySetups = useMemo<ManualSetup[]>(() => (historySetupsQuery.data?.setups ?? []).map(mapSetup), [historySetupsQuery.data?.setups])
+  const setups = useMemo(() => [...activeSetups, ...historySetups], [activeSetups, historySetups])
+  const selected = setups.find((setup) => setup.id === selectedId) ?? activeSetups[0] ?? historySetups[0] ?? null
 
   useEffect(() => {
     if (!successMessage) return
@@ -218,10 +269,10 @@ export default function ManualSetups() {
   }, [successMessage])
 
   useEffect(() => {
-    if (!selected && setups[0]) {
-      setSelectedId(setups[0].id)
+    if (!selected && (activeSetups[0] || historySetups[0])) {
+      setSelectedId((activeSetups[0] ?? historySetups[0])!.id)
     }
-  }, [selected, setups])
+  }, [activeSetups, historySetups, selected])
 
   function updateField<K extends keyof SetupForm>(key: K, value: SetupForm[K]) {
     setForm((current) => ({ ...current, [key]: value }))
@@ -304,9 +355,30 @@ export default function ManualSetups() {
 
   const totals = {
     total: setups.length,
-    activeQueue: setups.filter((setup) => ["watching", "pending-order-ready", "activated"].includes(setup.status)).length,
+    activeQueue: activeSetups.length,
+    history: historySetups.length,
     highPriority: setups.filter((setup) => setup.highPriority).length,
     alertsEnabled: setups.filter((setup) => setup.enableTelegramAlerts).length,
+  }
+
+  async function handleLifecycleAction(status: "completed" | "failed" | "cancelled" | "archived", label: string) {
+    if (!selected) return
+    try {
+      await updateSetupStatus.mutateAsync({ id: selected.id, payload: { status } })
+      setSuccessMessage(label)
+    } catch (err) {
+      setSuccessMessage(err instanceof Error ? err.message : "Failed to update manual setup.")
+    }
+  }
+
+  async function handleResendAlert() {
+    if (!selected) return
+    try {
+      const result = await resendSetupAlert.mutateAsync(selected.id)
+      setSuccessMessage(result.success ? "Manual setup alert resent successfully" : "Manual setup alert resend failed")
+    } catch (err) {
+      setSuccessMessage(err instanceof Error ? err.message : "Failed to resend manual setup alert.")
+    }
   }
 
   return (
@@ -328,6 +400,7 @@ export default function ManualSetups() {
         <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
           <MetricTile label="Total Setups" value={String(totals.total)} accent="gold" icon={Layers3} />
           <MetricTile label="Tracking Queue" value={String(totals.activeQueue)} accent="buy" icon={Eye} />
+          <MetricTile label="History" value={String(totals.history)} accent="gold" icon={ClipboardCheck} />
           <MetricTile label="High Priority" value={String(totals.highPriority)} accent="warn" icon={Flag} />
           <MetricTile label="Alerts Enabled" value={String(totals.alertsEnabled)} accent="gold" icon={Bell} />
         </div>
@@ -368,16 +441,28 @@ export default function ManualSetups() {
             editing={editingId !== null}
             saving={createSetup.isPending || updateSetup.isPending}
           />
-          {setupsQuery.isLoading ? <LoadingCard label="Loading manual setups..." /> : null}
-          {setupsQuery.error instanceof Error ? <LoadingCard label={setupsQuery.error.message} error /> : null}
-          {!setupsQuery.isLoading && !(setupsQuery.error instanceof Error) ? (
-            <ManualSetupList setups={setups} selectedId={selectedId ?? 0} onSelect={handleSelect} />
+          {activeSetupsQuery.isLoading || historySetupsQuery.isLoading ? <LoadingCard label="Loading manual setups..." /> : null}
+          {activeSetupsQuery.error instanceof Error ? <LoadingCard label={activeSetupsQuery.error.message} error /> : null}
+          {historySetupsQuery.error instanceof Error ? <LoadingCard label={historySetupsQuery.error.message} error /> : null}
+          {!activeSetupsQuery.isLoading && !(activeSetupsQuery.error instanceof Error) ? (
+            <ManualSetupList title="Active Manual Setups" description="Currently tracked setups with live lifecycle state." setups={activeSetups} selectedId={selectedId ?? 0} onSelect={handleSelect} />
+          ) : null}
+          {!historySetupsQuery.isLoading && !(historySetupsQuery.error instanceof Error) ? (
+            <ManualSetupList title="Manual Setup History" description="Completed, cancelled, failed, expired, invalidated, and archived setups." setups={historySetups} selectedId={selectedId ?? 0} onSelect={handleSelect} />
           ) : null}
         </div>
 
         <div className="space-y-5">
           <SetupPreviewCard preview={preview} />
-          <SetupDetailPanel setup={selected} />
+          <SetupDetailPanel
+            setup={selected}
+            busy={updateSetupStatus.isPending || resendSetupAlert.isPending}
+            onCompleted={() => handleLifecycleAction("completed", "Manual setup marked completed")}
+            onFailed={() => handleLifecycleAction("failed", "Manual setup marked failed")}
+            onCancelled={() => handleLifecycleAction("cancelled", "Manual setup tracking cancelled")}
+            onArchived={() => handleLifecycleAction("archived", "Manual setup archived")}
+            onResendAlert={handleResendAlert}
+          />
         </div>
       </div>
     </div>
@@ -671,10 +756,14 @@ function SetupPreviewCard({ preview }: { preview: ReturnType<typeof buildPreview
 }
 
 function ManualSetupList({
+  title,
+  description,
   setups,
   selectedId,
   onSelect,
 }: {
+  title: string
+  description: string
   setups: ManualSetup[]
   selectedId: number
   onSelect: (id: number) => void
@@ -684,8 +773,8 @@ function ManualSetupList({
       <CardHeader className="pb-3">
         <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
           <div>
-            <CardTitle>Manual Setup History</CardTitle>
-            <CardDescription>Local mock list for handoff-ready setups and status tracking.</CardDescription>
+            <CardTitle>{title}</CardTitle>
+            <CardDescription>{description}</CardDescription>
           </div>
           <Badge variant="muted" className="text-[10px]">
             {setups.length} saved setups
@@ -751,7 +840,23 @@ function ManualSetupList({
   )
 }
 
-function SetupDetailPanel({ setup }: { setup: ManualSetup | null }) {
+function SetupDetailPanel({
+  setup,
+  busy,
+  onCompleted,
+  onFailed,
+  onCancelled,
+  onArchived,
+  onResendAlert,
+}: {
+  setup: ManualSetup | null
+  busy: boolean
+  onCompleted: () => void
+  onFailed: () => void
+  onCancelled: () => void
+  onArchived: () => void
+  onResendAlert: () => void
+}) {
   if (!setup) {
     return (
       <Card>
@@ -798,7 +903,21 @@ function SetupDetailPanel({ setup }: { setup: ManualSetup | null }) {
             <MetaBlock label="Confirmation" value={formatConfirmation(setup.confirmationType)} />
             <MetaBlock label="Session" value={formatSession(setup.session)} />
             <MetaBlock label="Activation Mode" value={formatActivationMode(setup.activationMode)} />
+            <MetaBlock label="Tracking" value={setup.trackingEnabled ? "Enabled" : "Stopped"} />
+            <MetaBlock label="Last Alert" value={setup.lastAlertType ? `${setup.lastAlertType}${setup.lastAlertTime ? ` · ${setup.lastAlertTime}` : ""}` : "None yet"} />
+            <MetaBlock label="Current Price" value={setup.currentPrice != null ? formatPrice(setup.currentPrice) : "Unavailable"} />
+            <MetaBlock label="Distance To Entry" value={setup.distanceToEntryPips != null ? `${setup.distanceToEntryPips.toFixed(1)} pips` : "Unavailable"} />
           </div>
+        </div>
+
+        <div className="grid gap-2 sm:grid-cols-2">
+          <Button variant="buy" disabled={busy || !setup.trackingEnabled} onClick={onCompleted}>Mark Completed</Button>
+          <Button variant="sell" disabled={busy || !setup.trackingEnabled} onClick={onFailed}>Mark Failed</Button>
+          <Button variant="outline" disabled={busy || !setup.trackingEnabled} onClick={onCancelled}>Cancel Tracking</Button>
+          <Button variant="secondary" disabled={busy} onClick={onArchived}>Archive</Button>
+          <Button variant="outline" disabled={busy || !setup.enableTelegramAlerts} onClick={onResendAlert} className="sm:col-span-2">
+            Resend Telegram Alert
+          </Button>
         </div>
 
         <div className="space-y-3 rounded-xl border border-ap-border bg-ap-surface/35 p-4">
@@ -835,6 +954,7 @@ function SetupDetailPanel({ setup }: { setup: ManualSetup | null }) {
             <FlagPill active={setup.moveSlToBeAfterTp1} label="Move SL to BE after TP1" />
             <FlagPill active={setup.enableTelegramAlerts} label="Telegram alerts enabled" />
             <FlagPill active={setup.highPriority} label="High priority review lane" />
+            <FlagPill active={setup.trackingEnabled} label="Tracking enabled" />
           </div>
         </div>
 
@@ -851,6 +971,12 @@ function SetupDetailPanel({ setup }: { setup: ManualSetup | null }) {
           </div>
           <Separator />
           <p className="text-xs leading-6 text-muted-foreground">{setup.notes || "No notes added yet."}</p>
+          {setup.completionNote ? (
+            <>
+              <Separator />
+              <p className="text-xs leading-6 text-muted-foreground">Completion note: {setup.completionNote}</p>
+            </>
+          ) : null}
         </div>
       </CardContent>
     </Card>

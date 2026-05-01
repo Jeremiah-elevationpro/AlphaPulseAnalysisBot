@@ -217,7 +217,7 @@ class SetupResult:
     engulfing_bonus: float = 0.0
     high_quality_trade: bool = False
     micro_strength: str = "normal"
-    strategy_type: str = "gap_sweep"
+    strategy_type: str = "gap_liquidity_sweep_reclaim"
     source: str = "live_bot"
     dominant_bias: str = "neutral"
     quality_rejection_count: int = 0
@@ -565,10 +565,7 @@ class MultiTimeframeAnalyzer:
         # Low volatility: do NOT skip — apply stricter quality gates below
         low_volatility = not ctx.is_volatile
         if low_volatility:
-            logger.info(
-                "Low volatility detected — applying stricter signal filtering "
-                "(min confidence 0.85, QM or psychological level required)."
-            )
+            logger.info("GAP LOW VOL CONTEXT: scoring adjusted, not hard blocked")
 
         if not getattr(ctx, "bot_window_active", ctx.session_allowed):
             logger.info(
@@ -578,7 +575,7 @@ class MultiTimeframeAnalyzer:
             )
         else:
             logger.info(
-                "SESSION PROFILE: %s %s | score_adjust=%+.0f | min_confirmation_bonus=%.0f",
+                "SESSION CONTEXT ONLY: 24/7 mode active | %s %s | score_adjust=%+.0f | min_confirmation_bonus=%.0f",
                 ctx.session_name,
                 SESSION_PROFILE.get(ctx.session_name, "balanced"),
                 SESSION_FINAL_SCORE_ADJUSTMENT.get(ctx.session_name, 0),

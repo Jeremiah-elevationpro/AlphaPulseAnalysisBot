@@ -44,6 +44,7 @@ from config.settings import (
     LEARNED_EDGE_REWARD_SCALE,
 )
 from utils.logger import get_logger
+from utils.strategy_registry import canonical_strategy_type
 
 logger = get_logger(__name__)
 
@@ -108,7 +109,7 @@ class LearningEngine:
         bias_gate_result: str = "",
         pd_location: str = "",
         realized_pips: float = 0.0,
-        strategy_type: str = "gap_sweep",
+        strategy_type: str = "gap_liquidity_sweep_reclaim",
     ):
         """
         Update all reward dimensions for a closed trade, then recompute
@@ -165,7 +166,7 @@ class LearningEngine:
             session_name=session_name,
         )
 
-        strategy_key  = strategy_type or ("lsd" if setup_type in ("lsd_swing", "lsd_scalp") else "gap_sweep")
+        strategy_key  = canonical_strategy_type(strategy_type or ("lsd" if setup_type in ("lsd_swing", "lsd_scalp") else "gap_liquidity_sweep_reclaim"))
 
         self._primary.update(primary_key, reward)
         self._secondary.update(secondary_key, reward)
@@ -264,6 +265,7 @@ class LearningEngine:
 
     def get_rank_result(
         self,
+        strategy_type: str,
         session: str,
         h4_bias: str,
         direction: str,
@@ -275,7 +277,7 @@ class LearningEngine:
         multi-dimensional performance. Safe to call before any trades are closed
         — returns neutral 1.0 when history is insufficient.
         """
-        return self._ranker.rank(session, h4_bias, direction, setup_type, confirmation_type)
+        return self._ranker.rank(strategy_type, session, h4_bias, direction, setup_type, confirmation_type)
 
     def get_learned_edge_bonus(self, setup) -> Tuple[float, str]:
         """Return bounded score bonus/penalty for the exact active setup combination."""
@@ -324,11 +326,90 @@ class LearningEngine:
         Neutral score 0.5 returned when fewer than 3 trades exist.
         EMA mapping mirrors _compute_confidence: BASE + ema * 0.18.
         """
+        try:
+            profiles = self._db.get_strategy_learning_profiles(strategy_type=strategy_name, limit=500)
+        except Exception:
+            profiles = []
+
+        if profiles:
+            wins = sum(int(item.get("wins") or 0) for item in profiles)
+            losses = sum(int(item.get("losses") or 0) for item in profiles)
+            sample_size = wins + losses
+            if sample_size > 0:
+                win_rate = wins / sample_size
+                net_pips = sum(float(item.get("net_pips") or 0.0) for item in profiles)
+                avg_pips = net_pips / sample_size if sample_size else 0.0
+                blended = (win_rate * 0.75) + (max(-0.2, min(0.2, avg_pips / 100.0)) + 0.5) * 0.25
+                score = round(max(MIN_CONFIDENCE, min(MAX_CONFIDENCE, blended)), 3)
+                return score, sample_size
+
         ema, n = self._strategy.get(strategy_name)
         if n < 3:
             return 0.5, n
         score = BASE_CONFIDENCE + (ema * 0.18)
         return round(max(MIN_CONFIDENCE, min(MAX_CONFIDENCE, score)), 3), n
+
+    def get_strategy_learning_profile(self, strategy_type: str, context: Optional[Dict[str, str]] = None) -> Dict[str, object]:
+        strategy_name = canonical_strategy_type(strategy_type)
+        context = context or {}
+        try:
+            profiles = self._db.get_strategy_learning_profiles(strategy_type=strategy_name, limit=500)
+        except Exception:
+            profiles = []
+
+        filtered = []
+        for row in profiles:
+            if (row.get("strategy_type") or "") != strategy_name:
+                continue
+            if context.get("session_name") and row.get("session_name") != context["session_name"]:
+                continue
+            if context.get("timeframe") and row.get("timeframe") != context["timeframe"]:
+                continue
+            if context.get("direction") and row.get("direction") != context["direction"]:
+                continue
+            if context.get("dominant_bias") and row.get("dominant_bias") != context["dominant_bias"]:
+                continue
+            if context.get("bias_strength") and row.get("bias_strength") != context["bias_strength"]:
+                continue
+            if context.get("confirmation_type") and row.get("confirmation_type") != context["confirmation_type"]:
+                continue
+            filtered.append(row)
+
+        rows = filtered or profiles
+        if not rows:
+            return {
+                "strategy_type": strategy_name,
+                "sample_size": 0,
+                "win_rate": 0.0,
+                "net_pips": 0.0,
+                "avg_pips": 0.0,
+                "confidence_tier": "low",
+                "recommended_weight": 0.85,
+                "warning": "low sample",
+            }
+
+        sample_size = sum(int(row.get("sample_size") or 0) for row in rows)
+        net_pips = sum(float(row.get("net_pips") or 0.0) for row in rows)
+        wins = sum(int(row.get("wins") or 0) for row in rows)
+        losses = sum(int(row.get("losses") or 0) for row in rows)
+        closed = wins + losses
+        win_rate = (wins / closed) * 100.0 if closed else 0.0
+        recommended_weight = sum(float(row.get("recommended_weight") or 0.85) for row in rows) / max(len(rows), 1)
+        confidence_tier = "low"
+        if sample_size >= 20:
+            confidence_tier = "high"
+        elif sample_size >= 8:
+            confidence_tier = "medium"
+        return {
+            "strategy_type": strategy_name,
+            "sample_size": sample_size,
+            "win_rate": round(win_rate, 2),
+            "net_pips": round(net_pips, 2),
+            "avg_pips": round(net_pips / closed, 2) if closed else 0.0,
+            "confidence_tier": confidence_tier,
+            "recommended_weight": round(recommended_weight, 3),
+            "warning": "low sample" if sample_size < 8 else "",
+        }
 
     # ─────────────────────────────────────────────────────
     # CONFIDENCE COMPUTATION

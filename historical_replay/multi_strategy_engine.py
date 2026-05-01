@@ -29,7 +29,7 @@ from utils.logger import get_logger
 
 logger = get_logger("alphapulse.multi_strategy_engine")
 
-SUPPORTED_STRATEGIES = {"gap_sweep", "engulfing_rejection"}
+SUPPORTED_STRATEGIES = {"gap_sweep", "gap_liquidity_sweep_reclaim", "engulfing_rejection"}
 
 CONFLUENCE_WINDOW_HOURS = 4
 CONFLUENCE_PIPS         = 15.0
@@ -348,7 +348,7 @@ class MultiStrategyReplayEngine:
             "multi_run_id":            multi_run_id,
             "source":                  "multi_strategy_replay",
             "symbol":                  t.get("symbol", SYMBOL),
-            "strategy_type":           t.get("strategy_type", "gap_sweep"),
+            "strategy_type":           t.get("strategy_type", "gap_liquidity_sweep_reclaim"),
             "direction":               direction,
             "timeframe":               timeframe,
             "timeframe_pair":          tf_pair,

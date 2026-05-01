@@ -17,6 +17,8 @@ No automatic execution. No capital management. Pure analysis assistant.
 
 from typing import Optional
 from datetime import datetime
+import json
+from pathlib import Path
 
 import requests
 
@@ -26,9 +28,59 @@ from config.settings import (
 from db.models import Trade
 from utils.helpers import price_to_pips, trade_direction_emoji
 from utils.logger import get_logger, get_runtime_logger
+from utils.strategy_registry import canonical_strategy_type, strategy_display_name
 
 logger = get_logger(__name__)
 runtime_logger = get_runtime_logger()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Runtime alert gate — reads flag file + control file directly so the guard
+# works even when telegram_bot.py runs inside the main.py subprocess (no
+# shared in-memory state with the API server).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ROOT_DIR = Path(__file__).resolve().parents[1]
+_RUNTIME_ALERTS_DISABLED_FLAG = _ROOT_DIR / "runtime_alerts_disabled.flag"
+_RUNTIME_CONTROL_FILE = _ROOT_DIR / "bot_runtime_control.json"
+
+_RUNTIME_ACTIVE_STATUSES = {"starting", "running", "watching", "analyzing"}
+
+
+def can_send_runtime_alert() -> bool:
+    """
+    Last-line-of-defense guard inside telegram_bot.py.
+    Checked before every runtime/system alert method so no caller can bypass it.
+    Lifecycle alerts (startup, stop, crash) call can_send_lifecycle_alert() instead.
+    """
+    if _RUNTIME_ALERTS_DISABLED_FLAG.exists():
+        logger.warning("TELEGRAM RUNTIME ALERT BLOCKED: emergency flag present")
+        return False
+    try:
+        ctrl = json.loads(_RUNTIME_CONTROL_FILE.read_text(encoding="utf-8")) if _RUNTIME_CONTROL_FILE.exists() else {}
+    except Exception:
+        ctrl = {}
+    if ctrl.get("shutdown_requested"):
+        logger.warning(
+            "TELEGRAM RUNTIME ALERT BLOCKED: shutdown_event_set status=%s", ctrl.get("status")
+        )
+        return False
+    if not ctrl.get("runtime_alerts_enabled", False):
+        logger.warning(
+            "TELEGRAM RUNTIME ALERT BLOCKED: runtime_alerts_enabled=false status=%s", ctrl.get("status")
+        )
+        return False
+    if ctrl.get("status") not in _RUNTIME_ACTIVE_STATUSES:
+        logger.warning(
+            "TELEGRAM RUNTIME ALERT BLOCKED: bot_not_running status=%s", ctrl.get("status")
+        )
+        return False
+    return True
+
+
+def can_send_lifecycle_alert() -> bool:
+    """Lifecycle alerts (startup, stop, restart, fatal crash) are always allowed."""
+    return True
+
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
@@ -311,13 +363,20 @@ class TelegramBot:
             score_line = f"`{quality_score:.0f}` adj / `{base_quality_score:.0f}` base"
 
         msg = (
-            f"*{symbol} {direction} {horizon_label}* {dir_emoji}\n"
-            f"Bias: `{bias}` | TF: `{timeframe_pair}`\n"
-            f"Level: `{level_price:.2f}` _{level_tag}_{tag_line}\n"
-            f"Now: `{current_price:.2f}` | Distance: `{distance_pips:.1f}p`\n"
+            f"SPENCER SETUP — GAP SWEEP WATCHLIST\n"
+            f"Symbol: {symbol}\n"
+            f"Direction: {direction}\n"
+            f"Level: {level_price:.2f}\n"
+            f"Zone: {level_type} {level_tag}{tag_line}\n"
+            f"Timeframe: {timeframe_pair}\n"
+            f"Session: {horizon_label}\n"
+            f"Bias: {bias}\n"
+            f"Current Price: {current_price:.2f}\n"
+            f"Distance: {distance_pips:.1f}p\n"
             f"Quality: {score_line}\n"
             f"Confluence: {confluence_line}\n"
-            f"Status: _{status}_"
+            f"Status: Watching for liquidity sweep reclaim\n"
+            f"Watch Context: {status}"
         )
         return self.send(msg)
 
@@ -364,6 +423,7 @@ class TelegramBot:
         action = trade.direction
         model_tag = self._model_tag(trade)
         tf_pair = f"{trade.higher_tf} → {trade.lower_tf}"
+        strategy_key = canonical_strategy_type(getattr(trade, "strategy_type", ""))
         strategy_title = model_tag.upper()
         if action == "BUY":
             confirmation = f"First bearish rejection closed above support ({trade.lower_tf})"
@@ -371,7 +431,7 @@ class TelegramBot:
             confirmation = f"First bullish rejection closed below resistance ({trade.lower_tf})"
         bias = self._bias_storyline_label(trade.h4_bias)
         extra = ""
-        if getattr(trade, "strategy_type", "") == "gap_sweep":
+        if strategy_key == "gap_liquidity_sweep_reclaim":
             extra = (
                 f"\nSession: {trade.session_name or 'checking'}"
                 f"\nBias: {getattr(trade, 'dominant_bias', trade.h4_bias) or trade.h4_bias}"
@@ -380,9 +440,9 @@ class TelegramBot:
                 f"\nScore: {float(getattr(trade, 'confirmation_score', 0.0) or 0.0):.0f}"
                 f"\nTracking: ✓ Pending retest fill"
             )
-        elif getattr(trade, "strategy_type", "") == "engulfing_rejection":
+        elif strategy_key == "engulfing_rejection":
             extra = (
-                f"\nStrategy: Engulfing Rejection"
+                f"\nEngulf Zone: {getattr(trade, 'level_price', trade.entry_price):.2f}"
                 f"\nBias: {getattr(trade, 'dominant_bias', trade.h4_bias)}/{getattr(trade, 'bias_strength', 'weak')}"
                 f"\nSession: {trade.session_name or 'off_session'}"
                 f"\nQuality Rejections: {getattr(trade, 'quality_rejection_count', 0)}"
@@ -390,26 +450,170 @@ class TelegramBot:
                 f"\nConfirmation Path: {getattr(trade, 'confirmation_path', 'combined') or 'combined'}"
                 f"\nConfirmation Score: {float(getattr(trade, 'confirmation_score', 0.0) or 0.0):.0f}"
             )
+        elif strategy_key == "standard_break_retest":
+            extra = (
+                f"\nBreak Level: {float(getattr(trade, 'level_price', trade.entry_price) or trade.entry_price):.2f}"
+                f"\nRetest Level: {float(getattr(trade, 'level_price', trade.entry_price) or trade.entry_price):.2f}"
+                f"\nSession: {trade.session_name or 'off_session'}"
+                f"\nBias: {getattr(trade, 'dominant_bias', trade.h4_bias)}/{getattr(trade, 'bias_strength', 'weak')}"
+                f"\nConfirmation: close_confirmation"
+            )
+        learning_context = getattr(trade, "learning_context", "")
+        if learning_context:
+            extra += f"\nLearning: {learning_context}"
         if getattr(trade, "confluence_with", None):
             extra += f"\nConfluence: {model_tag} + {', '.join(trade.confluence_with).replace('_', ' ').title()}"
 
-        msg = (
-            f"🚀 SPENCER LIVE SETUP — {strategy_title}\n\n"
-            f"Symbol: {trade.pair}\n"
-            f"Direction: {action}\n"
-            f"Set Pending Order: {trade.entry_price:.2f}\n"
-            f"Stop Loss: {trade.sl_price:.2f}\n\n"
-            f"TP1: {trade.tp1:.2f}\n"
-            f"TP2: {trade.tp2:.2f}\n"
-            f"TP3: {trade.tp3:.2f}\n\n"
-            f"Timeframes: {tf_pair}\n"
-            f"Setup Type: {model_tag}\n"
-            f"Confirmation: {confirmation}\n"
-            f"Bias Storyline: {bias}\n"
-            f"{extra}\n\n"
-            f"Status: Waiting for retest entry"
-        )
+        if strategy_key == "gap_liquidity_sweep_reclaim":
+            msg = (
+                f"SPENCER ENTRY — GAP LIQUIDITY SWEEP RECLAIM\n"
+                f"Symbol: {trade.pair}\n"
+                f"Direction: {action}\n"
+                f"Entry: {trade.entry_price:.2f}\n"
+                f"SL: {trade.sl_price:.2f}\n"
+                f"TP1: {trade.tp1:.2f}\n"
+                f"TP2: {trade.tp2:.2f}\n"
+                f"TP3: {trade.tp3:.2f}\n"
+                f"Confirmation: liquidity_sweep_reclaim\n"
+                f"Session: {trade.session_name or 'off_session'}\n"
+                f"Bias: {getattr(trade, 'dominant_bias', trade.h4_bias)}/{getattr(trade, 'bias_strength', 'moderate')}\n"
+                f"Learning: {learning_context or 'No strong negative profile'}"
+            )
+        elif strategy_key == "engulfing_rejection":
+            msg = (
+                f"SPENCER SETUP — ENGULFING REJECTION\n"
+                f"Symbol: {trade.pair}\n"
+                f"Direction: {action}\n"
+                f"Entry: {trade.entry_price:.2f}\n"
+                f"SL: {trade.sl_price:.2f}\n"
+                f"TP1: {trade.tp1:.2f}\n"
+                f"TP2: {trade.tp2:.2f}\n"
+                f"TP3: {trade.tp3:.2f}\n"
+                f"Timeframe: {trade.lower_tf}\n"
+                f"Session: {trade.session_name or 'off_session'}\n"
+                f"Bias: {getattr(trade, 'dominant_bias', trade.h4_bias)}/{getattr(trade, 'bias_strength', 'weak')}\n"
+                f"{extra}"
+            )
+        elif strategy_key == "standard_break_retest":
+            msg = (
+                f"SPENCER SETUP — BREAK + RETEST\n"
+                f"Symbol: {trade.pair}\n"
+                f"Direction: {action}\n"
+                f"Entry: {trade.entry_price:.2f}\n"
+                f"SL: {trade.sl_price:.2f}\n"
+                f"TP1: {trade.tp1:.2f}\n"
+                f"TP2: {trade.tp2:.2f}\n"
+                f"TP3: {trade.tp3:.2f}\n"
+                f"Timeframe: {trade.lower_tf}\n"
+                f"{extra}"
+            )
+        else:
+            msg = (
+                f"🚀 SPENCER LIVE SETUP — {strategy_title}\n\n"
+                f"Symbol: {trade.pair}\n"
+                f"Direction: {action}\n"
+                f"Set Pending Order: {trade.entry_price:.2f}\n"
+                f"Stop Loss: {trade.sl_price:.2f}\n\n"
+                f"TP1: {trade.tp1:.2f}\n"
+                f"TP2: {trade.tp2:.2f}\n"
+                f"TP3: {trade.tp3:.2f}\n\n"
+                f"Timeframes: {tf_pair}\n"
+                f"Setup Type: {model_tag}\n"
+                f"Confirmation: {confirmation}\n"
+                f"Bias Storyline: {bias}\n"
+                f"{extra}\n\n"
+                f"Status: Waiting for retest entry"
+            )
         return self._send_logged("PENDING ORDER ALERT", msg, parse_mode=None)
+
+    def send_market_plan_alert(self, market_plan) -> bool:
+        plan = market_plan.to_dict() if hasattr(market_plan, "to_dict") else dict(market_plan or {})
+        if plan.get("targets_source") and plan.get("targets_source") != "structure_tp_engine":
+            logger.warning(
+                "OLD TARGET PATH BLOCKED: source=%s reason=market_plan_requires_structure_targets",
+                plan.get("targets_source"),
+            )
+            return False
+        primary = plan.get("primary_scenario", {}) or {}
+        secondary = plan.get("secondary_scenario", {}) or {}
+        msg = (
+            f"SPENCER MARKET PLAN — {plan.get('symbol', 'XAUUSD')}\n\n"
+            f"Current Price: {float(plan.get('current_price') or 0.0):.2f}\n\n"
+            f"H4 Context:\n{plan.get('h4_context', 'Unavailable')}\n\n"
+            f"H1 Context:\n{plan.get('h1_context', 'Unavailable')}\n\n"
+            f"M15 Context:\n{plan.get('m15_context', 'Unavailable')}\n\n"
+            f"Dominant Bias: {plan.get('dominant_bias', 'neutral')} ({plan.get('bias_strength', 'weak')})\n\n"
+            f"Primary Scenario:\n"
+            f"{primary.get('direction', '?')} fresh retest of {primary.get('watch_zone', 'n/a')} only\n"
+            f"Trigger: {'; '.join(primary.get('trigger_conditions', [])[:4])}\n"
+            f"Targets: {' / '.join(f'{float(v):.2f}' for v in primary.get('market_plan_targets', primary.get('targets', []))[:5])}\n"
+            f"Invalidation: {primary.get('invalidation', 'n/a')}\n\n"
+            f"Secondary Scenario:\n"
+            f"{secondary.get('direction', '?')} {secondary.get('watch_zone', 'n/a')}\n"
+            f"Trigger: {'; '.join(secondary.get('trigger_conditions', [])[:4])}\n"
+            f"Targets: {' / '.join(f'{float(v):.2f}' for v in secondary.get('market_plan_targets', secondary.get('targets', []))[:5])}\n"
+            f"Invalidation: {secondary.get('invalidation', 'n/a')}\n\n"
+            f"Watching: {', '.join(plan.get('confirmation_waiting_for', [])[:6])}\n"
+            f"Psychological Levels: {', '.join(f'{float(v):.2f}' for v in (plan.get('actionable_psych_levels') or plan.get('psychological_levels') or [])[:12])}\n"
+            f"Key Supports: {', '.join(f'{float(v):.2f}' for v in plan.get('key_supports', [])[:4])}\n"
+            f"Key Resistances: {', '.join(f'{float(v):.2f}' for v in plan.get('key_resistances', [])[:4])}"
+        )
+        return self._send_logged("MARKET PLAN", msg, parse_mode=None)
+
+    def send_analyst_entry_alert(self, setup: dict) -> bool:
+        target_roles = dict(setup.get("target_roles", {}) or {})
+        reaction_level = float(setup.get("reaction_level") or 0.0)
+        msg = (
+            f"SPENCER ENTRY CONFIRMED â€” {setup.get('direction', '?')} GOLD\n\n"
+            f"Quality: {setup.get('setup_quality_label', 'QUALITY SETUP')}\n"
+            f"Score: {float(setup.get('candidate_rank_score') or setup.get('priority') or 0.0):.0f}\n"
+            f"Scenario: {setup.get('scenario', 'primary')}\n"
+            f"Confirmation: {setup.get('confirmation_type', 'unknown')}\n"
+            f"Grade: {setup.get('confirmation_grade', setup.get('grade', '?'))}\n\n"
+            f"Entry: {float(setup.get('entry') or setup.get('suggested_entry') or 0.0):.2f}\n"
+            f"SL: {float(setup.get('sl') or setup.get('suggested_sl') or 0.0):.2f}\n"
+            f"Invalidation: {setup.get('invalidation', 'n/a')}\n\n"
+            f"{f'Reaction Level: {reaction_level:.2f}\\n' if reaction_level else ''}"
+            f"TP1: {float(setup.get('tp1') or 0.0):.2f} — main target / move SL to BE\n"
+            f"TP2: {float(setup.get('tp2') or 0.0):.2f} — runner target\n"
+            f"TP3: {float(setup.get('tp3') or 0.0):.2f} — extended runner / major target\n\n"
+            f"Risk: {float(setup.get('risk_pips') or 0.0):.0f} pips\n"
+            f"TP1 RR: {float(setup.get('tp1_rr') or 0.0):.2f}R\n"
+            f"TP2 RR: {float(setup.get('tp2_rr') or 0.0):.2f}R\n"
+            f"TP3 RR: {float(setup.get('tp3_rr') or 0.0):.2f}R\n\n"
+            f"Why:\n{setup.get('trade_path_rationale', setup.get('entry_reason', 'Quality confirmation at active watch zone.'))}\n\n"
+            f"SL Rationale: {setup.get('sl_rationale', 'structure-based')}\n"
+            f"TP Rationale: {setup.get('tp_rationale', 'structure-based')}\n"
+            f"Target Roles: {target_roles}"
+        )
+        return self._send_logged("ANALYST ENTRY", msg, parse_mode=None)
+        suggested_tps = setup.get("suggested_tps", {}) or {}
+        msg = (
+            f"SPENCER ENTRY CONFIRMED — {setup.get('direction', '?')} GOLD\n\n"
+            f"Reason:\n{setup.get('reason', 'Quality confirmation at active watch zone.')}\n\n"
+            f"Confirmation:\n{setup.get('confirmation_type', 'unknown')}\n"
+            f"Grade: {setup.get('grade', '?')}\n\n"
+            f"Entry: {float(setup.get('suggested_entry') or 0.0):.2f}\n"
+            f"SL: {float(setup.get('suggested_sl') or 0.0):.2f}\n"
+            f"TP1: {float(suggested_tps.get('tp1') or 0.0):.2f}\n"
+            f"TP2: {float(suggested_tps.get('tp2') or 0.0):.2f}\n"
+            f"TP3: {float(suggested_tps.get('tp3') or 0.0):.2f}\n\n"
+            f"Scenario: {setup.get('scenario', 'primary')}\n"
+            f"Invalidation: {setup.get('invalidation', 'n/a')}\n"
+            f"TP Rationale: {setup.get('tp_rationale', 'structure-based')}\n"
+            f"SL Rationale: {setup.get('sl_rationale', 'structure-based')}"
+        )
+        return self._send_logged("ANALYST ENTRY", msg, parse_mode=None)
+
+    def send_scenario_update_alert(self, update: dict) -> bool:
+        msg = (
+            f"SPENCER SCENARIO UPDATE — {update.get('symbol', 'XAUUSD')}\n\n"
+            f"{update.get('message', 'Scenario updated.')}\n\n"
+            f"Primary: {update.get('primary', 'n/a')}\n"
+            f"Secondary: {update.get('secondary', 'n/a')}\n"
+            f"Waiting For: {update.get('waiting_for', 'n/a')}"
+        )
+        return self._send_logged("SCENARIO UPDATE", msg, parse_mode=None)
 
     # ─────────────────────────────────────────────────────
     # INTERNAL — trade registered for simulated tracking
@@ -656,6 +860,19 @@ class TelegramBot:
             runtime_logger.info("TELEGRAM SEND FAILED: SHUTDOWN")
         return ok
 
+    def send_restart_alert(self) -> bool:
+        """Lifecycle alert for restart — not guarded by runtime_alerts_enabled."""
+        now = datetime.utcnow().strftime("%H:%M UTC")
+        ok = self.send(
+            f"🔄 *Spencer restarting* — `{now}`\n"
+            f"_AlphaPulse engine restarting now._"
+        )
+        if ok:
+            runtime_logger.info("TELEGRAM SEND SUCCESS: RESTART ALERT")
+        else:
+            runtime_logger.info("TELEGRAM SEND FAILED: RESTART ALERT")
+        return ok
+
     def send_bot_stopped_alert(self) -> bool:
         """API safety-net stop alert — fires even if bot process was hard-killed."""
         now = datetime.utcnow().strftime("%H:%M UTC")
@@ -684,6 +901,8 @@ class TelegramBot:
         return ok
 
     def send_system_alert(self, message: str) -> bool:
+        if not can_send_runtime_alert():
+            return False
         now = datetime.utcnow().strftime("%H:%M UTC")
         ok = self.send(
             f"⚠️ *System Alert* `{now}`\n{message}"
@@ -701,11 +920,9 @@ class TelegramBot:
     @staticmethod
     def _model_tag(trade: Trade) -> str:
         """Return a human-readable model label for the trade."""
-        strategy_type = getattr(trade, "strategy_type", "")
-        if strategy_type == "gap_sweep":
-            return "Gap Sweep"
-        if strategy_type == "engulfing_rejection":
-            return "Engulfing Rejection"
+        strategy_type = canonical_strategy_type(getattr(trade, "strategy_type", ""))
+        if strategy_type in ("gap_liquidity_sweep_reclaim", "engulfing_rejection", "standard_break_retest", "failed_engulf_break_retest"):
+            return strategy_display_name(strategy_type)
         setup = getattr(trade, "setup_type", "major")
         _LABELS = {
             "lsd_swing":               "LSD Swing",

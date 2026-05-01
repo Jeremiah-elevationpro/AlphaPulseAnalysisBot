@@ -25,10 +25,12 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from config.settings import LEVEL_TOLERANCE_PIPS, LIVE_ENABLED_STRATEGIES, PIP_SIZE
+from config.settings import LEVEL_TOLERANCE_PIPS, LIVE_ENABLED_STRATEGIES, PIP_SIZE, RESEARCH_ONLY_STRATEGIES
+from strategies.break_retest_live import LiveBreakRetestAnalyzer
 from strategies.engulfing_live import LiveEngulfingAnalyzer
 from strategies.multi_timeframe import MultiTimeframeAnalyzer, SetupResult, MarketOutlook
 from utils.logger import get_logger
+from utils.strategy_registry import canonical_strategy_type
 
 logger = get_logger(__name__)
 
@@ -134,6 +136,7 @@ class StrategyRunResult:
     market_condition: str
     strategy_scores: Dict[str, StrategyScore]   # for performance logging only
     signals: List[StrategySignal]               # DEFAULT signals
+    strategy_scans: Dict[str, Dict[str, object]] = field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -153,8 +156,9 @@ class StrategyManager:
     def __init__(self, learning_engine=None, enabled_strategies: Optional[List[str]] = None, merge_confluence: bool = True):
         self._analyzer = MultiTimeframeAnalyzer()
         self._engulfing = LiveEngulfingAnalyzer()
+        self._break_retest = LiveBreakRetestAnalyzer()
         self._learning = learning_engine
-        self._enabled = list(enabled_strategies or LIVE_ENABLED_STRATEGIES)
+        self._enabled = [canonical_strategy_type(name) for name in (enabled_strategies or LIVE_ENABLED_STRATEGIES)]
         self._merge_confluence_signals = merge_confluence
         logger.info("StrategyManager initialised — enabled live strategies: %s", ", ".join(self._enabled))
 
@@ -171,6 +175,8 @@ class StrategyManager:
         required = set(self._analyzer.get_required_timeframes())
         if "engulfing_rejection" in self._enabled:
             required.update({"D1", "H4", "H1", "M30"})
+        if "standard_break_retest" in self._enabled:
+            required.update({"D1", "H4", "H1", "M30", "M15"})
         return sorted(required)
 
     # ─────────────────────────────────────────────────────
@@ -195,16 +201,90 @@ class StrategyManager:
             data, current_price=current_price, analysis_time=analysis_time
         )
         signals: List[StrategySignal] = []
-        if "gap_sweep" in self._enabled:
-            signals.extend(_wrap_setups(gap_setups, "gap_sweep"))
+        strategy_scans: Dict[str, Dict[str, object]] = {}
+
+        for strategy_name in (
+            "gap_liquidity_sweep_reclaim",
+            "engulfing_rejection",
+            "standard_break_retest",
+            "failed_engulf_break_retest",
+        ):
+            enabled = strategy_name in self._enabled
+            if strategy_name in RESEARCH_ONLY_STRATEGIES:
+                enabled = False
+            scan = {
+                "enabled": enabled,
+                "scans_run": 1 if enabled else 0,
+                "candidates_found": 0,
+                "watchlist_alerts_sent": 0,
+                "entry_alerts_sent": 0,
+                "alerts_sent": 0,
+                "alerts_failed": 0,
+                "duplicates_blocked": 0,
+                "last_result": "not_scanned",
+                "last_reject_reason": "",
+            }
+            if strategy_name == "failed_engulf_break_retest":
+                scan["mode"] = "research_only"
+                logger.info("RESEARCH ONLY STRATEGY SKIPPED IN LIVE: failed_engulf_break_retest")
+            strategy_scans[strategy_name] = scan
+
+        if "gap_liquidity_sweep_reclaim" in self._enabled:
+            logger.info("LIVE STRATEGY SCAN STARTED: gap_liquidity_sweep_reclaim")
+            gap_signals = _wrap_setups(gap_setups, "gap_liquidity_sweep_reclaim")
+            signals.extend(gap_signals)
+            strategy_scans["gap_liquidity_sweep_reclaim"].update({
+                "candidates_found": len(gap_signals),
+                "last_result": "signals_found" if gap_signals else "no_signal",
+                "last_reject_reason": "" if gap_signals else "no_confirmation",
+            })
+            logger.info(
+                "LIVE STRATEGY SCAN COMPLETE: gap_liquidity_sweep_reclaim | candidates=%d | alerts=0 | rejects=%s",
+                len(gap_signals),
+                strategy_scans["gap_liquidity_sweep_reclaim"]["last_reject_reason"],
+            )
+
         if "engulfing_rejection" in self._enabled:
+            logger.info("LIVE STRATEGY SCAN STARTED: engulfing_rejection")
             engulf_setups = self._engulfing.analyze(
                 data,
                 pair=outlook.pair,
                 current_price=current_price,
                 context=outlook.context,
             )
-            signals.extend(_wrap_setups(engulf_setups, "engulfing_rejection"))
+            engulf_signals = _wrap_setups(engulf_setups, "engulfing_rejection")
+            signals.extend(engulf_signals)
+            strategy_scans["engulfing_rejection"].update({
+                "candidates_found": len(engulf_signals),
+                "last_result": "signals_found" if engulf_signals else "no_signal",
+                "last_reject_reason": "" if engulf_signals else "no_live_candidate",
+            })
+            logger.info(
+                "LIVE STRATEGY SCAN COMPLETE: engulfing_rejection | candidates=%d | alerts=0 | rejects=%s",
+                len(engulf_signals),
+                strategy_scans["engulfing_rejection"]["last_reject_reason"],
+            )
+
+        if "standard_break_retest" in self._enabled:
+            logger.info("LIVE STRATEGY SCAN STARTED: standard_break_retest")
+            brt_setups = self._break_retest.analyze(
+                data,
+                pair=outlook.pair,
+                current_price=current_price,
+                outlook=outlook,
+            )
+            brt_signals = _wrap_setups(brt_setups, "standard_break_retest")
+            signals.extend(brt_signals)
+            strategy_scans["standard_break_retest"].update({
+                "candidates_found": len(brt_signals),
+                "last_result": "signals_found" if brt_signals else "no_signal",
+                "last_reject_reason": "" if brt_signals else "no_close_confirmation",
+            })
+            logger.info(
+                "LIVE STRATEGY SCAN COMPLETE: standard_break_retest | candidates=%d | alerts=0 | rejects=%s",
+                len(brt_signals),
+                strategy_scans["standard_break_retest"]["last_reject_reason"],
+            )
         if self._merge_confluence_signals:
             signals = self._merge_confluence(signals)
         else:
@@ -215,10 +295,12 @@ class StrategyManager:
 
         # ── Strategy score (learning transparency — does NOT gate execution) ──
         scores: Dict[str, StrategyScore] = {
-            "gap_sweep": self._score_strategy("gap_sweep"),
+            "gap_liquidity_sweep_reclaim": self._score_strategy("gap_liquidity_sweep_reclaim"),
         }
         if "engulfing_rejection" in self._enabled:
             scores["engulfing_rejection"] = self._score_strategy("engulfing_rejection")
+        if "standard_break_retest" in self._enabled:
+            scores["standard_break_retest"] = self._score_strategy("standard_break_retest")
 
         # ── Logging ───────────────────────────────────────────────────────────
         score_parts = [f"{name}={score.raw_score:.0f}pts/{score.trades_seen}T" for name, score in scores.items()]
@@ -229,6 +311,7 @@ class StrategyManager:
             market_condition=condition,
             strategy_scores=scores,
             signals=signals,
+            strategy_scans=strategy_scans,
         )
 
     # ─────────────────────────────────────────────────────
@@ -327,11 +410,13 @@ class StrategyManager:
                 signal.confluence_strategies = sorted(s for s in combined if s != signal.strategy_name)
                 if signal.setup is not None:
                     signal.setup.confluence_with = list(signal.confluence_strategies)
+                logger.info("STRATEGY CONFLUENCE DETECTED: %s + %s", existing.strategy_name, signal.strategy_name)
                 merged[merged.index(existing)] = signal
             else:
                 existing.confluence_strategies = sorted(s for s in combined if s != existing.strategy_name)
                 if existing.setup is not None:
                     existing.setup.confluence_with = list(existing.confluence_strategies)
+                logger.info("STRATEGY CONFLUENCE DETECTED: %s + %s", existing.strategy_name, signal.strategy_name)
         return merged
 
     @staticmethod
@@ -353,6 +438,12 @@ class StrategyManager:
             signal.confluence_strategies = confluence
             if signal.setup is not None:
                 signal.setup.confluence_with = list(confluence)
+            if confluence:
+                logger.info(
+                    "STRATEGY CONFLUENCE DETECTED: %s + %s",
+                    signal.strategy_name,
+                    ", ".join(confluence),
+                )
         return signals
 
 

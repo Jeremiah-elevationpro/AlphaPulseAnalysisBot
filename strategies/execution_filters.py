@@ -2,7 +2,7 @@
 AlphaPulse - Institutional Execution Filters
 ============================================
 Weighted filter layer for the active M30->M15 Gap strategy:
-  - H1 premium/discount location
+  - H1 premium/discount location (scoring only)
   - D1/H4 directional bias alignment
 """
 
@@ -52,7 +52,7 @@ class ExecutionFilterResult:
 
 
 class ExecutionFilterEngine:
-    """Applies H1 sweep/reclaim, premium/discount, and strong bias gates."""
+    """Applies H1 sweep/reclaim scoring context and directional bias gates."""
 
     def evaluate(self, data: Dict[str, pd.DataFrame], setup, ctx) -> ExecutionFilterResult:
         result = ExecutionFilterResult()
@@ -84,21 +84,12 @@ class ExecutionFilterEngine:
                 or (setup.direction == "SELL" and pd_location == "premium")
             )
             neutral = pd_location == "equilibrium"
-            if favorable:
-                logger.info(
-                    "EXECUTION FILTER BONUS: PD favorable | %s in %s | +%.0f",
-                    setup.direction, pd_location, pd_score,
-                )
-            elif neutral:
-                logger.info(
-                    "EXECUTION FILTER PENALTY: PD equilibrium | %s near midpoint | %.0f",
-                    setup.direction, pd_score,
-                )
-            else:
-                logger.info(
-                    "EXECUTION FILTER PENALTY: PD opposite | %s in %s | %.0f",
-                    setup.direction, pd_location, pd_score,
-                )
+            logger.info(
+                "GAP PD CONTEXT: pd_location=%s used as scoring context only | %s | score=%+.0f",
+                pd_location,
+                setup.direction,
+                pd_score,
+            )
 
         return result
 
@@ -123,21 +114,11 @@ class ExecutionFilterEngine:
             )
             return True, f"penalized_{dominant}_{strength}", -BIAS_MIXED_PENALTY
         if dominant != expected:
-            micro_type = getattr(setup, "micro_confirmation_type", "none") or "none"
-            if micro_type == "liquidity_sweep_reclaim":
-                logger.info(
-                    "EXECUTION FILTER PASS: counter-trend allowed by liquidity_sweep_reclaim | %s setup vs %s %s",
-                    setup.direction,
-                    dominant,
-                    strength,
-                )
-                return True, f"passed_counter_{dominant}_{strength}_liquidity_sweep_reclaim", 0.0
             logger.info(
-                "EXECUTION FILTER REJECT: counter-trend requires liquidity_sweep_reclaim | %s setup vs %s %s | micro=%s",
+                "GAP REJECTED: counter-bias trade blocked | %s setup vs %s %s",
                 setup.direction,
                 dominant,
                 strength,
-                micro_type,
             )
             return False, f"rejected_counter_{dominant}_{strength}", 0.0
         if d1 in ("bullish", "bearish") and h4 in ("bullish", "bearish") and d1 != h4:
@@ -148,10 +129,13 @@ class ExecutionFilterEngine:
             return True, "penalized_d1_h4_mismatch", -BIAS_MIXED_PENALTY
 
         score = BIAS_STRONG_ALIGNED_SCORE if strength == "strong" else BIAS_MODERATE_ALIGNED_SCORE
-        logger.info(
-            "EXECUTION FILTER BONUS: bias aligned | %s %s | +%.0f",
-            dominant, strength, score,
-        )
+        if strength == "moderate":
+            logger.info("GAP BIAS PASS: aligned moderate bias + sweep reclaim")
+        else:
+            logger.info(
+                "EXECUTION FILTER BONUS: bias aligned | %s %s | +%.0f",
+                dominant, strength, score,
+            )
         return True, f"passed_{dominant}_{strength}", score
 
     @staticmethod

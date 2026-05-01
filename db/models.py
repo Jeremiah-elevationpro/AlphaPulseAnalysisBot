@@ -76,7 +76,7 @@ class Trade:
     pd_location: str = ""
     high_quality_trade: bool = False
     micro_strength: str = "normal"
-    strategy_type: str = "gap_sweep"
+    strategy_type: str = "gap_liquidity_sweep_reclaim"
     source: str = "live_bot"
     dominant_bias: str = ""
     bias_strength: str = "weak"

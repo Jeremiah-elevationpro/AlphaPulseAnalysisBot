@@ -5,6 +5,14 @@ import { StatusDot } from "@/components/ui/status-dot"
 import { cn } from "@/lib/utils"
 import type { BotStatusResponse } from "@/lib/api"
 
+function formatStrategyName(value: string) {
+  if (value === "gap_liquidity_sweep_reclaim") return "Gap Sweep"
+  if (value === "engulfing_rejection") return "Engulfing Rejection"
+  if (value === "standard_break_retest") return "Break + Retest"
+  if (value === "failed_engulf_break_retest") return "Failed Engulf Break + Retest"
+  return value.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())
+}
+
 const STATUS_LABELS: Record<string, string> = {
   online: "Spencer Online",
   offline: "Spencer Offline",
@@ -26,7 +34,6 @@ function useHeartbeatAge(lastHeartbeatAt?: string | null): { ageMin: number; isS
 export function SpencerStatus({ status }: { status?: BotStatusResponse }) {
   const hb = useHeartbeatAge(status?.data?.lastHeartbeatAt ?? status?.last_heartbeat_at)
   const isActive = ["online", "analyzing", "watching"].includes(status?.status ?? "")
-
   const tone =
     status?.status === "online" || status?.status === "watching"
       ? "buy"
@@ -55,18 +62,7 @@ export function SpencerStatus({ status }: { status?: BotStatusResponse }) {
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
             <StatusPill icon={Bot} label="Status" value={STATUS_LABELS[status?.status ?? "offline"] ?? status?.status ?? "Offline"} tone={tone} />
             <StatusPill icon={Cpu} label="Mode" value={status?.strategy_mode ?? "hybrid"} tone="purple" />
-            <StatusPill
-              icon={RadioTower}
-              label="Market Session"
-              value={
-                (() => {
-                  const s = status?.session ?? status?.data?.currentSession ?? "—"
-                  if (s === "off_session" || s === "quiet_session") return "Quiet Session"
-                  return s.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())
-                })()
-              }
-              tone="gold"
-            />
+            <StatusPill icon={RadioTower} label="Market Session" value={formatSessionLabel(status?.session ?? status?.data?.marketSession ?? status?.data?.currentSession)} tone="gold" />
             <div className="rounded-xl border border-ap-border bg-ap-surface/45 px-3 py-3">
               <div className="label-xs">Backend</div>
               <div className="mt-2 flex items-center gap-2 text-sm font-semibold text-foreground">
@@ -74,18 +70,8 @@ export function SpencerStatus({ status }: { status?: BotStatusResponse }) {
                 {status?.backend_connected ? "Connected" : "Unavailable"}
               </div>
             </div>
-            <StatusPill
-              icon={RadioTower}
-              label="Operating Mode"
-              value={status?.data?.operatingMode === "24_7" ? "24/7 Active" : (status?.data?.activeUntil ?? "24/7")}
-              tone="buy"
-            />
-            <StatusPill
-              icon={Cpu}
-              label="Scan Active"
-              value="Yes — 24/7"
-              tone="buy"
-            />
+            <StatusPill icon={RadioTower} label="Operating Mode" value={status?.data?.operatingMode === "24_7" ? "24/7 Active" : (status?.data?.activeUntil ?? "24/7")} tone="purple" />
+            <StatusPill icon={Cpu} label="Bot Window" value={status?.data?.scanAllowed ? "Active" : "Closed"} tone={status?.data?.scanAllowed ? "buy" : "sell"} />
           </div>
         </div>
 
@@ -94,32 +80,28 @@ export function SpencerStatus({ status }: { status?: BotStatusResponse }) {
             {STATUS_LABELS[status?.status ?? "offline"] ?? "Spencer Offline"}
           </Badge>
           <Badge variant="gold" className="text-[10px]">Powered by AlphaPulse</Badge>
-          <Badge variant="buy" className="text-[10px]">24/7 Scanning Active</Badge>
+          <Badge variant={status?.data?.scanAllowed ? "buy" : "outline"} className="text-[10px]">
+            {status?.data?.scanAllowed ? "Bot Window Active" : "Bot Window Closed"}
+          </Badge>
           {status?.data?.liveEnabledStrategies?.map((strategy) => (
             <Badge key={`live-${strategy}`} variant="buy" className="text-[10px]">
-              Live: {strategy.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())}
+              Live: {formatStrategyName(strategy)}
             </Badge>
           ))}
           {status?.data?.researchOnlyStrategies?.map((strategy) => (
             <Badge key={`research-${strategy}`} variant="outline" className="text-[10px]">
-              Research Only: {strategy.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())}
+              Research Only: {formatStrategyName(strategy)}
             </Badge>
           ))}
           <Badge variant="outline" className="text-[10px]">Current Symbol: {status?.symbol ?? "XAUUSD"}</Badge>
           {isActive && hb.isStale && (
             <Badge variant="sell" className="text-[10px]">
-              ⚠ Heartbeat stale ({Math.floor(hb.ageMin)}m ago)
+              Heartbeat stale ({Math.floor(hb.ageMin)}m ago)
             </Badge>
           )}
-          {(status?.data?.lastScanResult) && (
-            <Badge variant="outline" className="text-[10px]">{status.data.lastScanResult}</Badge>
-          )}
-          {status?.data?.instanceId && (
-            <Badge variant="outline" className="text-[10px]">Instance {status.data.instanceId}</Badge>
-          )}
-          {status?.data?.lastScanNumber != null && (
-            <Badge variant="outline" className="text-[10px]">Scan #{status.data.lastScanNumber}</Badge>
-          )}
+          {status?.data?.lastScanResult && <Badge variant="outline" className="text-[10px]">{status.data.lastScanResult}</Badge>}
+          {status?.data?.instanceId && <Badge variant="outline" className="text-[10px]">Instance {status.data.instanceId}</Badge>}
+          {status?.data?.lastScanNumber != null && <Badge variant="outline" className="text-[10px]">Scan #{status.data.lastScanNumber}</Badge>}
           {status?.data?.sessionBlocking && (
             <Badge variant="sell" className="text-[10px]">
               Session blocking active — check config
@@ -162,4 +144,13 @@ function StatusPill({
       </div>
     </div>
   )
+}
+
+function formatSessionLabel(value?: string | null) {
+  if (!value || value === "off_session" || value === "quiet_session") return "Quiet Session"
+  if (value === "overlap") return "Overlap"
+  if (value === "london") return "London"
+  if (value === "new_york") return "New York"
+  if (value === "asia") return "Asia"
+  return value.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase())
 }

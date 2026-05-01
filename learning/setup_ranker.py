@@ -29,6 +29,7 @@ from db.database import Database
 from db.models import TradeResult
 from config.settings import MIN_TRADES_FOR_LEARNING
 from utils.logger import get_logger
+from utils.strategy_registry import canonical_strategy_type
 
 logger = get_logger(__name__)
 
@@ -88,9 +89,9 @@ class SetupRanker:
     def __init__(self, db: Database):
         self._db = db
         # dimension → DimStats
-        self._sbd:  Dict[str, DimStats] = {}   # session|bias|direction
-        self._stype: Dict[str, DimStats] = {}  # setup_type
-        self._ctype: Dict[str, DimStats] = {}  # confirmation_type
+        self._sbd: Dict[str, Dict[str, DimStats]] = {}
+        self._stype: Dict[str, Dict[str, DimStats]] = {}
+        self._ctype: Dict[str, Dict[str, DimStats]] = {}
         self._loaded = False
 
     # ─────────────────────────────────────────────────────
@@ -100,7 +101,9 @@ class SetupRanker:
     def refresh(self):
         """Re-read closed trades and recompute all dimension stats."""
         try:
-            trades = self._db.get_all_closed_trades()
+            trades = self._db.get_strategy_learning_trades(limit=20000)
+            if not trades:
+                trades = self._db.get_all_closed_trades()
             self._load_stats(trades)
             self._loaded = True
             logger.info(
@@ -112,6 +115,7 @@ class SetupRanker:
 
     def rank(
         self,
+        strategy_type: str,
         session: str,
         h4_bias: str,
         direction: str,
@@ -140,10 +144,15 @@ class SetupRanker:
                 note="ranker not loaded — neutral rank applied",
             )
 
+        strategy_key = canonical_strategy_type(strategy_type or "gap_liquidity_sweep_reclaim")
+        sbd_store = self._sbd.get(strategy_key, {})
+        st_store = self._stype.get(strategy_key, {})
+        ct_store = self._ctype.get(strategy_key, {})
+
         sbd_key = f"{session or 'off'}|{h4_bias or 'neutral'}|{direction}"
-        sbd     = self._sbd.get(sbd_key, DimStats())
-        st      = self._stype.get(setup_type or "major", DimStats())
-        ct      = self._ctype.get(confirmation_type or "rejection", DimStats())
+        sbd     = sbd_store.get(sbd_key, DimStats())
+        st      = st_store.get(setup_type or "major", DimStats())
+        ct      = ct_store.get(confirmation_type or "rejection", DimStats())
 
         min_n = MIN_TRADES_FOR_LEARNING
         sbd_wr = sbd.win_rate  if sbd.total  >= min_n else 0.5
@@ -192,15 +201,21 @@ class SetupRanker:
 
         for row in trades:
             try:
+                strategy_type = "gap_liquidity_sweep_reclaim"
                 if isinstance(row, dict):
                     result        = row.get("result")
+                    if result is None:
+                        result = row.get("final_result")
                     session       = row.get("session_name", "") or "off"
-                    h4_bias       = row.get("h4_bias", "") or "neutral"
+                    h4_bias       = row.get("dominant_bias") or row.get("h4_bias", "") or "neutral"
                     direction     = row.get("direction", "")
                     setup_type    = row.get("setup_type", "") or "major"
-                    conf_type     = row.get("confirmation_type", "") or "rejection"
+                    conf_type     = row.get("micro_confirmation_type") or row.get("confirmation_type", "") or "rejection"
                     tp_progress   = int(row.get("tp_progress_reached", 0) or 0)
+                    if not tp_progress:
+                        tp_progress = int(row.get("tp_progress", 0) or 0)
                     sl_pips_val   = float(row.get("sl_pips", 20) or 20)
+                    strategy_type = canonical_strategy_type(row.get("strategy_type") or "gap_liquidity_sweep_reclaim")
                 elif isinstance(row, tuple):
                     # Column order: adjust indices based on your CREATE TABLE order
                     result      = row[21] if len(row) > 21 else None
@@ -221,11 +236,14 @@ class SetupRanker:
                 is_tp1  = result in _WIN_RESULTS  # TP1 is hit in all win variants
                 pip_val = (tp_progress * 20.0) if is_win else -sl_pips_val
 
+                strategy_sbd = self._sbd.setdefault(strategy_type, {})
+                strategy_stype = self._stype.setdefault(strategy_type, {})
+                strategy_ctype = self._ctype.setdefault(strategy_type, {})
                 sbd_key = f"{session}|{h4_bias}|{direction}"
                 for key, store in (
-                    (sbd_key,   self._sbd),
-                    (setup_type, self._stype),
-                    (conf_type,  self._ctype),
+                    (sbd_key, strategy_sbd),
+                    (setup_type, strategy_stype),
+                    (conf_type, strategy_ctype),
                 ):
                     if key not in store:
                         store[key] = DimStats()

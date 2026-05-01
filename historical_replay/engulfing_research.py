@@ -189,6 +189,7 @@ class EngulfingResearchEngine:
         self.research_counters: Dict[str, int] = defaultdict(int)
         self.reject_counters: Dict[str, int] = defaultdict(int)
         self.candidate_traces: List[Dict] = []
+        self._live_failed_engulf_candidates: List[Dict] = []
         self._trace_limit = 20
         self._candidate_seq = 0
 
@@ -196,6 +197,7 @@ class EngulfingResearchEngine:
         self.research_counters = defaultdict(int)
         self.reject_counters = defaultdict(int)
         self.candidate_traces = []
+        self._live_failed_engulf_candidates = []
         self._candidate_seq = 0
 
     def _bump(self, key: str, amount: int = 1) -> None:
@@ -241,7 +243,20 @@ class EngulfingResearchEngine:
         self._reset_diagnostics()
         self.db.init()
         self.mt5.connect()
+        try:
+            return self._run_core(start=start, end=end, symbol=symbol, show_trades=show_trades)
+        finally:
+            self.mt5.disconnect()
+            self.db.close()
 
+    def run_embedded(self, *, start: datetime, end: datetime, symbol: str = SYMBOL, show_trades: int = 0) -> Dict:
+        """Run without touching DB/MT5 lifecycle — caller owns the connections."""
+        start = self._as_utc(start)
+        end = self._as_utc(end)
+        self._reset_diagnostics()
+        return self._run_core(start=start, end=end, symbol=symbol, show_trades=show_trades)
+
+    def _run_core(self, *, start: datetime, end: datetime, symbol: str, show_trades: int) -> Dict:
         run_id = self.db.create_strategy_research_run({
             "strategy_group": "engulfing_rejection",
             "strategy_type": self.strategy_type,
@@ -282,9 +297,6 @@ class EngulfingResearchEngine:
                 },
             )
             raise
-        finally:
-            self.mt5.disconnect()
-            self.db.close()
 
     def _load_history(self, start: datetime, end: datetime) -> Dict[str, pd.DataFrame]:
         warmup_start = start - timedelta(days=REPLAY_WARMUP_DAYS)
@@ -922,6 +934,7 @@ class EngulfingResearchEngine:
                         "created_at": bar_time,
                     }
                     self.db.insert_strategy_research_trade(payload)
+                    self._live_failed_engulf_candidates.append(payload)
                     logger.info("FAILED ENGULF STORED: waiting for break-retest research")
                     self._trace_candidate(candidate)
                 candidates.pop(key, None)

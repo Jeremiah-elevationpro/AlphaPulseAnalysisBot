@@ -139,10 +139,36 @@ ENGULF_MODERATE_BIAS_BONUS = int(os.getenv("ENGULF_MODERATE_BIAS_BONUS", "3"))
 # ── PRODUCTION LOCK ──────────────────────────────────────────────────────────
 # Only gap_sweep (Gap + liquidity_sweep_reclaim) is approved for live forward
 # testing. All other strategies are research/replay only until verified.
-# Override via env: LIVE_ENABLED_STRATEGIES=gap_sweep
+STRATEGY_ALIASES = {
+    "gap_sweep": "gap_liquidity_sweep_reclaim",
+    "gap_liquidity_sweep_reclaim": "gap_liquidity_sweep_reclaim",
+    "engulfing": "engulfing_rejection",
+    "engulfing_rejection": "engulfing_rejection",
+    "break_retest": "standard_break_retest",
+    "standard_break_retest": "standard_break_retest",
+    "failed_engulf": "failed_engulf_break_retest",
+    "failed_engulf_break_retest": "failed_engulf_break_retest",
+}
+
+STRATEGY_DISPLAY_NAMES = {
+    "gap_liquidity_sweep_reclaim": "Gap Sweep",
+    "engulfing_rejection": "Engulfing Rejection",
+    "standard_break_retest": "Break + Retest",
+    "failed_engulf_break_retest": "Failed Engulf Break + Retest",
+}
+
+
+def canonical_strategy_type(name: str) -> str:
+    return STRATEGY_ALIASES.get((name or "").strip(), (name or "").strip())
+
+
+# Override via env: LIVE_ENABLED_STRATEGIES=gap_liquidity_sweep_reclaim,engulfing_rejection,standard_break_retest
 LIVE_ENABLED_STRATEGIES = [
-    part.strip()
-    for part in os.getenv("LIVE_ENABLED_STRATEGIES", "gap_sweep").split(",")
+    canonical_strategy_type(part.strip())
+    for part in os.getenv(
+        "LIVE_ENABLED_STRATEGIES",
+        "gap_liquidity_sweep_reclaim,engulfing_rejection,standard_break_retest",
+    ).split(",")
     if part.strip()
 ]
 
@@ -150,13 +176,15 @@ LIVE_ENABLED_STRATEGIES = [
 # alerts or live trade tracking entries. Changing this list requires explicit
 # replay verification first.
 RESEARCH_ONLY_STRATEGIES: List[str] = [
-    part.strip()
+    canonical_strategy_type(part.strip())
     for part in os.getenv(
         "RESEARCH_ONLY_STRATEGIES",
-        "engulfing_rejection,standard_break_retest,failed_engulf_break_retest,failed_gap_break_retest",
+        "failed_engulf_break_retest",
     ).split(",")
     if part.strip()
 ]
+FAILED_ENGULF_LIVE_ENABLED = os.getenv("FAILED_ENGULF_LIVE_ENABLED", "false").lower() == "true"
+FAILED_ENGULF_RESEARCH_ENABLED = os.getenv("FAILED_ENGULF_RESEARCH_ENABLED", "true").lower() == "true"
 ENGULF_ALLOWED_LIVE_TIMEFRAMES = tuple(
     part.strip()
     for part in os.getenv("ENGULF_ALLOWED_LIVE_TIMEFRAMES", "H1,M30").split(",")
@@ -189,6 +217,82 @@ ENGULF_LIVE_MAX_PER_TIMEFRAME_DIRECTION_SESSION = int(
     os.getenv("ENGULF_LIVE_MAX_PER_TIMEFRAME_DIRECTION_SESSION", "2")
 )
 ENGULF_LIVE_MAX_CANDIDATES_PER_SCAN = int(os.getenv("ENGULF_LIVE_MAX_CANDIDATES_PER_SCAN", "4"))
+
+# Spencer market analyst layer
+MAX_ENTRY_CHASE_DISTANCE_PIPS = float(os.getenv("MAX_ENTRY_CHASE_DISTANCE_PIPS", "15"))
+CONFIRMATION_MAX_AGE_CANDLES = int(os.getenv("CONFIRMATION_MAX_AGE_CANDLES", "2"))
+MARKET_PLAN_ALERT_COOLDOWN_MINUTES = int(os.getenv("MARKET_PLAN_ALERT_COOLDOWN_MINUTES", "45"))
+SCENARIO_UPDATE_ALERT_COOLDOWN_MINUTES = int(os.getenv("SCENARIO_UPDATE_ALERT_COOLDOWN_MINUTES", "20"))
+LIVE_ALERT_ROUTING = os.getenv("LIVE_ALERT_ROUTING", "analyst_layer").strip().lower()
+SPENCER_MEMORY_RETENTION_HOURS = int(os.getenv("SPENCER_MEMORY_RETENTION_HOURS", "72"))
+SPENCER_RESUME_WATCH_ALERT_ENABLED = os.getenv("SPENCER_RESUME_WATCH_ALERT_ENABLED", "true").lower() == "true"
+MARKET_PLAN_MIN_INTERVAL_MINUTES = int(os.getenv("MARKET_PLAN_MIN_INTERVAL_MINUTES", "30"))
+MARKET_PLAN_RESEND_ON_MINOR_PRICE_CHANGE = os.getenv("MARKET_PLAN_RESEND_ON_MINOR_PRICE_CHANGE", "false").lower() == "true"
+ENTRY_ALERT_COOLDOWN_MINUTES = int(os.getenv("ENTRY_ALERT_COOLDOWN_MINUTES", "30"))
+ENTRY_ZONE_DUPLICATE_TOLERANCE_PIPS = float(os.getenv("ENTRY_ZONE_DUPLICATE_TOLERANCE_PIPS", "10"))
+MT5_NO_DATA_ALERT_COOLDOWN_MINUTES = int(os.getenv("MT5_NO_DATA_ALERT_COOLDOWN_MINUTES", "30"))
+TELEGRAM_RUNTIME_ALERTS_ENABLED = os.getenv("TELEGRAM_RUNTIME_ALERTS_ENABLED", "true").lower() == "true"
+LIVE_ARCHITECTURE_MODE = os.getenv("LIVE_ARCHITECTURE_MODE", "five_layer").strip().lower()
+ANALYST_REPLAY_STEP_TIMEFRAME = os.getenv("ANALYST_REPLAY_STEP_TIMEFRAME", "M15").strip().upper()
+ANALYST_REPLAY_MARKET_PLAN_INTERVAL_CANDLES = int(os.getenv("ANALYST_REPLAY_MARKET_PLAN_INTERVAL_CANDLES", "4"))
+ANALYST_REPLAY_CONFIRMATION_CHECK_EVERY_CANDLE = os.getenv("ANALYST_REPLAY_CONFIRMATION_CHECK_EVERY_CANDLE", "true").strip().lower() == "true"
+ANALYST_REPLAY_STORE_ONLY_EVENTS = os.getenv("ANALYST_REPLAY_STORE_ONLY_EVENTS", "true").strip().lower() == "true"
+ANALYST_REPLAY_STORE_REJECTIONS = os.getenv("ANALYST_REPLAY_STORE_REJECTIONS", "false").strip().lower() == "true"
+ANALYST_REPLAY_VERBOSE_LOGS = os.getenv("ANALYST_REPLAY_VERBOSE_LOGS", "false").strip().lower() == "true"
+ANALYST_REPLAY_BATCH_DB_WRITES = os.getenv("ANALYST_REPLAY_BATCH_DB_WRITES", "true").strip().lower() == "true"
+ANALYST_REPLAY_BATCH_SIZE = int(os.getenv("ANALYST_REPLAY_BATCH_SIZE", "250"))
+ANALYST_REPLAY_MAX_CONFIRMATIONS_PER_ZONE = int(os.getenv("ANALYST_REPLAY_MAX_CONFIRMATIONS_PER_ZONE", "1"))
+ANALYST_REPLAY_ENTRY_COOLDOWN_CANDLES = int(os.getenv("ANALYST_REPLAY_ENTRY_COOLDOWN_CANDLES", "8"))
+ANALYST_QUALITY_GATE_ENABLED = os.getenv("ANALYST_QUALITY_GATE_ENABLED", "true").strip().lower() == "true"
+ANALYST_ALLOWED_PRIMARY_ENTRIES = os.getenv("ANALYST_ALLOWED_PRIMARY_ENTRIES", "true").strip().lower() == "true"
+ANALYST_SECONDARY_ENTRIES_REQUIRE_A_PLUS = os.getenv("ANALYST_SECONDARY_ENTRIES_REQUIRE_A_PLUS", "true").strip().lower() == "true"
+ANALYST_SECONDARY_REQUIRE_STRUCTURE_FLIP = os.getenv("ANALYST_SECONDARY_REQUIRE_STRUCTURE_FLIP", "true").strip().lower() == "true"
+ANALYST_ALLOWED_CONFIRMATIONS = [
+    item.strip() for item in os.getenv(
+        "ANALYST_ALLOWED_CONFIRMATIONS",
+        "break_retest_close_confirmation,failed_retest_confirmation,sweep_reclaim_confirmation,engulfing_level_confirmation",
+    ).split(",") if item.strip()
+]
+ANALYST_STRUCTURE_SHIFT_ALONE_ALLOWED = os.getenv("ANALYST_STRUCTURE_SHIFT_ALONE_ALLOWED", "false").strip().lower() == "true"
+ANALYST_MIN_CONFIRMATION_GRADE = os.getenv("ANALYST_MIN_CONFIRMATION_GRADE", "A").strip().upper()
+ANALYST_PRIMARY_MIN_GRADE = os.getenv("ANALYST_PRIMARY_MIN_GRADE", "A").strip().upper()
+ANALYST_SECONDARY_MIN_GRADE = os.getenv("ANALYST_SECONDARY_MIN_GRADE", "A+").strip().upper()
+ANALYST_MIN_LEARNING_SCORE = float(os.getenv("ANALYST_MIN_LEARNING_SCORE", "75"))
+MAX_ANALYST_ENTRIES_PER_DAY = int(os.getenv("MAX_ANALYST_ENTRIES_PER_DAY", "2"))
+MAX_ANALYST_ENTRIES_PER_SESSION = int(os.getenv("MAX_ANALYST_ENTRIES_PER_SESSION", "1"))
+MAX_ANALYST_ENTRIES_PER_ZONE_PER_DAY = int(os.getenv("MAX_ANALYST_ENTRIES_PER_ZONE_PER_DAY", "1"))
+ALLOW_THIRD_TRADE_IF_ELITE = os.getenv("ALLOW_THIRD_TRADE_IF_ELITE", "true").strip().lower() == "true"
+ELITE_TRADE_MIN_SCORE = float(os.getenv("ELITE_TRADE_MIN_SCORE", "90"))
+DECISION_WINDOW_CANDLES = int(os.getenv("DECISION_WINDOW_CANDLES", "2"))
+LIVE_WAIT_FOR_BETTER_CONFIRMATION = os.getenv("LIVE_WAIT_FOR_BETTER_CONFIRMATION", "true").strip().lower() == "true"
+XAUUSD_SL_BUFFER_PIPS_MIN = float(os.getenv("XAUUSD_SL_BUFFER_PIPS_MIN", "4"))
+XAUUSD_SL_BUFFER_PIPS_DEFAULT = float(os.getenv("XAUUSD_SL_BUFFER_PIPS_DEFAULT", "6"))
+XAUUSD_SL_BUFFER_PIPS_MAX = float(os.getenv("XAUUSD_SL_BUFFER_PIPS_MAX", "10"))
+ALLOW_MICRO_TP_IN_LIVE = os.getenv("ALLOW_MICRO_TP_IN_LIVE", "false").strip().lower() == "true"
+ALLOW_MICRO_TP_IN_REPLAY = os.getenv("ALLOW_MICRO_TP_IN_REPLAY", "true").strip().lower() == "true"
+TP_MIN_USEFUL_DISTANCE_PIPS = float(os.getenv("TP_MIN_USEFUL_DISTANCE_PIPS", "15"))
+TP_MIN_SPACING_PIPS = float(os.getenv("TP_MIN_SPACING_PIPS", "20"))
+TP_PREFERRED_SPACING_PIPS = float(os.getenv("TP_PREFERRED_SPACING_PIPS", "25"))
+RISK_QUALITY_GATE_ENABLED = os.getenv("RISK_QUALITY_GATE_ENABLED", "true").strip().lower() == "true"
+XAUUSD_WIDE_SL_THRESHOLD_PIPS = float(os.getenv("XAUUSD_WIDE_SL_THRESHOLD_PIPS", "25"))
+XAUUSD_VERY_WIDE_SL_THRESHOLD_PIPS = float(os.getenv("XAUUSD_VERY_WIDE_SL_THRESHOLD_PIPS", "35"))
+WIDE_SL_MIN_CANDIDATE_SCORE = float(os.getenv("WIDE_SL_MIN_CANDIDATE_SCORE", "90"))
+VERY_WIDE_SL_MIN_CANDIDATE_SCORE = float(os.getenv("VERY_WIDE_SL_MIN_CANDIDATE_SCORE", "100"))
+WIDE_SL_MIN_TP1_RR = float(os.getenv("WIDE_SL_MIN_TP1_RR", "1.3"))
+VERY_WIDE_SL_MIN_TP1_RR = float(os.getenv("VERY_WIDE_SL_MIN_TP1_RR", "1.5"))
+WIDE_SL_REQUIRE_H4_H1_ALIGNMENT = os.getenv("WIDE_SL_REQUIRE_H4_H1_ALIGNMENT", "true").strip().lower() == "true"
+WIDE_SL_ALLOWED_CONFIRMATIONS = [
+    item.strip() for item in os.getenv(
+        "WIDE_SL_ALLOWED_CONFIRMATIONS",
+        "break_retest_close_confirmation,engulfing_level_confirmation",
+    ).split(",") if item.strip()
+]
+WIDE_SL_RESTRICT_CONFIRMATIONS = [
+    item.strip() for item in os.getenv(
+        "WIDE_SL_RESTRICT_CONFIRMATIONS",
+        "sweep_reclaim_confirmation,failed_retest_confirmation",
+    ).split(",") if item.strip()
+]
 
 # A/V quality scoring bonuses (selector + final scoring layers only)
 AV_STRONG_ORIGIN_BONUS = int(os.getenv("AV_STRONG_ORIGIN_BONUS", "8"))
@@ -525,6 +629,17 @@ ACTIVE_STRATEGY_ALLOWED_MICRO_TYPES = ["liquidity_sweep_reclaim"]
 
 # Institutional-style execution filters layered on top of the active Gap +
 # approved-micro strategy.
+
+# Standard Break + Retest confirmation policy
+STANDARD_BRT_ALLOWED_CONFIRMATIONS = ["close_confirmation"]
+STANDARD_BRT_RESEARCH_CONFIRMATIONS = ["close_confirmation", "rejection_wick"]
+FAILED_ENGULF_BRT_ALLOWED_CONFIRMATIONS = ["close_confirmation"]
+FAILED_ENGULF_BRT_RESEARCH_CONFIRMATIONS = ["close_confirmation", "rejection_wick"]
+FAILED_ENGULF_RESEARCH_TIMEFRAMES = ["H1", "M30", "M15"]
+FAILED_ENGULF_APPROVED_TIMEFRAMES = ["H1", "M30"]
+FAILED_ENGULF_RESEARCH_ALLOW_WEAK_BIAS = True
+FAILED_ENGULF_MIN_BREAK_PIPS = float(os.getenv("FAILED_ENGULF_MIN_BREAK_PIPS", "5"))
+FAILED_ENGULF_RETEST_TOLERANCE_PIPS = float(os.getenv("FAILED_ENGULF_RETEST_TOLERANCE_PIPS", "10"))
 EXECUTION_FILTERS_ENABLED = os.getenv("EXECUTION_FILTERS_ENABLED", "true").lower() == "true"
 HTF_SWEEP_FILTER_ENABLED = os.getenv("HTF_SWEEP_FILTER_ENABLED", "false").lower() == "true"
 HTF_SWEEP_LOOKBACK = int(os.getenv("HTF_SWEEP_LOOKBACK", "24"))
@@ -752,15 +867,18 @@ NO_SETUP_STATUS_INTERVAL_MINUTES = int(os.getenv("NO_SETUP_STATUS_INTERVAL_MINUT
 # LIVE / RESEARCH STRATEGY GATES
 # ─────────────────────────────────────────────
 LIVE_ENABLED_STRATEGIES = [
-    part.strip()
-    for part in os.getenv("LIVE_ENABLED_STRATEGIES", "gap_sweep").split(",")
+    canonical_strategy_type(part.strip())
+    for part in os.getenv(
+        "LIVE_ENABLED_STRATEGIES",
+        "gap_liquidity_sweep_reclaim,engulfing_rejection,standard_break_retest",
+    ).split(",")
     if part.strip()
 ]
 RESEARCH_ONLY_STRATEGIES: List[str] = [
-    part.strip()
+    canonical_strategy_type(part.strip())
     for part in os.getenv(
         "RESEARCH_ONLY_STRATEGIES",
-        "engulfing_rejection,standard_break_retest,failed_engulf_break_retest,failed_gap_break_retest",
+        "failed_engulf_break_retest",
     ).split(",")
     if part.strip()
 ]
