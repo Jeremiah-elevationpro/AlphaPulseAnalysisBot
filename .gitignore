@@ -30,3 +30,10 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Runtime state files (generated at runtime, not source code)
+bot_heartbeat.json
+bot_runtime_control.json
+spencer_memory.json
+spencer_instance.lock
+runtime_alerts_disabled.flag
