@@ -1,0 +1,60 @@
+{
+  "categories": {
+    "confirmation_grade": [
+      "unknown",
+      "a",
+      "a+"
+    ],
+    "confirmation_type": [
+      "unknown",
+      "break_retest_close_confirmation",
+      "engulfing_level_confirmation",
+      "failed_retest_confirmation",
+      "sweep_reclaim_confirmation"
+    ],
+    "direction": [
+      "unknown",
+      "buy",
+      "sell"
+    ],
+    "dominant_bias": [
+      "unknown",
+      "bearish",
+      "bullish",
+      "neutral"
+    ],
+    "h1_bias": [
+      "unknown",
+      "impulsive",
+      "range",
+      "reversal_attempt"
+    ],
+    "h4_bias": [
+      "unknown",
+      "bearish",
+      "bullish",
+      "neutral"
+    ],
+    "market_condition": [
+      "unknown"
+    ],
+    "scenario_type": [
+      "unknown",
+      "primary",
+      "secondary"
+    ],
+    "session_name": [
+      "unknown",
+      "asia",
+      "london",
+      "new_york",
+      "off_session"
+    ],
+    "symbol": [
+      "unknown",
+      "xauusd"
+    ]
+  },
+  "schema_version": "spencer_setup_features_v1",
+  "unknown_token": "unknown"
+}

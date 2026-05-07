@@ -1,0 +1,41 @@
+# Environment
+.env
+*.env
+
+# Virtual environment
+venv/
+.venv/
+
+# Claude Code session files
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime state files (generated at runtime, not source code)
+bot_heartbeat.json
+bot_runtime_control.json
+spencer_memory.json
+spencer_instance.lock
+runtime_alerts_disabled.flag
+telegram_health.json
+*.tsbuildinfo

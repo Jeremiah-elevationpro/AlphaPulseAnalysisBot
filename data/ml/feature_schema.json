@@ -1,0 +1,426 @@
+{
+  "categorical_features": [
+    "symbol",
+    "direction",
+    "session_name",
+    "h4_bias",
+    "h1_bias",
+    "dominant_bias",
+    "scenario_type",
+    "confirmation_type",
+    "confirmation_grade",
+    "market_condition"
+  ],
+  "categories": {
+    "confirmation_grade": [
+      "unknown",
+      "a",
+      "a+"
+    ],
+    "confirmation_type": [
+      "unknown",
+      "break_retest_close_confirmation",
+      "displacement_confirmation",
+      "engulfing_level_confirmation",
+      "failed_retest_confirmation",
+      "structure_shift_confirmation",
+      "sweep_reclaim_confirmation"
+    ],
+    "direction": [
+      "unknown",
+      "buy",
+      "sell"
+    ],
+    "dominant_bias": [
+      "unknown",
+      "bearish",
+      "bullish",
+      "neutral"
+    ],
+    "h1_bias": [
+      "unknown",
+      "impulsive",
+      "range",
+      "reversal_attempt"
+    ],
+    "h4_bias": [
+      "unknown",
+      "bearish",
+      "bullish",
+      "neutral"
+    ],
+    "market_condition": [
+      "unknown"
+    ],
+    "scenario_type": [
+      "unknown",
+      "primary",
+      "secondary"
+    ],
+    "session_name": [
+      "unknown",
+      "asia",
+      "london",
+      "new_york",
+      "off_session"
+    ],
+    "symbol": [
+      "unknown",
+      "xauusd"
+    ]
+  },
+  "critical_features": [
+    "candidate_rank_score",
+    "confirmation_grade",
+    "confirmation_type",
+    "direction",
+    "h1_bias",
+    "h4_bias",
+    "learning_score",
+    "risk_pips",
+    "scenario_type",
+    "session_name",
+    "structure_alignment_score",
+    "tp1_rr",
+    "tp2_rr",
+    "tp3_rr"
+  ],
+  "feature_columns": [
+    "symbol__unknown",
+    "symbol__xauusd",
+    "direction__unknown",
+    "direction__buy",
+    "direction__sell",
+    "session_name__unknown",
+    "session_name__asia",
+    "session_name__london",
+    "session_name__new_york",
+    "session_name__off_session",
+    "h4_bias__unknown",
+    "h4_bias__bearish",
+    "h4_bias__bullish",
+    "h4_bias__neutral",
+    "h1_bias__unknown",
+    "h1_bias__impulsive",
+    "h1_bias__range",
+    "h1_bias__reversal_attempt",
+    "dominant_bias__unknown",
+    "dominant_bias__bearish",
+    "dominant_bias__bullish",
+    "dominant_bias__neutral",
+    "scenario_type__unknown",
+    "scenario_type__primary",
+    "scenario_type__secondary",
+    "confirmation_type__unknown",
+    "confirmation_type__break_retest_close_confirmation",
+    "confirmation_type__displacement_confirmation",
+    "confirmation_type__engulfing_level_confirmation",
+    "confirmation_type__failed_retest_confirmation",
+    "confirmation_type__structure_shift_confirmation",
+    "confirmation_type__sweep_reclaim_confirmation",
+    "confirmation_grade__unknown",
+    "confirmation_grade__a",
+    "confirmation_grade__a+",
+    "market_condition__unknown",
+    "bias_strength",
+    "candidate_rank_score",
+    "learning_score",
+    "entry",
+    "sl",
+    "tp1",
+    "tp2",
+    "tp3",
+    "risk_pips",
+    "tp1_reward_pips",
+    "tp2_reward_pips",
+    "tp3_reward_pips",
+    "tp1_rr",
+    "tp2_rr",
+    "tp3_rr",
+    "reaction_level_present",
+    "volatility_at_entry",
+    "atr_m15",
+    "atr_h1",
+    "candle_body_ratio",
+    "candle_wick_ratio",
+    "displacement_strength",
+    "distance_to_psych_level",
+    "distance_to_watch_zone",
+    "distance_to_invalidation",
+    "recent_momentum_3",
+    "recent_momentum_5",
+    "recent_momentum_10",
+    "structure_alignment_score"
+  ],
+  "missing_defaults": {
+    "categorical": "unknown",
+    "numeric": {
+      "atr_h1": 0.0,
+      "atr_m15": 0.0,
+      "bias_strength": 0.55,
+      "candidate_rank_score": 0.0,
+      "candle_body_ratio": 0.5,
+      "candle_wick_ratio": 0.0,
+      "displacement_strength": 0.5,
+      "distance_to_invalidation": 0.0,
+      "distance_to_psych_level": 0.0,
+      "distance_to_watch_zone": 0.0,
+      "entry": 0.0,
+      "learning_score": 0.0,
+      "reaction_level_present": 0.0,
+      "recent_momentum_10": 0.0,
+      "recent_momentum_3": 0.0,
+      "recent_momentum_5": 0.0,
+      "risk_pips": 0.0,
+      "sl": 0.0,
+      "structure_alignment_score": 0.0,
+      "tp1": 0.0,
+      "tp1_reward_pips": 0.0,
+      "tp1_rr": 0.0,
+      "tp2": 0.0,
+      "tp2_reward_pips": 0.0,
+      "tp2_rr": 0.0,
+      "tp3": 0.0,
+      "tp3_reward_pips": 0.0,
+      "tp3_rr": 0.0,
+      "volatility_at_entry": 0.0
+    }
+  },
+  "numeric_features": [
+    "bias_strength",
+    "candidate_rank_score",
+    "learning_score",
+    "entry",
+    "sl",
+    "tp1",
+    "tp2",
+    "tp3",
+    "risk_pips",
+    "tp1_reward_pips",
+    "tp2_reward_pips",
+    "tp3_reward_pips",
+    "tp1_rr",
+    "tp2_rr",
+    "tp3_rr",
+    "reaction_level_present",
+    "volatility_at_entry",
+    "atr_m15",
+    "atr_h1",
+    "candle_body_ratio",
+    "candle_wick_ratio",
+    "displacement_strength",
+    "distance_to_psych_level",
+    "distance_to_watch_zone",
+    "distance_to_invalidation",
+    "recent_momentum_3",
+    "recent_momentum_5",
+    "recent_momentum_10",
+    "structure_alignment_score"
+  ],
+  "numeric_stats": {
+    "atr_h1": {
+      "max": 86.78000000000065,
+      "mean": 41.86814285714281,
+      "min": 0.1000000000003638,
+      "missing_default": 0.0,
+      "std": 19.560034954165193
+    },
+    "atr_m15": {
+      "max": 43.39000000000033,
+      "mean": 20.934071428571404,
+      "min": 0.0500000000001819,
+      "missing_default": 0.0,
+      "std": 9.780017477082596
+    },
+    "bias_strength": {
+      "max": 0.85,
+      "mean": 0.5877142857142856,
+      "min": 0.25,
+      "missing_default": 0.55,
+      "std": 0.2976199466653087
+    },
+    "candidate_rank_score": {
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "missing_default": 0.0,
+      "std": 1.0
+    },
+    "candle_body_ratio": {
+      "max": 0.96,
+      "mean": 0.9421571428571428,
+      "min": 0.9,
+      "missing_default": 0.5,
+      "std": 0.01919236136315374
+    },
+    "candle_wick_ratio": {
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "missing_default": 0.0,
+      "std": 1.0
+    },
+    "displacement_strength": {
+      "max": 0.96,
+      "mean": 0.9421571428571428,
+      "min": 0.9,
+      "missing_default": 0.5,
+      "std": 0.01919236136315374
+    },
+    "distance_to_invalidation": {
+      "max": 43.39000000000033,
+      "mean": 20.934071428571404,
+      "min": 0.0500000000001819,
+      "missing_default": 0.0,
+      "std": 9.780017477082596
+    },
+    "distance_to_psych_level": {
+      "max": 24.93000000000029,
+      "mean": 12.287100000000008,
+      "min": 0.0100000000002182,
+      "missing_default": 0.0,
+      "std": 7.422330767257116
+    },
+    "distance_to_watch_zone": {
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "missing_default": 0.0,
+      "std": 1.0
+    },
+    "entry": {
+      "max": 5405.92,
+      "mean": 5101.987785714286,
+      "min": 4538.99,
+      "missing_default": 0.0,
+      "std": 165.76483243209276
+    },
+    "learning_score": {
+      "max": 95.0,
+      "mean": 81.14285714285714,
+      "min": 70.0,
+      "missing_default": 0.0,
+      "std": 5.3030603409344526
+    },
+    "reaction_level_present": {
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "missing_default": 0.0,
+      "std": 1.0
+    },
+    "recent_momentum_10": {
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "missing_default": 0.0,
+      "std": 1.0
+    },
+    "recent_momentum_3": {
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "missing_default": 0.0,
+      "std": 1.0
+    },
+    "recent_momentum_5": {
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "missing_default": 0.0,
+      "std": 1.0
+    },
+    "risk_pips": {
+      "max": 43.39000000000033,
+      "mean": 20.934071428571404,
+      "min": 0.0500000000001819,
+      "missing_default": 0.0,
+      "std": 9.780017477082596
+    },
+    "sl": {
+      "max": 5404.0,
+      "mean": 5113.233171428571,
+      "min": 4554.0,
+      "missing_default": 0.0,
+      "std": 155.3810186512011
+    },
+    "structure_alignment_score": {
+      "max": 1.0,
+      "mean": 0.5628571428571428,
+      "min": 0.0,
+      "missing_default": 0.0,
+      "std": 0.4960332444421812
+    },
+    "tp1": {
+      "max": 5420.0,
+      "mean": 5098.3304285714285,
+      "min": 4520.0,
+      "missing_default": 0.0,
+      "std": 171.41631635487173
+    },
+    "tp1_reward_pips": {
+      "max": 29.949999999999815,
+      "mean": 17.60952857142857,
+      "min": 10.010000000000218,
+      "missing_default": 0.0,
+      "std": 5.0185760565022655
+    },
+    "tp1_rr": {
+      "max": 348.5000000003183,
+      "mean": 3.050674599715062,
+      "min": 0.2445263885687852,
+      "missing_default": 0.0,
+      "std": 18.669032478088518
+    },
+    "tp2": {
+      "max": 5440.0,
+      "mean": 5094.701528571429,
+      "min": 4500.0,
+      "missing_default": 0.0,
+      "std": 180.83311307574027
+    },
+    "tp2_reward_pips": {
+      "max": 49.94999999999982,
+      "mean": 39.03317142857143,
+      "min": 30.01000000000022,
+      "missing_default": 0.0,
+      "std": 5.37332046310133
+    },
+    "tp2_rr": {
+      "max": 680.9999999975262,
+      "mean": 6.564063831267848,
+      "min": 0.7990320350311088,
+      "missing_default": 0.0,
+      "std": 38.27657696314988
+    },
+    "tp3": {
+      "max": 5460.0,
+      "mean": 5090.791185714286,
+      "min": 4480.0,
+      "missing_default": 0.0,
+      "std": 191.26218246135278
+    },
+    "tp3_reward_pips": {
+      "max": 181.09000000000012,
+      "mean": 60.14182857142857,
+      "min": 50.01000000000022,
+      "missing_default": 0.0,
+      "std": 9.213514969049418
+    },
+    "tp3_rr": {
+      "max": 1080.999999996071,
+      "mean": 10.158484292405667,
+      "min": 1.3968656372435864,
+      "missing_default": 0.0,
+      "std": 58.48473385120321
+    },
+    "volatility_at_entry": {
+      "max": 43.39000000000033,
+      "mean": 20.934071428571404,
+      "min": 0.0500000000001819,
+      "missing_default": 0.0,
+      "std": 9.780017477082596
+    }
+  },
+  "schema_version": "spencer_setup_features_v1"
+}

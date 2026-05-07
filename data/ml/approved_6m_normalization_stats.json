@@ -1,0 +1,239 @@
+{
+  "missing_defaults": {
+    "atr_h1": 0.0,
+    "atr_m15": 0.0,
+    "bias_strength": 0.55,
+    "candidate_rank_score": 0.0,
+    "candle_body_ratio": 0.5,
+    "candle_wick_ratio": 0.0,
+    "displacement_strength": 0.5,
+    "distance_to_invalidation": 0.0,
+    "distance_to_psych_level": 0.0,
+    "distance_to_watch_zone": 0.0,
+    "entry": 0.0,
+    "learning_score": 0.0,
+    "reaction_level_present": 0.0,
+    "recent_momentum_10": 0.0,
+    "recent_momentum_3": 0.0,
+    "recent_momentum_5": 0.0,
+    "risk_pips": 0.0,
+    "sl": 0.0,
+    "structure_alignment_score": 0.0,
+    "tp1": 0.0,
+    "tp1_reward_pips": 0.0,
+    "tp1_rr": 0.0,
+    "tp2": 0.0,
+    "tp2_reward_pips": 0.0,
+    "tp2_rr": 0.0,
+    "tp3": 0.0,
+    "tp3_reward_pips": 0.0,
+    "tp3_rr": 0.0,
+    "volatility_at_entry": 0.0
+  },
+  "numeric_stats": {
+    "atr_h1": {
+      "max": 83.55999999999949,
+      "mean": 41.320357142857105,
+      "min": 3.5199999999986176,
+      "missing_default": 0.0,
+      "std": 14.473735209385648
+    },
+    "atr_m15": {
+      "max": 41.77999999999975,
+      "mean": 20.660178571428553,
+      "min": 1.7599999999993088,
+      "missing_default": 0.0,
+      "std": 7.236867604692824
+    },
+    "bias_strength": {
+      "max": 0.85,
+      "mean": 0.6766233766233766,
+      "min": 0.25,
+      "missing_default": 0.55,
+      "std": 0.2719678666543062
+    },
+    "candidate_rank_score": {
+      "max": 145.0,
+      "mean": 94.99188311688312,
+      "min": 70.0,
+      "missing_default": 0.0,
+      "std": 11.831127734364879
+    },
+    "candle_body_ratio": {
+      "max": 0.96,
+      "mean": 0.7926136363636364,
+      "min": 0.5,
+      "missing_default": 0.5,
+      "std": 0.20423953042463538
+    },
+    "candle_wick_ratio": {
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "missing_default": 0.0,
+      "std": 1.0
+    },
+    "displacement_strength": {
+      "max": 0.96,
+      "mean": 0.7926136363636364,
+      "min": 0.5,
+      "missing_default": 0.5,
+      "std": 0.20423953042463538
+    },
+    "distance_to_invalidation": {
+      "max": 41.77999999999975,
+      "mean": 17.03582792207792,
+      "min": 0.5200000000004366,
+      "missing_default": 0.0,
+      "std": 7.85215124565714
+    },
+    "distance_to_psych_level": {
+      "max": 24.9399999999996,
+      "mean": 11.944951298701302,
+      "min": 0.0399999999999636,
+      "missing_default": 0.0,
+      "std": 7.32691870160755
+    },
+    "distance_to_watch_zone": {
+      "max": 24.1899999999996,
+      "mean": 3.64868506493504,
+      "min": 0.0,
+      "missing_default": 0.0,
+      "std": 7.343219510809417
+    },
+    "entry": {
+      "max": 5541.58,
+      "mean": 4713.278652597403,
+      "min": 3939.94,
+      "missing_default": 0.0,
+      "std": 243.21566467402417
+    },
+    "learning_score": {
+      "max": 100.0,
+      "mean": 84.09902597402598,
+      "min": 70.0,
+      "missing_default": 0.0,
+      "std": 6.611304689743474
+    },
+    "reaction_level_present": {
+      "max": 1.0,
+      "mean": 0.19967532467532467,
+      "min": 0.0,
+      "missing_default": 0.0,
+      "std": 0.3997562874941786
+    },
+    "recent_momentum_10": {
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "missing_default": 0.0,
+      "std": 1.0
+    },
+    "recent_momentum_3": {
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "missing_default": 0.0,
+      "std": 1.0
+    },
+    "recent_momentum_5": {
+      "max": 0.0,
+      "mean": 0.0,
+      "min": 0.0,
+      "missing_default": 0.0,
+      "std": 1.0
+    },
+    "risk_pips": {
+      "max": 41.77999999999975,
+      "mean": 20.660178571428553,
+      "min": 1.7599999999993088,
+      "missing_default": 0.0,
+      "std": 7.236867604692824
+    },
+    "sl": {
+      "max": 5514.0,
+      "mean": 4712.49788961039,
+      "min": 3956.0,
+      "missing_default": 0.0,
+      "std": 240.3930136885981
+    },
+    "structure_alignment_score": {
+      "max": 1.0,
+      "mean": 0.711038961038961,
+      "min": 0.0,
+      "missing_default": 0.0,
+      "std": 0.45327977775717715
+    },
+    "tp1": {
+      "max": 5580.0,
+      "mean": 4715.111931818182,
+      "min": 3920.0,
+      "missing_default": 0.0,
+      "std": 249.53685845436655
+    },
+    "tp1_reward_pips": {
+      "max": 54.9,
+      "mean": 24.726525974025993,
+      "min": 10.019999999999529,
+      "missing_default": 0.0,
+      "std": 9.918432594867777
+    },
+    "tp1_rr": {
+      "max": 12.4431818181865,
+      "mean": 1.3663853658837297,
+      "min": 0.2960235640648081,
+      "missing_default": 0.0,
+      "std": 0.8512719465223348
+    },
+    "tp2": {
+      "max": 5600.0,
+      "mean": 4716.976834415584,
+      "min": 3900.0,
+      "missing_default": 0.0,
+      "std": 255.11191400459813
+    },
+    "tp2_reward_pips": {
+      "max": 79.8,
+      "mean": 45.7613311688312,
+      "min": 30.050000000000185,
+      "missing_default": 0.0,
+      "std": 9.687142713012694
+    },
+    "tp2_rr": {
+      "max": 23.806818181827325,
+      "mean": 2.6405848208355334,
+      "min": 0.8851251840942663,
+      "missing_default": 0.0,
+      "std": 1.9350652655298155
+    },
+    "tp3": {
+      "max": 5625.0,
+      "mean": 4718.157288961039,
+      "min": 3880.0,
+      "missing_default": 0.0,
+      "std": 262.8827418649045
+    },
+    "tp3_reward_pips": {
+      "max": 150.9,
+      "mean": 67.11689935064938,
+      "min": 50.05000000000018,
+      "missing_default": 0.0,
+      "std": 11.961416039298784
+    },
+    "tp3_rr": {
+      "max": 35.170454545468154,
+      "mean": 3.9082551884166,
+      "min": 1.4742268041237243,
+      "missing_default": 0.0,
+      "std": 2.930406394349015
+    },
+    "volatility_at_entry": {
+      "max": 41.77999999999975,
+      "mean": 20.660178571428553,
+      "min": 1.7599999999993088,
+      "missing_default": 0.0,
+      "std": 7.236867604692824
+    }
+  },
+  "schema_version": "spencer_setup_features_v1"
+}
