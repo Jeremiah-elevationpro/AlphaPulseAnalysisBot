@@ -440,6 +440,203 @@ def _structured_blocks(s: dict) -> dict:
     }
 
 
+def _build_price_feed_block(s: dict) -> dict:
+    """Return a structured priceFeed block for the dashboard.
+
+    Pure shaping only — null-safe defaults so the frontend never crashes.
+    """
+    pf = s.get("priceFeed") or {}
+    candles = pf.get("candles") or pf.get("latestCandles") or []
+    candles_by_tf = pf.get("candlesByTimeframe") or {}
+    latest_candle = pf.get("latestCandle")
+    if not latest_candle and candles:
+        latest_candle = candles[-1]
+    status_value = pf.get("status") or ("live" if candles else "waiting_for_data")
+    return {
+        "symbol":         pf.get("symbol") or s.get("symbol") or "XAUUSD",
+        "currentPrice":   pf.get("currentPrice") if pf.get("currentPrice") is not None else s.get("current_price"),
+        "bid":            pf.get("bid") if pf.get("bid") is not None else s.get("bid"),
+        "ask":            pf.get("ask") if pf.get("ask") is not None else s.get("ask"),
+        "spread":         pf.get("spread") if pf.get("spread") is not None else s.get("spread"),
+        "spreadPips":     pf.get("spreadPips") if pf.get("spreadPips") is not None else s.get("spread_pips"),
+        "timeframe":      pf.get("timeframe") or "M15",
+        "status":         status_value,
+        "lastUpdated":    pf.get("lastUpdated") or s.get("last_market_update_at"),
+        "session":        pf.get("session") or s.get("session"),
+        "latestCandle":   latest_candle,
+        "candles":        candles,
+        "candlesByTimeframe": {
+            "M5":  candles_by_tf.get("M5") or [],
+            "M15": candles_by_tf.get("M15") or candles or [],
+            "H1":  candles_by_tf.get("H1") or [],
+        },
+        "activeLevel":    pf.get("activeLevel"),
+        "primaryZone":    pf.get("primaryZone"),
+        "alternativeZone": pf.get("alternativeZone"),
+        "primaryZoneLow":  pf.get("primaryZoneLow"),
+        "primaryZoneHigh": pf.get("primaryZoneHigh"),
+        "alternativeZoneLow":  pf.get("alternativeZoneLow"),
+        "alternativeZoneHigh": pf.get("alternativeZoneHigh"),
+        "entry":          pf.get("entry"),
+        "direction":      pf.get("direction"),
+        "sl":             pf.get("sl"),
+        "tp1":            pf.get("tp1"),
+        "tp2":            pf.get("tp2"),
+        "tp3":            pf.get("tp3"),
+    }
+
+
+def _build_dashboard_state(s: dict, blocks: dict) -> dict:
+    """Top-level dashboardState — the single feed the new dashboard reads.
+
+    Wraps existing structured blocks behind a stable, null-safe shape so
+    UI panels can render gracefully while the bot warms up.
+    """
+    plan = s.get("market_plan") or {}
+    primary = (plan.get("primary_scenario") or {}) if isinstance(plan, dict) else {}
+    secondary = (plan.get("secondary_scenario") or {}) if isinstance(plan, dict) else {}
+
+    # Active scenario summary (sentence the dashboard surfaces verbatim)
+    active_scenario_label: str | None = None
+    if primary:
+        direction = (primary.get("direction") or "?").upper()
+        watch_zone = primary.get("watch_zone") or ""
+        scenario_kind = primary.get("scenario_type") or "continuation"
+        if watch_zone:
+            active_scenario_label = f"{direction} {scenario_kind} {watch_zone}".strip()
+        else:
+            active_scenario_label = f"{direction} {scenario_kind}".strip()
+
+    confirmation_block = blocks.get("confirmationEngine") or {}
+    waiting_for = confirmation_block.get("watchingFor") or primary.get("trigger_conditions") or []
+    plan_status = primary.get("scenario_status") or (plan or {}).get("plan_status")
+    deep_context_levels: list = []
+    for source in (
+        plan.get("psychological_levels"),
+        plan.get("actionable_psych_levels"),
+        plan.get("key_supports"),
+        plan.get("key_resistances"),
+    ):
+        if isinstance(source, list):
+            for v in source:
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                if fv not in deep_context_levels:
+                    deep_context_levels.append(fv)
+    deep_context_levels = deep_context_levels[:12]
+
+    active_plan = {
+        "scenarioLabel":       active_scenario_label,
+        "direction":           primary.get("direction"),
+        "watchZone":           primary.get("watch_zone"),
+        "watchLow":            primary.get("watch_low"),
+        "watchHigh":           primary.get("watch_high"),
+        "expectedReaction":    primary.get("expected_reaction") or primary.get("reason"),
+        "status":              plan_status,
+        "waitingForConfirmation": list(waiting_for) if isinstance(waiting_for, (list, tuple)) else None,
+        "primaryScenario":     primary or None,
+        "alternativeScenario": secondary or None,
+        "alternativeLabel": (
+            f"{(secondary.get('direction') or '?').upper()} {(secondary.get('scenario_type') or 'reversal')} {secondary.get('watch_zone') or ''}".strip()
+            if secondary else None
+        ),
+        "deepContextLevels":   deep_context_levels,
+        "lastUpdated":         (plan or {}).get("last_updated"),
+    }
+
+    five_layer = s.get("five_layer_status") or {}
+    strategy_watchlists = {
+        "gapSweep":          (five_layer.get("gap_liquidity_sweep_reclaim") or {}),
+        "breakRetest":       (five_layer.get("break_retest_live") or five_layer.get("standard_break_retest") or {}),
+        "engulfing":         (five_layer.get("engulfing_rejection") or five_layer.get("engulfing_live") or {}),
+        "liquiditySweep":    (five_layer.get("liquidity_sweep_displacement") or {}),
+        "activeContinuation": (five_layer.get("active_continuation") or {}),
+        "strategyScans":     s.get("strategy_scans") or {},
+        "liveEnabled":       s.get("live_enabled_strategies") or [],
+        "researchOnly":      s.get("research_only_strategies") or [],
+    }
+
+    risk = blocks.get("riskTradeManagement") or {}
+    active_trade_state = s.get("active_trade_state") or {}
+    has_active_trade = bool(active_trade_state)
+    current_price = s.get("current_price")
+    pip_size = 0.1  # XAUUSD pip = $0.10
+
+    def _pips(target):
+        try:
+            if target is None or current_price is None:
+                return None
+            return round((float(target) - float(current_price)) / pip_size, 1)
+        except Exception:
+            return None
+
+    active_trade = {
+        "hasActiveTrade":      has_active_trade,
+        "direction":           risk.get("direction"),
+        "entry":               risk.get("entry"),
+        "sl":                  risk.get("sl"),
+        "tp1":                 risk.get("tp1"),
+        "tp2":                 risk.get("tp2"),
+        "tp3":                 risk.get("tp3"),
+        "currentPrice":        current_price,
+        "pipsToTp1":           _pips(risk.get("tp1")),
+        "pipsToSl":            _pips(risk.get("sl")),
+        "tp1Hit":              bool(risk.get("tp1Hit")),
+        "tp2Hit":              bool(risk.get("tp2Hit")),
+        "tp3Hit":              bool(risk.get("tp3Hit")),
+        "protectedAfterTp1":   bool(risk.get("protectedAfterTp1")),
+        "beStatus":            risk.get("moveToBEStatus") or risk.get("beStatus"),
+        "tradeStatus":         risk.get("tradeStatus"),
+        "lastTradeManagementAlert": risk.get("lastTradeManagementAlert"),
+        "invalidationLevel":   risk.get("invalidationLevel"),
+        "activeTrades":        active_trade_state,
+        "activeTradesCount":   risk.get("activeTradesCount"),
+        "message":             None if has_active_trade else "No active trade. Spencer is watching for confirmation.",
+    }
+
+    diagnostics_block = blocks.get("developerDiagnostics") or {}
+    diagnostics = {
+        **diagnostics_block,
+        "botStatus":           s.get("status"),
+        "botRunning":          s.get("status") in ("online", "analyzing", "watching", "starting"),
+        "lastScanAt":          s.get("last_scan_at"),
+        "selectedScenario":    active_scenario_label,
+        "scenarioCompliance":  (s.get("scenario_compliance") or {}),
+        "activationPipeline": {
+            "levelsDetected":  s.get("levels_detected", 0),
+            "gapLevels":       s.get("gap_levels", 0),
+            "biasPassed":      s.get("bias_passed", 0),
+            "sweepConfirmed":  s.get("sweep_confirmed", 0),
+            "sessionPassed":   s.get("session_passed", 0),
+            "distancePassed":  s.get("distance_passed", 0),
+            "watchlistCandidates": s.get("watchlist_candidates", 0),
+        },
+        "telegramSendStatus":  s.get("last_telegram_status"),
+        "telegramLastError":   s.get("last_telegram_error"),
+        "mt5Connected":        bool(s.get("current_price") is not None and s.get("status") in ("online", "analyzing", "watching")),
+        "supabaseConnected":   bool(state.db_ready),
+        "memoryDedupe":        s.get("alert_dedupe") or {},
+        "latestError":         s.get("last_error") or s.get("error_message"),
+        "lastShutdownTime":    s.get("last_shutdown_time"),
+    }
+
+    session_liquidity = (s.get("market_plan") or {}).get("session_liquidity") or s.get("session_liquidity") or {}
+    level_intel = (s.get("five_layer_status") or {}).get("level_intelligence", s.get("level_intelligence", {}))
+
+    return {
+        "priceFeed":          _build_price_feed_block(s),
+        "activePlan":         active_plan,
+        "levelIntelligence":  level_intel,
+        "sessionLiquidity":   session_liquidity,
+        "strategyWatchlists": strategy_watchlists,
+        "aiPredictiveLayer":  blocks.get("aiPredictiveLayer") or {},
+        "activeTrade":        active_trade,
+        "diagnostics":        diagnostics,
+    }
+
+
 def _payload(message: str) -> dict:
     _sync_process_state()
     s = state.bot_state
@@ -520,7 +717,7 @@ def _payload(message: str) -> dict:
             "strategyScans":          s.get("strategy_scans", {}),
             "operatingMode":          s.get("operating_mode", "24_7"),
             "marketPlan":             s.get("market_plan"),
-            "priceFeed":              s.get("priceFeed", {}),
+            "priceFeed":              _build_price_feed_block(s),
             "fiveLayerStatus":        s.get("five_layer_status", {}),
             "activeTradeState":       s.get("active_trade_state", {}),
             "tradeTracking":          s.get("trade_tracking", {}),
@@ -539,6 +736,10 @@ def _payload(message: str) -> dict:
             # frontend cards). Old fields above remain for back-compat and
             # are surfaced by Developer Diagnostics.
             **_structured_blocks(s),
+            # New top-level dashboardState block — single source of truth for
+            # the deep Spencer dashboard (price feed + candles + active plan +
+            # internal levels + AI + active trade + diagnostics). Null-safe.
+            "dashboardState":         _build_dashboard_state(s, _structured_blocks(s)),
         },
     }
 

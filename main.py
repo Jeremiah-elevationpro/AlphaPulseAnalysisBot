@@ -774,7 +774,7 @@ class AlphaPulse:
                             )
 
         # 10. Write heartbeat so the API can surface richer status
-        self._write_heartbeat(in_silent_phase, signals, ctx, current_price, tick)
+        self._write_heartbeat(in_silent_phase, signals, ctx, current_price, tick, data)
         logger.info(
             "SCAN COMPLETE: symbol=XAUUSD | scan=%d | signals=%d | watchlist_sent=%d",
             self._scan_count, len(signals or []), watchlist_sent,
@@ -2298,7 +2298,40 @@ class AlphaPulse:
             }
         return {"strategy_type": "analyst_layer"}
 
-    def _write_heartbeat(self, in_silent_phase: bool, signals: list, ctx, current_price: Optional[float], tick: Optional[dict]) -> None:
+    @staticmethod
+    def _candles_from_df(df, limit: int = 200) -> list:
+        """Convert an OHLCV DataFrame (oldest -> newest) to JSON-safe candle dicts.
+
+        Returns the most recent ``limit`` candles. Returns [] for any
+        missing/empty/exception case so the API stays null-safe.
+        """
+        try:
+            if df is None or len(df) == 0:
+                return []
+            tail = df.tail(limit)
+            out: list = []
+            for _, row in tail.iterrows():
+                try:
+                    t_val = row.get("time") if hasattr(row, "get") else row["time"]
+                    if hasattr(t_val, "isoformat"):
+                        t_iso = t_val.isoformat()
+                    else:
+                        t_iso = str(t_val)
+                    out.append({
+                        "time":   t_iso,
+                        "open":   float(row["open"]),
+                        "high":   float(row["high"]),
+                        "low":    float(row["low"]),
+                        "close":  float(row["close"]),
+                        "volume": float(row.get("tick_volume", 0)) if hasattr(row, "get") else float(row["tick_volume"]) if "tick_volume" in row else 0.0,
+                    })
+                except Exception:
+                    continue
+            return out
+        except Exception:
+            return []
+
+    def _write_heartbeat(self, in_silent_phase: bool, signals: list, ctx, current_price: Optional[float], tick: Optional[dict], data: Optional[Dict[str, "pd.DataFrame"]] = None) -> None:
         """Write bot_heartbeat.json so the API can surface analyzing/watching status."""
         try:
             runtime_control = self._read_runtime_control()
@@ -2364,18 +2397,56 @@ class AlphaPulse:
             active_trade_feed = next(iter(self.trade_management_engine._active_setups.values()), None)
             active_trade_dict = active_trade_feed.to_dict() if active_trade_feed else {}
             primary_level = primary_feed.get("watch_low") or primary_feed.get("watch_high")
+
+            # Candle pack — multi-timeframe, null-safe
+            data = data or {}
+            candles_m5  = self._candles_from_df(data.get("M5"), limit=200)
+            candles_m15 = self._candles_from_df(data.get("M15"), limit=200)
+            candles_h1  = self._candles_from_df(data.get("H1"), limit=200)
+            default_candles = candles_m15 or candles_m5 or candles_h1
+            latest_candle = default_candles[-1] if default_candles else None
+            feed_status = "live" if default_candles else "waiting_for_data"
+
+            bid_val    = (tick.get("bid") if tick else None) or current_price
+            ask_val    = (tick.get("ask") if tick else None) or current_price
+            spread_val = tick.get("spread") if tick else None
+            spread_pips_val = tick.get("spread_pips") if tick else None
+
             price_feed = {
-                "currentPrice": current_price,
-                "latestCandles": [],
-                "timeframe": "M15",
-                "lastUpdated": datetime.now(timezone.utc).isoformat(),
-                "activeLevel": primary_level,
-                "primaryZone": primary_feed.get("watch_zone"),
+                "symbol":         "XAUUSD",
+                "currentPrice":   current_price,
+                "bid":            bid_val,
+                "ask":            ask_val,
+                "spread":         spread_val,
+                "spreadPips":     spread_pips_val,
+                "timeframe":      "M15",
+                "status":         feed_status,
+                "lastUpdated":    datetime.now(timezone.utc).isoformat(),
+                "session":        getattr(ctx, "session_name", None) if ctx else None,
+                "latestCandle":   latest_candle,
+                # Default chart candles (M15)
+                "candles":        candles_m15,
+                # Multi-timeframe candle bundle for the dashboard timeframe selector
+                "candlesByTimeframe": {
+                    "M5":  candles_m5,
+                    "M15": candles_m15,
+                    "H1":  candles_h1,
+                },
+                # Backwards-compat — older frontends still read latestCandles
+                "latestCandles":  candles_m15,
+                "activeLevel":    primary_level,
+                "primaryZone":    primary_feed.get("watch_zone"),
                 "alternativeZone": secondary_feed.get("watch_zone"),
+                "primaryZoneLow":  primary_feed.get("watch_low"),
+                "primaryZoneHigh": primary_feed.get("watch_high"),
+                "alternativeZoneLow":  secondary_feed.get("watch_low"),
+                "alternativeZoneHigh": secondary_feed.get("watch_high"),
                 "sl": active_trade_dict.get("sl") or active_trade_dict.get("virtual_sl") or primary_feed.get("invalidation_level"),
                 "tp1": active_trade_dict.get("tp1") or ((primary_feed.get("market_plan_targets") or [None])[0] if primary_feed.get("market_plan_targets") else None),
                 "tp2": active_trade_dict.get("tp2") or ((primary_feed.get("market_plan_targets") or [None, None])[1] if len(primary_feed.get("market_plan_targets") or []) > 1 else None),
                 "tp3": active_trade_dict.get("tp3") or ((primary_feed.get("market_plan_targets") or [None, None, None])[2] if len(primary_feed.get("market_plan_targets") or []) > 2 else None),
+                "entry": active_trade_dict.get("entry"),
+                "direction": active_trade_dict.get("direction"),
             }
             data = {
                 "status":               status,

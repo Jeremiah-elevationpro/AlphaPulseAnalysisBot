@@ -20,10 +20,13 @@ import { Link } from "react-router-dom"
 import { BotControlPanel } from "@/components/control/BotControlPanel"
 import { ReplayRunner } from "@/components/control/ReplayRunner"
 import { SpencerStatus } from "@/components/control/SpencerStatus"
+import { CandlestickChart, type ChartLevel, type ChartZone } from "@/components/dashboard/CandlestickChart"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { Separator } from "@/components/ui/separator"
+import { Switch } from "@/components/ui/switch"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   useActiveTrades,
   useAlerts,
@@ -38,16 +41,24 @@ import {
   useTelegramHealth,
 } from "@/hooks/use-data"
 import type {
+  ActivePlanState,
+  ActiveTradeState,
   AIPredictiveLayerState,
+  Candle,
   ConfirmationEngineState,
+  DashboardState,
   DecisionEngineState,
   DeveloperDiagnosticsState,
+  DiagnosticsState,
   LearningScoringState,
   LevelIntelligenceState,
   MarketAnalystState,
+  PriceFeedState,
+  PriceFeedTimeframe,
   RiskTradeManagementState,
   SessionLiquidityState,
   SpencerStatus as SpencerStatusBlock,
+  StrategyWatchlistState,
   SystemHealthState,
   TelegramHealthResponse,
 } from "@/lib/api"
@@ -68,17 +79,105 @@ export default function Dashboard() {
   const market = useMarketContext(botStatus.data?.symbol ?? "XAUUSD", isBotOnline)
 
   const data = botStatus.data?.data ?? null
+  const dashboard: DashboardState = data?.dashboardState ?? {}
   const spencer: SpencerStatusBlock = data?.spencerStatus ?? {}
   const marketAnalyst: MarketAnalystState = data?.marketAnalyst ?? {}
   const confirmationEngine: ConfirmationEngineState = data?.confirmationEngine ?? {}
   const learningScoring: LearningScoringState = data?.learningScoring ?? {}
-  const aiLayer: AIPredictiveLayerState = (data?.aiPredictiveLayer ?? {}) as AIPredictiveLayerState
+  const aiLayer: AIPredictiveLayerState =
+    (dashboard.aiPredictiveLayer ?? data?.aiPredictiveLayer ?? {}) as AIPredictiveLayerState
   const decisionEngine: DecisionEngineState = data?.decisionEngine ?? {}
-  const levelIntel: LevelIntelligenceState = data?.levelIntelligence ?? {}
+  const levelIntel: LevelIntelligenceState =
+    (dashboard.levelIntelligence ?? data?.levelIntelligence ?? {}) as LevelIntelligenceState
   const riskTradeMgmt: RiskTradeManagementState = data?.riskTradeManagement ?? {}
   const systemHealth: SystemHealthState = data?.systemHealth ?? {}
   const developerDiag: DeveloperDiagnosticsState = data?.developerDiagnostics ?? {}
-  const priceFeed = data?.priceFeed ?? {}
+  const priceFeed: PriceFeedState = (dashboard.priceFeed ?? data?.priceFeed ?? {}) as PriceFeedState
+  const activePlan: ActivePlanState = dashboard.activePlan ?? {}
+  const activeTrade: ActiveTradeState = dashboard.activeTrade ?? {}
+  const sessionLiquidity: SessionLiquidityState =
+    (dashboard.sessionLiquidity ?? data?.sessionLiquidity ?? {}) as SessionLiquidityState
+  const strategyWatchlists: StrategyWatchlistState = dashboard.strategyWatchlists ?? {}
+  const diagnostics: DiagnosticsState = (dashboard.diagnostics ?? developerDiag) as DiagnosticsState
+
+  // Chart toggles + active timeframe
+  const [chartTimeframe, setChartTimeframe] = useState<PriceFeedTimeframe>("M15")
+  const [showPrimaryZone, setShowPrimaryZone] = useState(true)
+  const [showAlternativeZone, setShowAlternativeZone] = useState(false)
+  const hasActiveTradeOrSetup =
+    Boolean(activeTrade.hasActiveTrade) || priceFeed.tp1 != null || priceFeed.sl != null
+  const [showSlTp, setShowSlTp] = useState(hasActiveTradeOrSetup)
+  const [showSessionLiquidity, setShowSessionLiquidity] = useState(true)
+  const [showLevelIntelligence, setShowLevelIntelligence] = useState(true)
+  const [showConsumedLevels, setShowConsumedLevels] = useState(false)
+
+  const tfCandles: Candle[] = useMemo(() => {
+    const bundle = priceFeed.candlesByTimeframe ?? {}
+    const fromBundle = (bundle as Record<string, Candle[] | undefined>)[chartTimeframe]
+    return (fromBundle ?? priceFeed.candles ?? priceFeed.latestCandles ?? []) as Candle[]
+  }, [priceFeed, chartTimeframe])
+
+  const chartLevels: ChartLevel[] = useMemo(() => {
+    const out: ChartLevel[] = []
+    if (showSlTp) {
+      if (priceFeed.entry != null) out.push({ price: Number(priceFeed.entry), label: "Entry", color: "#fbbf24" })
+      if (priceFeed.sl != null) out.push({ price: Number(priceFeed.sl), label: "SL", color: "#ef4444" })
+      if (priceFeed.tp1 != null) out.push({ price: Number(priceFeed.tp1), label: "TP1", color: "#22c55e" })
+      if (priceFeed.tp2 != null) out.push({ price: Number(priceFeed.tp2), label: "TP2", color: "#22c55e", dashed: true })
+      if (priceFeed.tp3 != null) out.push({ price: Number(priceFeed.tp3), label: "TP3", color: "#22c55e", dashed: true })
+    }
+    if (showLevelIntelligence) {
+      if (levelIntel.strongest_support?.level != null) {
+        out.push({ price: Number(levelIntel.strongest_support.level), label: "S", color: "#60a5fa" })
+      }
+      if (levelIntel.strongest_resistance?.level != null) {
+        out.push({ price: Number(levelIntel.strongest_resistance.level), label: "R", color: "#f472b6" })
+      }
+      if (showConsumedLevels) {
+        ;(levelIntel.consumed_levels ?? []).slice(0, 4).forEach((lvl) => {
+          if (lvl?.level != null) {
+            out.push({ price: Number(lvl.level), label: "x", color: "#94a3b8", dashed: true })
+          }
+        })
+      }
+    }
+    if (showSessionLiquidity) {
+      const sessions = sessionLiquidity.sessions ?? {}
+      const tag = (label: string, value?: number) => {
+        if (value != null) out.push({ price: value, label, color: "#a855f7", dashed: true })
+      }
+      tag("Asia H", sessions.asia?.high)
+      tag("Asia L", sessions.asia?.low)
+      tag("Lon H", sessions.london?.high)
+      tag("Lon L", sessions.london?.low)
+      tag("NY H", sessions.new_york?.high)
+      tag("NY L", sessions.new_york?.low)
+      tag("PDH", sessionLiquidity.previous_day_high)
+      tag("PDL", sessionLiquidity.previous_day_low)
+    }
+    return out
+  }, [showSlTp, showLevelIntelligence, showConsumedLevels, showSessionLiquidity, priceFeed, levelIntel, sessionLiquidity])
+
+  const chartZones: ChartZone[] = useMemo(() => {
+    const out: ChartZone[] = []
+    if (showPrimaryZone && priceFeed.primaryZoneLow != null && priceFeed.primaryZoneHigh != null) {
+      out.push({
+        low: Number(priceFeed.primaryZoneLow),
+        high: Number(priceFeed.primaryZoneHigh),
+        label: `Primary ${priceFeed.primaryZone ?? ""}`.trim(),
+        color: "#fbbf24",
+      })
+    }
+    if (showAlternativeZone && priceFeed.alternativeZoneLow != null && priceFeed.alternativeZoneHigh != null) {
+      out.push({
+        low: Number(priceFeed.alternativeZoneLow),
+        high: Number(priceFeed.alternativeZoneHigh),
+        label: `Alt ${priceFeed.alternativeZone ?? ""}`.trim(),
+        color: "#a855f7",
+      })
+    }
+    return out
+  }, [showPrimaryZone, showAlternativeZone, priceFeed])
 
   const learningMap = useMemo(
     () => Object.fromEntries((learningProfiles.data?.profiles ?? []).map((profile) => [profile.strategy_type, profile])),
@@ -138,34 +237,48 @@ export default function Dashboard() {
 
       <SpencerStatus status={botStatus.data} />
 
-      <Card>
-        <CardHeader className="pb-3">
-          <div className="flex items-center gap-3">
-            <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-gold-500/20 bg-gold-500/8 text-gold-300">
-              <BarChart2 className="h-4 w-4" />
-            </div>
-            <CardTitle>Spencer Live Price Action</CardTitle>
-            <Badge variant="outline" className="ml-auto text-[10px]">
-              {priceFeed.timeframe ?? "M15"}
-            </Badge>
-          </div>
-        </CardHeader>
-        <CardContent className="grid grid-cols-1 gap-3 md:grid-cols-4">
-          <InfoRow label="Current Price" value={priceFeed.currentPrice != null ? Number(priceFeed.currentPrice).toFixed(2) : "Waiting"} mono />
-          <InfoRow label="Active Level" value={priceFeed.activeLevel != null ? Number(priceFeed.activeLevel).toFixed(2) : "—"} mono />
-          <InfoRow label="Primary Zone" value={priceFeed.primaryZone ?? "—"} mono />
-          <InfoRow label="Alternative Zone" value={priceFeed.alternativeZone ?? "—"} mono />
-          <InfoRow label="SL" value={priceFeed.sl != null ? Number(priceFeed.sl).toFixed(2) : "—"} mono />
-          <InfoRow label="TP1 / TP2 / TP3" value={[priceFeed.tp1, priceFeed.tp2, priceFeed.tp3].filter((v) => v != null).map((v) => Number(v).toFixed(2)).join(" / ") || "—"} mono />
-          <InfoRow label="Candles" value={(priceFeed.latestCandles?.length ?? 0) > 0 ? `${priceFeed.latestCandles?.length} loaded` : "chart integration pending"} />
-          <InfoRow label="Updated" value={formatRelative(priceFeed.lastUpdated)} />
-        </CardContent>
-      </Card>
+      <div className="grid gap-4 xl:grid-cols-[1.4fr_0.6fr]">
+        {/* Spencer Live Price Action — chart + OHLC + toggles */}
+        <SpencerLivePriceActionCard
+          priceFeed={priceFeed}
+          candles={tfCandles}
+          chartLevels={chartLevels}
+          chartZones={chartZones}
+          chartTimeframe={chartTimeframe}
+          setChartTimeframe={setChartTimeframe}
+          showPrimaryZone={showPrimaryZone}
+          setShowPrimaryZone={setShowPrimaryZone}
+          showAlternativeZone={showAlternativeZone}
+          setShowAlternativeZone={setShowAlternativeZone}
+          showSlTp={showSlTp}
+          setShowSlTp={setShowSlTp}
+          showSessionLiquidity={showSessionLiquidity}
+          setShowSessionLiquidity={setShowSessionLiquidity}
+          showLevelIntelligence={showLevelIntelligence}
+          setShowLevelIntelligence={setShowLevelIntelligence}
+          showConsumedLevels={showConsumedLevels}
+          setShowConsumedLevels={setShowConsumedLevels}
+          systemHealth={systemHealth}
+        />
+        <div className="grid gap-4">
+          {/* Active Spencer Plan + Active Trade Management stack on the right */}
+          <ActiveSpencerPlanCard plan={activePlan} marketAnalyst={marketAnalyst} />
+          <ActiveTradeManagementCard trade={activeTrade} />
+        </div>
+      </div>
 
       <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
         <BotControlPanel />
         <ReplayRunner />
       </div>
+
+      {/* Internal Levels / Spencer Brain — tabs */}
+      <InternalLevelsCard
+        levelIntel={levelIntel}
+        sessionLiquidity={sessionLiquidity}
+        strategyWatchlists={strategyWatchlists}
+        aiLayer={aiLayer}
+      />
 
       {/* B. Market Analyst Card */}
       <Card>
@@ -501,7 +614,459 @@ export default function Dashboard() {
       </div>
 
       {/* I. Developer Diagnostics (collapsed by default) */}
-      <DeveloperDiagnosticsAccordion diagnostics={developerDiag} />
+      <DeveloperDiagnosticsAccordion diagnostics={diagnostics} />
+    </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Spencer Live Price Action — chart + OHLC + toggles
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface SpencerLivePriceActionCardProps {
+  priceFeed: PriceFeedState
+  candles: Candle[]
+  chartLevels: ChartLevel[]
+  chartZones: ChartZone[]
+  chartTimeframe: PriceFeedTimeframe
+  setChartTimeframe: (tf: PriceFeedTimeframe) => void
+  showPrimaryZone: boolean
+  setShowPrimaryZone: (v: boolean) => void
+  showAlternativeZone: boolean
+  setShowAlternativeZone: (v: boolean) => void
+  showSlTp: boolean
+  setShowSlTp: (v: boolean) => void
+  showSessionLiquidity: boolean
+  setShowSessionLiquidity: (v: boolean) => void
+  showLevelIntelligence: boolean
+  setShowLevelIntelligence: (v: boolean) => void
+  showConsumedLevels: boolean
+  setShowConsumedLevels: (v: boolean) => void
+  systemHealth: SystemHealthState
+}
+
+function SpencerLivePriceActionCard({
+  priceFeed,
+  candles,
+  chartLevels,
+  chartZones,
+  chartTimeframe,
+  setChartTimeframe,
+  showPrimaryZone,
+  setShowPrimaryZone,
+  showAlternativeZone,
+  setShowAlternativeZone,
+  showSlTp,
+  setShowSlTp,
+  showSessionLiquidity,
+  setShowSessionLiquidity,
+  showLevelIntelligence,
+  setShowLevelIntelligence,
+  showConsumedLevels,
+  setShowConsumedLevels,
+  systemHealth,
+}: SpencerLivePriceActionCardProps) {
+  const status = priceFeed.status ?? (candles.length > 0 ? "live" : "waiting_for_data")
+  const mt5Down = systemHealth.dataFeedStatus && systemHealth.dataFeedStatus !== "healthy"
+  const latest = priceFeed.latestCandle ?? (candles.length > 0 ? candles[candles.length - 1] : undefined)
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-gold-500/20 bg-gold-500/8 text-gold-300">
+            <BarChart2 className="h-4 w-4" />
+          </div>
+          <CardTitle>Spencer Live Price Action</CardTitle>
+          <Badge variant="outline" className="text-[10px]">
+            {(priceFeed.symbol ?? "XAUUSD").toUpperCase()}
+          </Badge>
+          <Badge variant={status === "live" ? "buy" : "outline"} className="text-[10px]">
+            {status === "live" ? "Live" : "Waiting for data"}
+          </Badge>
+          <div className="ml-auto flex items-center gap-1 rounded-md border border-ap-border bg-ap-surface/40 p-0.5">
+            {(["M5", "M15", "H1"] as PriceFeedTimeframe[]).map((tf) => (
+              <button
+                key={tf}
+                type="button"
+                onClick={() => setChartTimeframe(tf)}
+                className={cn(
+                  "rounded px-2 py-1 text-[10px] font-semibold transition-colors",
+                  chartTimeframe === tf
+                    ? "bg-gold-500/20 text-gold-200"
+                    : "text-muted-foreground hover:text-foreground"
+                )}
+              >
+                {tf}
+              </button>
+            ))}
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {mt5Down ? (
+          <div className="rounded-md border border-warn/30 bg-warn/10 px-3 py-2 text-[11px] text-warn">
+            Waiting for live price data from MT5.
+          </div>
+        ) : null}
+
+        <div className="grid grid-cols-2 gap-2 md:grid-cols-4 xl:grid-cols-6">
+          <MetaBox
+            label="Current Price"
+            value={priceFeed.currentPrice != null ? Number(priceFeed.currentPrice).toFixed(2) : "—"}
+            tone="gold"
+          />
+          <MetaBox label="Bid" value={priceFeed.bid != null ? Number(priceFeed.bid).toFixed(2) : "—"} tone="gold" />
+          <MetaBox label="Ask" value={priceFeed.ask != null ? Number(priceFeed.ask).toFixed(2) : "—"} tone="gold" />
+          <MetaBox
+            label="Spread"
+            value={
+              priceFeed.spreadPips != null
+                ? `${Number(priceFeed.spreadPips).toFixed(1)} pips`
+                : priceFeed.spread != null
+                ? Number(priceFeed.spread).toFixed(2)
+                : "—"
+            }
+            tone="gold"
+          />
+          <MetaBox label="Session" value={formatSession(priceFeed.session)} tone="gold" />
+          <MetaBox label="Updated" value={formatRelative(priceFeed.lastUpdated)} tone="gold" />
+        </div>
+
+        {/* Chart */}
+        <CandlestickChart
+          candles={candles}
+          height={320}
+          levels={chartLevels}
+          zones={chartZones}
+          currentPrice={priceFeed.currentPrice ?? undefined}
+        />
+
+        {/* Latest candle OHLC */}
+        <div className="grid grid-cols-2 gap-2 md:grid-cols-5">
+          <MetaBox label="Open" value={latest?.open != null ? Number(latest.open).toFixed(2) : "—"} tone="gold" />
+          <MetaBox label="High" value={latest?.high != null ? Number(latest.high).toFixed(2) : "—"} tone="buy" />
+          <MetaBox label="Low" value={latest?.low != null ? Number(latest.low).toFixed(2) : "—"} tone="sell" />
+          <MetaBox label="Close" value={latest?.close != null ? Number(latest.close).toFixed(2) : "—"} tone="gold" />
+          <MetaBox label="Vol" value={latest?.volume != null ? Number(latest.volume).toFixed(0) : "—"} tone="gold" />
+        </div>
+
+        {/* Toggles */}
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-ap-border bg-ap-surface/35 px-3 py-2">
+          <ChartToggle label="Primary Zone" checked={showPrimaryZone} onChange={setShowPrimaryZone} />
+          <ChartToggle label="Alt Zone" checked={showAlternativeZone} onChange={setShowAlternativeZone} />
+          <ChartToggle label="SL/TP" checked={showSlTp} onChange={setShowSlTp} />
+          <ChartToggle label="Session Liquidity" checked={showSessionLiquidity} onChange={setShowSessionLiquidity} />
+          <ChartToggle label="Level Intelligence" checked={showLevelIntelligence} onChange={setShowLevelIntelligence} />
+          <ChartToggle label="Consumed Levels" checked={showConsumedLevels} onChange={setShowConsumedLevels} />
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function ChartToggle({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string
+  checked: boolean
+  onChange: (v: boolean) => void
+}) {
+  return (
+    <label className="flex cursor-pointer items-center gap-2 text-[11px] text-muted-foreground">
+      <Switch checked={checked} onCheckedChange={onChange} />
+      <span>{label}</span>
+    </label>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Active Spencer Plan Panel
+// ─────────────────────────────────────────────────────────────────────────────
+
+function ActiveSpencerPlanCard({
+  plan,
+  marketAnalyst,
+}: {
+  plan: ActivePlanState
+  marketAnalyst: MarketAnalystState
+}) {
+  const direction = plan.direction ?? marketAnalyst.primaryScenario?.direction
+  const watchZone = plan.watchZone ?? marketAnalyst.primaryScenario?.watch_zone
+  const status = plan.status ?? marketAnalyst.scenarioStatus
+  const waitingFor = plan.waitingForConfirmation ?? marketAnalyst.primaryScenario?.trigger_conditions
+  const expectedReaction =
+    plan.expectedReaction ?? marketAnalyst.primaryScenario?.reason ?? "—"
+  const altLabel = plan.alternativeLabel ?? (
+    marketAnalyst.secondaryScenario
+      ? `${(marketAnalyst.secondaryScenario.direction ?? "?").toUpperCase()} ${marketAnalyst.secondaryScenario.watch_zone ?? ""}`.trim()
+      : null
+  )
+
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center gap-3">
+          <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-gold-500/20 bg-gold-500/8 text-gold-300">
+            <Target className="h-4 w-4" />
+          </div>
+          <CardTitle>Active Spencer Plan</CardTitle>
+          <Badge
+            variant={direction === "BUY" ? "buy" : direction === "SELL" ? "sell" : "outline"}
+            className="ml-auto text-[10px]"
+          >
+            {direction ?? "Watching"}
+          </Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="rounded-lg border border-ap-border bg-ap-surface/35 p-3">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            Active Intraday Scenario
+          </div>
+          <div className="mt-1 text-sm font-semibold text-foreground">
+            {plan.scenarioLabel ?? (watchZone ? `${direction ?? "Watch"} ${watchZone}` : "Waiting for primary scenario")}
+          </div>
+        </div>
+        <InfoRow label="Best Level / Zone" value={watchZone ?? "—"} mono />
+        <InfoRow label="Expected Reaction" value={expectedReaction} />
+        <InfoRow label="Status" value={status ?? "—"} />
+        <InfoRow
+          label="Waiting For Confirmation"
+          value={(waitingFor ?? []).join(" / ") || "—"}
+        />
+        <Separator />
+        <div className="rounded-lg border border-ap-border bg-ap-surface/35 p-3">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Alternative</div>
+          <div className="mt-1 text-xs text-foreground">
+            {altLabel ?? "If level fails, watch breakdown/retest for opposite direction."}
+          </div>
+        </div>
+        <InfoRow
+          label="Deep Context"
+          value={
+            (plan.deepContextLevels ?? [])
+              .slice(0, 8)
+              .map((v) => Number(v).toFixed(2))
+              .join(" / ") || "—"
+          }
+          mono
+        />
+        <div className="text-right text-[10px] text-muted-foreground">
+          Last updated: {formatRelative(plan.lastUpdated)}
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Active Trade Management Panel
+// ─────────────────────────────────────────────────────────────────────────────
+
+function ActiveTradeManagementCard({ trade }: { trade: ActiveTradeState }) {
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center gap-3">
+          <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-buy/20 bg-buy/10 text-buy">
+            <ShieldCheck className="h-4 w-4" />
+          </div>
+          <CardTitle>Active Trade Management</CardTitle>
+          <Badge
+            variant={trade.hasActiveTrade ? "buy" : "outline"}
+            className="ml-auto text-[10px]"
+          >
+            {trade.hasActiveTrade ? "Active" : "Idle"}
+          </Badge>
+        </div>
+      </CardHeader>
+      <CardContent>
+        {!trade.hasActiveTrade ? (
+          <div className="rounded-lg border border-ap-border bg-ap-surface/35 px-3 py-4 text-xs text-muted-foreground">
+            {trade.message ?? "No active trade. Spencer is watching for confirmation."}
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <div className="grid grid-cols-2 gap-2 md:grid-cols-3">
+              <MetaBox label="Direction" value={trade.direction ?? "—"} tone={trade.direction === "SELL" ? "sell" : "buy"} />
+              <MetaBox label="Entry" value={formatMaybe(trade.entry)} tone="gold" />
+              <MetaBox label="Current" value={formatMaybe(trade.currentPrice)} tone="gold" />
+              <MetaBox label="SL" value={formatMaybe(trade.sl)} tone="sell" />
+              <MetaBox label="TP1" value={formatMaybe(trade.tp1)} tone="buy" />
+              <MetaBox label="TP2" value={formatMaybe(trade.tp2)} tone="buy" />
+              <MetaBox label="TP3" value={formatMaybe(trade.tp3)} tone="buy" />
+              <MetaBox label="Pips → TP1" value={trade.pipsToTp1 != null ? formatSignedNumber(trade.pipsToTp1) : "—"} tone="gold" />
+              <MetaBox label="Pips → SL" value={trade.pipsToSl != null ? formatSignedNumber(trade.pipsToSl) : "—"} tone="gold" />
+              <MetaBox label="TP1 Hit" value={trade.tp1Hit ? "yes" : "no"} tone={trade.tp1Hit ? "buy" : "gold"} />
+              <MetaBox label="TP2 Hit" value={trade.tp2Hit ? "yes" : "no"} tone={trade.tp2Hit ? "buy" : "gold"} />
+              <MetaBox label="TP3 Hit" value={trade.tp3Hit ? "yes" : "no"} tone={trade.tp3Hit ? "buy" : "gold"} />
+              <MetaBox
+                label="Protected after TP1"
+                value={trade.protectedAfterTp1 ? "yes" : "no"}
+                tone={trade.protectedAfterTp1 ? "buy" : "gold"}
+              />
+              <MetaBox label="BE Status" value={trade.beStatus ?? "—"} tone="gold" />
+              <MetaBox label="Trade Status" value={trade.tradeStatus ?? "—"} tone="gold" />
+            </div>
+            <InfoRow label="Last TM Alert" value={trade.lastTradeManagementAlert ?? "—"} />
+            <InfoRow label="Invalidation" value={trade.invalidationLevel != null ? String(trade.invalidationLevel) : "—"} mono />
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal Levels / Spencer Brain — tabs
+// ─────────────────────────────────────────────────────────────────────────────
+
+function InternalLevelsCard({
+  levelIntel,
+  sessionLiquidity,
+  strategyWatchlists,
+  aiLayer,
+}: {
+  levelIntel: LevelIntelligenceState
+  sessionLiquidity: SessionLiquidityState
+  strategyWatchlists: StrategyWatchlistState
+  aiLayer: AIPredictiveLayerState
+}) {
+  const [showConsumed, setShowConsumed] = useState(false)
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex items-center gap-3">
+          <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-purple-400/25 bg-purple-500/12 text-purple-200">
+            <BrainCircuit className="h-4 w-4" />
+          </div>
+          <CardTitle>Internal Levels / Spencer Brain</CardTitle>
+        </div>
+      </CardHeader>
+      <CardContent>
+        <Tabs defaultValue="levels">
+          <TabsList>
+            <TabsTrigger value="levels">Level Intelligence</TabsTrigger>
+            <TabsTrigger value="liquidity">Session Liquidity</TabsTrigger>
+            <TabsTrigger value="strategies">Strategy Watchlists</TabsTrigger>
+            <TabsTrigger value="ai">AI Predictive Layer</TabsTrigger>
+          </TabsList>
+
+          <TabsContent value="levels" className="space-y-3">
+            <div className="grid gap-3 lg:grid-cols-2">
+              <div className="space-y-2 rounded-lg border border-ap-border bg-ap-surface/35 p-3">
+                <InfoRow label="Strongest Support" value={formatLevelIntel(levelIntel.strongest_support)} />
+                <InfoRow label="Strongest Resistance" value={formatLevelIntel(levelIntel.strongest_resistance)} />
+                <InfoRow
+                  label="Upside Targets"
+                  value={
+                    (levelIntel.next_valid_targets ?? [])
+                      .slice(0, 5)
+                      .map(formatLevelIntel)
+                      .join(" | ") || "—"
+                  }
+                />
+                <InfoRow
+                  label="Downside Risks"
+                  value={
+                    (levelIntel.consumed_levels ?? [])
+                      .slice(0, 5)
+                      .map(formatLevelIntel)
+                      .join(" | ") || "none"
+                  }
+                />
+                <InfoRow label="Manual Levels Watched" value={String(levelIntel.manual_levels_watched ?? 0)} />
+              </div>
+              <div className="space-y-2 rounded-lg border border-ap-border bg-ap-surface/35 p-3">
+                <div className="flex items-center justify-between">
+                  <div className="text-xs font-semibold text-gold-300">Level Score Detail</div>
+                  <ChartToggle label="Show consumed" checked={showConsumed} onChange={setShowConsumed} />
+                </div>
+                <div className="space-y-1">
+                  {(levelIntel.level_scores ?? [])
+                    .filter((lvl) => showConsumed || lvl?.state !== "consumed")
+                    .slice(0, 8)
+                    .map((lvl, i) => (
+                      <div
+                        key={`${lvl?.level}-${i}`}
+                        className="flex items-center justify-between rounded-md border border-ap-border/60 bg-ap-bg/30 px-2 py-1 text-[11px]"
+                      >
+                        <span className="num text-foreground">{lvl?.level != null ? Number(lvl.level).toFixed(2) : "—"}</span>
+                        <span className="text-muted-foreground">{lvl?.quality_label ?? lvl?.state ?? "—"}</span>
+                        <span className="num text-gold-300">{lvl?.score != null ? Number(lvl.score).toFixed(0) : "—"}</span>
+                      </div>
+                    ))}
+                  {(levelIntel.level_scores ?? []).length === 0 ? (
+                    <div className="text-[11px] text-muted-foreground">No level scores yet.</div>
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          </TabsContent>
+
+          <TabsContent value="liquidity">
+            <SessionLiquidityCard liquidity={sessionLiquidity} />
+          </TabsContent>
+
+          <TabsContent value="strategies">
+            <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+              <StrategyWatchBox label="Gap + Sweep Reclaim" data={strategyWatchlists.gapSweep} />
+              <StrategyWatchBox label="Break + Retest" data={strategyWatchlists.breakRetest} />
+              <StrategyWatchBox label="Engulfing Rejection" data={strategyWatchlists.engulfing} />
+              <StrategyWatchBox label="Liquidity Sweep / Displacement" data={strategyWatchlists.liquiditySweep} />
+              <StrategyWatchBox label="Active Continuation" data={strategyWatchlists.activeContinuation} />
+              <div className="rounded-lg border border-ap-border bg-ap-surface/35 p-3">
+                <div className="text-xs font-semibold text-gold-300">Strategies</div>
+                <InfoRow
+                  label="Live Enabled"
+                  value={(strategyWatchlists.liveEnabled ?? []).join(", ") || "—"}
+                />
+                <InfoRow
+                  label="Research Only"
+                  value={(strategyWatchlists.researchOnly ?? []).join(", ") || "—"}
+                />
+              </div>
+            </div>
+          </TabsContent>
+
+          <TabsContent value="ai">
+            <div className="grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-6">
+              <MetaBox label="AI Label" value={aiLayer.aiLabel ?? "AI-ALLOWED SETUP"} tone="gold" />
+              <MetaBox label="TP1 Probability" value={formatPercent(aiLayer.tp1Probability)} tone="buy" />
+              <MetaBox label="SL Probability" value={formatPercent(aiLayer.slProbability)} tone="sell" />
+              <MetaBox label="Expected Pips" value={formatSignedNumber(aiLayer.expectedPips)} tone="gold" />
+              <MetaBox label="Model Version" value={aiLayer.modelVersion ?? "—"} tone="gold" />
+              <MetaBox
+                label="Schema Health"
+                value={aiLayer.schemaMatch === false ? "mismatch" : "ok"}
+                tone={aiLayer.schemaMatch === false ? "sell" : "buy"}
+              />
+            </div>
+          </TabsContent>
+        </Tabs>
+      </CardContent>
+    </Card>
+  )
+}
+
+function StrategyWatchBox({ label, data }: { label: string; data?: Record<string, unknown> | null }) {
+  const obj = (data ?? {}) as Record<string, unknown>
+  const candidates = (obj.candidates_found as number | undefined) ?? (obj.watchlist_candidates as number | undefined) ?? 0
+  const status = (obj.status as string | undefined) ?? (obj.last_result as string | undefined) ?? "watching"
+  const reason = (obj.last_reject_reason as string | undefined) ?? (obj.reason as string | undefined) ?? "—"
+  return (
+    <div className="rounded-lg border border-ap-border bg-ap-surface/35 p-3">
+      <div className="flex items-center justify-between">
+        <div className="text-xs font-semibold text-gold-300">{label}</div>
+        <Badge variant="outline" className="text-[10px]">
+          {String(status)}
+        </Badge>
+      </div>
+      <InfoRow label="Candidates" value={String(candidates)} mono />
+      <InfoRow label="Reason" value={String(reason)} />
     </div>
   )
 }
@@ -695,8 +1260,9 @@ function SystemHealthCard({
   )
 }
 
-function DeveloperDiagnosticsAccordion({ diagnostics }: { diagnostics: DeveloperDiagnosticsState }) {
+function DeveloperDiagnosticsAccordion({ diagnostics }: { diagnostics: DiagnosticsState }) {
   const [open, setOpen] = useState(false)
+  const pipeline = diagnostics.activationPipeline ?? {}
   return (
     <Card>
       <CardHeader className="pb-3">
@@ -717,14 +1283,24 @@ function DeveloperDiagnosticsAccordion({ diagnostics }: { diagnostics: Developer
       </CardHeader>
       {open ? (
         <CardContent className="grid grid-cols-2 gap-2 md:grid-cols-4 xl:grid-cols-4">
+          <MetaBox label="Bot Status" value={diagnostics.botStatus ?? "—"} tone={diagnostics.botRunning ? "buy" : "gold"} />
           <MetaBox label="Active Instance ID" value={diagnostics.activeInstanceId ?? "—"} tone="gold" />
+          <MetaBox label="Last Scan At" value={formatRelative(diagnostics.lastScanAt)} tone="gold" />
           <MetaBox label="Last Scan Result" value={diagnostics.lastScanResult ?? "—"} tone="gold" />
+          <MetaBox label="Selected Scenario" value={diagnostics.selectedScenario ?? "—"} tone="gold" />
           <MetaBox label="Candidates Found" value={String(diagnostics.candidatesFound ?? 0)} tone="gold" />
           <MetaBox label="Alerts Sent" value={String(diagnostics.rawAlertsSent ?? 0)} tone="gold" />
           <MetaBox label="Alerts Failed" value={String(diagnostics.rawAlertsFailed ?? 0)} tone={(diagnostics.rawAlertsFailed ?? 0) > 0 ? "sell" : "gold"} />
           <MetaBox label="Reject Reason" value={diagnostics.rejectReason ?? "—"} tone="gold" />
+          <MetaBox label="Telegram Send" value={diagnostics.telegramSendStatus ?? "—"} tone="gold" />
+          <MetaBox label="Telegram Error" value={diagnostics.telegramLastError ?? "—"} tone={diagnostics.telegramLastError ? "sell" : "gold"} />
+          <MetaBox label="MT5 Connection" value={diagnostics.mt5Connected ? "ok" : "down"} tone={diagnostics.mt5Connected ? "buy" : "sell"} />
+          <MetaBox label="Supabase" value={diagnostics.supabaseConnected ? "ok" : "down"} tone={diagnostics.supabaseConnected ? "buy" : "sell"} />
+          <MetaBox label="Pipeline · Levels" value={String(pipeline.levelsDetected ?? 0)} tone="gold" />
+          <MetaBox label="Pipeline · Bias passed" value={String(pipeline.biasPassed ?? 0)} tone="gold" />
+          <MetaBox label="Pipeline · Sweep" value={String(pipeline.sweepConfirmed ?? 0)} tone="gold" />
+          <MetaBox label="Pipeline · Watchlist" value={String(pipeline.watchlistCandidates ?? 0)} tone="gold" />
           <MetaBox label="Total Scans" value={String(diagnostics.totalScans ?? 0)} tone="gold" />
-          <MetaBox label="Total Candidates" value={String(diagnostics.totalCandidatesFound ?? 0)} tone="gold" />
           <MetaBox label="Total Alerts Sent" value={String(diagnostics.totalAlertsSent ?? 0)} tone="gold" />
           <MetaBox label="Total Alerts Failed" value={String(diagnostics.totalAlertsFailed ?? 0)} tone={(diagnostics.totalAlertsFailed ?? 0) > 0 ? "sell" : "gold"} />
           <MetaBox label="Duplicates Blocked" value={String(diagnostics.totalDuplicatesBlocked ?? 0)} tone="gold" />
@@ -734,6 +1310,7 @@ function DeveloperDiagnosticsAccordion({ diagnostics }: { diagnostics: Developer
           <MetaBox label="Scan Allowed" value={String(diagnostics.scanAllowed ?? true)} tone="gold" />
           <MetaBox label="Background Tasks" value={String(diagnostics.backgroundTasksActive ?? 0)} tone="gold" />
           <MetaBox label="Runtime Alerts" value={String(Boolean(diagnostics.runtimeAlertsEnabled))} tone="gold" />
+          <MetaBox label="Latest Error" value={diagnostics.latestError ?? "—"} tone={diagnostics.latestError ? "sell" : "gold"} />
           <MetaBox label="Last Shutdown" value={diagnostics.lastShutdownTime ?? "—"} tone="gold" />
         </CardContent>
       ) : null}

@@ -301,19 +301,7 @@ export interface BotStatusResponse {
       confirmation_waiting_for?: string[]
       last_updated?: string
     } | null
-    priceFeed?: {
-      currentPrice?: number | null
-      latestCandles?: Array<{ time?: string; open?: number; high?: number; low?: number; close?: number }>
-      timeframe?: string | null
-      lastUpdated?: string | null
-      activeLevel?: number | null
-      primaryZone?: string | null
-      alternativeZone?: string | null
-      sl?: number | null
-      tp1?: number | null
-      tp2?: number | null
-      tp3?: number | null
-    } | null
+    priceFeed?: PriceFeedState | null
     fiveLayerStatus?: {
       market_analyst?: Record<string, unknown>
       confirmation_engine?: Record<string, unknown>
@@ -344,7 +332,145 @@ export interface BotStatusResponse {
     systemHealth?: SystemHealthState | null
     developerDiagnostics?: DeveloperDiagnosticsState | null
     sessionLiquidity?: SessionLiquidityState | null
+    // Top-level dashboard feed used by the deep Spencer dashboard.
+    dashboardState?: DashboardState | null
   } | null
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Spencer Deep Dashboard — top-level shape returned in data.dashboardState.
+// All fields optional/null-safe so the UI renders gracefully on cold start.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface Candle {
+  time?: string
+  open?: number
+  high?: number
+  low?: number
+  close?: number
+  volume?: number
+}
+
+export type PriceFeedTimeframe = "M5" | "M15" | "H1" | string
+
+export interface PriceFeedState {
+  symbol?: string | null
+  currentPrice?: number | null
+  bid?: number | null
+  ask?: number | null
+  spread?: number | null
+  spreadPips?: number | null
+  timeframe?: PriceFeedTimeframe | null
+  status?: "live" | "waiting_for_data" | string | null
+  lastUpdated?: string | null
+  session?: string | null
+  latestCandle?: Candle | null
+  candles?: Candle[] | null
+  candlesByTimeframe?: Partial<Record<PriceFeedTimeframe, Candle[]>> | null
+  // Backwards-compat — older shape exposed candles under latestCandles
+  latestCandles?: Candle[] | null
+  activeLevel?: number | null
+  primaryZone?: string | null
+  alternativeZone?: string | null
+  primaryZoneLow?: number | null
+  primaryZoneHigh?: number | null
+  alternativeZoneLow?: number | null
+  alternativeZoneHigh?: number | null
+  entry?: number | null
+  direction?: string | null
+  sl?: number | null
+  tp1?: number | null
+  tp2?: number | null
+  tp3?: number | null
+}
+
+export interface ActivePlanState {
+  scenarioLabel?: string | null
+  direction?: string | null
+  watchZone?: string | null
+  watchLow?: number | null
+  watchHigh?: number | null
+  expectedReaction?: string | null
+  status?: string | null
+  waitingForConfirmation?: string[] | null
+  primaryScenario?: MarketAnalystScenario | null
+  alternativeScenario?: MarketAnalystScenario | null
+  alternativeLabel?: string | null
+  deepContextLevels?: number[] | null
+  lastUpdated?: string | null
+}
+
+export type LevelIntelligenceDashboardState = LevelIntelligenceState
+
+export type SessionLiquidityDashboardState = SessionLiquidityState
+
+export interface StrategyWatchlistState {
+  gapSweep?: Record<string, unknown> | null
+  breakRetest?: Record<string, unknown> | null
+  engulfing?: Record<string, unknown> | null
+  liquiditySweep?: Record<string, unknown> | null
+  activeContinuation?: Record<string, unknown> | null
+  strategyScans?: Record<string, unknown> | null
+  liveEnabled?: string[] | null
+  researchOnly?: string[] | null
+}
+
+export interface ActiveTradeState {
+  hasActiveTrade?: boolean | null
+  direction?: string | null
+  entry?: number | null
+  sl?: number | null
+  tp1?: number | null
+  tp2?: number | null
+  tp3?: number | null
+  currentPrice?: number | null
+  pipsToTp1?: number | null
+  pipsToSl?: number | null
+  tp1Hit?: boolean | null
+  tp2Hit?: boolean | null
+  tp3Hit?: boolean | null
+  protectedAfterTp1?: boolean | null
+  beStatus?: string | null
+  tradeStatus?: string | null
+  lastTradeManagementAlert?: string | null
+  invalidationLevel?: number | string | null
+  activeTrades?: Record<string, unknown> | null
+  activeTradesCount?: number | null
+  message?: string | null
+}
+
+export interface DiagnosticsState extends DeveloperDiagnosticsState {
+  botStatus?: string | null
+  botRunning?: boolean | null
+  lastScanAt?: string | null
+  selectedScenario?: string | null
+  scenarioCompliance?: Record<string, unknown> | null
+  activationPipeline?: {
+    levelsDetected?: number | null
+    gapLevels?: number | null
+    biasPassed?: number | null
+    sweepConfirmed?: number | null
+    sessionPassed?: number | null
+    distancePassed?: number | null
+    watchlistCandidates?: number | null
+  } | null
+  telegramSendStatus?: string | null
+  telegramLastError?: string | null
+  mt5Connected?: boolean | null
+  supabaseConnected?: boolean | null
+  memoryDedupe?: Record<string, unknown> | null
+  latestError?: string | null
+}
+
+export interface DashboardState {
+  priceFeed?: PriceFeedState | null
+  activePlan?: ActivePlanState | null
+  levelIntelligence?: LevelIntelligenceDashboardState | null
+  sessionLiquidity?: SessionLiquidityDashboardState | null
+  strategyWatchlists?: StrategyWatchlistState | null
+  aiPredictiveLayer?: AIPredictiveLayerState | null
+  activeTrade?: ActiveTradeState | null
+  diagnostics?: DiagnosticsState | null
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
