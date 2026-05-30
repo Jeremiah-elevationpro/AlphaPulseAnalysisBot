@@ -2,21 +2,27 @@
 
 Usage:
     python -m historical_replay.run_core_strategy_replay --symbol XAUUSD --months 6
+    python -m historical_replay.run_core_strategy_replay --symbol XAUUSD --months 6 --require-real-data
+    python -m historical_replay.run_core_strategy_replay --symbol XAUUSD --months 6 --export-rejections 50
+    python -m historical_replay.run_core_strategy_replay --symbol XAUUSD --months 6 --profile research
 
-Replays the last N months of XAUUSD candles by walking M15 bars forward one at
-a time, running the Core Strategy Engine on each window, and tracking what
-would have happened to each candidate's TP1/2/3/SL.
+Walks M15 bars forward, runs the Core Strategy Engine on each window, resolves
+outcomes (TP1/2/3/SL) on a 24h forward window, and writes a JSON summary with:
+  * candidate funnel counts per strategy
+  * rejected_reasons_by_strategy (granular)
+  * data_source (mt5_live | synthetic_demo)  ← explicit, no silent fallback
+  * per-strategy + per-session performance breakdowns
+  * optional rejection_samples export
 
-Output: prints a summary to stdout AND writes a JSON evaluation file.
-
-This evaluates ONLY the three core strategies — legacy strategy results are not
-mixed in.
+Evaluates ONLY the three core strategies. Legacy strategy results are not mixed.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import random
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,7 +33,14 @@ os.environ.setdefault("ALPHAPULSE_REPLAY_MODE", "1")
 import pandas as pd
 
 from data.mt5_client import MT5Client
-from strategies.core_strategy_engine import CoreStrategyEngine, StrategySetup
+from strategies.core_strategy_engine import (
+    ALL_REJECTION_REASONS,
+    CoreStrategyEngine,
+    FunnelMetrics,
+    StrategySetup,
+)
+
+logger = logging.getLogger(__name__)
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT_DIR / "data" / "core_strategy_replays"
@@ -45,7 +58,7 @@ class TradeOutcome:
     tp3: float
     opened_at: str
     closed_at: str = ""
-    result: str = "open"  # "tp1" | "tp2" | "tp3" | "sl" | "open"
+    result: str = "open"
     realized_pips: float = 0.0
     session_name: str = ""
 
@@ -79,7 +92,15 @@ class ReplayMetrics:
     net_pips: float = 0.0
     by_strategy: dict[str, dict[str, float]] = field(default_factory=dict)
     by_session: dict[str, dict[str, float]] = field(default_factory=dict)
-    rejected_reasons: dict[str, int] = field(default_factory=dict)
+    rejected_reasons_by_strategy: dict[str, dict[str, int]] = field(default_factory=dict)
+    funnels: dict[str, FunnelMetrics] = field(default_factory=dict)
+
+    def init_strategies(self) -> None:
+        # Pre-init rejected_reasons_by_strategy with all known reason keys so the
+        # output always shows "this reason fired 0 times" for unfired buckets.
+        for strat, reasons in ALL_REJECTION_REASONS.items():
+            self.rejected_reasons_by_strategy.setdefault(strat, {r: 0 for r in reasons})
+            self.funnels.setdefault(strat, FunnelMetrics(strategy_type=strat))
 
     def add_strategy(self, st: str, key: str, val: float = 1.0) -> None:
         if st not in self.by_strategy:
@@ -91,15 +112,12 @@ class ReplayMetrics:
             self.by_session[sess] = {"activated": 0, "wins": 0, "net_pips": 0.0}
         self.by_session[sess][key] = self.by_session[sess].get(key, 0.0) + val
 
+    def add_rejection(self, strategy: str, reason: str) -> None:
+        bucket = self.rejected_reasons_by_strategy.setdefault(strategy, {})
+        bucket[reason] = bucket.get(reason, 0) + 1
 
-def _resolve_outcome(
-    setup: StrategySetup, forward: pd.DataFrame
-) -> TradeOutcome:
-    """Walk forward bars after entry; first TP/SL touch wins.
 
-    Conservative: assumes worst-case ordering inside a single bar — if both SL
-    and TP are touched on the same bar, SL wins.
-    """
+def _resolve_outcome(setup: StrategySetup, forward: pd.DataFrame) -> TradeOutcome:
     pip = 0.1
     direction = setup.direction.upper()
     outcome = TradeOutcome(
@@ -128,70 +146,97 @@ def _resolve_outcome(
                 outcome.closed_at = str(ts)
                 outcome.realized_pips = round((setup.sl - setup.entry) / pip, 1)
                 return outcome
-            if hi >= setup.tp3:
-                outcome.result = "tp3"
-                outcome.closed_at = str(ts)
-                outcome.realized_pips = round((setup.tp3 - setup.entry) / pip, 1)
-                return outcome
-            if hi >= setup.tp2:
-                outcome.result = "tp2"
-                outcome.closed_at = str(ts)
-                outcome.realized_pips = round((setup.tp2 - setup.entry) / pip, 1)
-                return outcome
-            if hi >= setup.tp1:
-                outcome.result = "tp1"
-                outcome.closed_at = str(ts)
-                outcome.realized_pips = round((setup.tp1 - setup.entry) / pip, 1)
-                return outcome
-        else:  # SELL
+            for tp_lvl, tp_name in ((setup.tp3, "tp3"), (setup.tp2, "tp2"), (setup.tp1, "tp1")):
+                if hi >= tp_lvl:
+                    outcome.result = tp_name
+                    outcome.closed_at = str(ts)
+                    outcome.realized_pips = round((tp_lvl - setup.entry) / pip, 1)
+                    return outcome
+        else:
             if hi >= setup.sl:
                 outcome.result = "sl"
                 outcome.closed_at = str(ts)
                 outcome.realized_pips = round((setup.entry - setup.sl) / pip, 1)
                 return outcome
-            if lo <= setup.tp3:
-                outcome.result = "tp3"
-                outcome.closed_at = str(ts)
-                outcome.realized_pips = round((setup.entry - setup.tp3) / pip, 1)
-                return outcome
-            if lo <= setup.tp2:
-                outcome.result = "tp2"
-                outcome.closed_at = str(ts)
-                outcome.realized_pips = round((setup.entry - setup.tp2) / pip, 1)
-                return outcome
-            if lo <= setup.tp1:
-                outcome.result = "tp1"
-                outcome.closed_at = str(ts)
-                outcome.realized_pips = round((setup.entry - setup.tp1) / pip, 1)
-                return outcome
-    return outcome  # still open at end of replay
+            for tp_lvl, tp_name in ((setup.tp3, "tp3"), (setup.tp2, "tp2"), (setup.tp1, "tp1")):
+                if lo <= tp_lvl:
+                    outcome.result = tp_name
+                    outcome.closed_at = str(ts)
+                    outcome.realized_pips = round((setup.entry - tp_lvl) / pip, 1)
+                    return outcome
+    return outcome
 
 
-def run_replay(symbol: str = "XAUUSD", months: int = 6) -> dict[str, Any]:
-    print(f"[core-replay] symbol={symbol} months={months}")
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=months * 30)
-    mt5 = MT5Client()
-    if not mt5.ensure_connected():
-        print("[core-replay] WARNING: MT5 not connected — running on synthetic data")
+def _load_data(
+    mt5: MT5Client, start: datetime, end: datetime, *, require_real_data: bool
+) -> tuple[dict[str, pd.DataFrame], str]:
+    """Load M5/M15/H1 between start and end.
+
+    Returns (data_dict, data_source). data_source is "mt5_live" or
+    "synthetic_demo". When require_real_data is True and MT5 isn't usable,
+    raises SystemExit instead of returning synthetic data.
+    """
+    mt5_ok = mt5.ensure_connected()
+    using_demo = bool(getattr(mt5, "_demo_mode", False))
+    if (not mt5_ok or using_demo) and require_real_data:
+        print(
+            "REPLAY ABORT: --require-real-data was set but MT5 is not available "
+            f"(connected={mt5_ok}, demo={using_demo}). Refusing to use synthetic data."
+        )
+        raise SystemExit(2)
+    if not mt5_ok or using_demo:
+        print(
+            "\nREPLAY WARNING: Synthetic demo data used. Results are not valid for "
+            "strategy performance.\n"
+        )
     m15 = mt5.get_ohlcv_range("M15", start, end)
     h1 = mt5.get_ohlcv_range("H1", start, end)
     m5 = mt5.get_ohlcv_range("M5", start, end)
+    data_source = "mt5_live" if (mt5_ok and not using_demo) else "synthetic_demo"
+    return {"M15": m15, "H1": h1, "M5": m5}, data_source
+
+
+def run_replay(
+    *,
+    symbol: str = "XAUUSD",
+    months: int = 6,
+    require_real_data: bool = False,
+    export_rejections: int = 0,
+    profile_override: str | None = None,
+) -> dict[str, Any]:
+    if profile_override:
+        os.environ["CORE_STRATEGY_PROFILE"] = profile_override
+        # Re-import settings is overkill — profile resolver reads from config
+        # at import time. For a runner like this, re-importing is cleanest:
+        import importlib
+        import config.settings as _settings
+        importlib.reload(_settings)
+        import strategies.core_strategy_engine as _cse
+        importlib.reload(_cse)
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=months * 30)
+    print(f"[core-replay] symbol={symbol} months={months} profile={profile_override or 'env-default'}")
+
+    mt5 = MT5Client()
+    data, data_source = _load_data(mt5, start, end, require_real_data=require_real_data)
+    m15 = data.get("M15")
+    h1 = data.get("H1")
+    m5 = data.get("M5")
     if m15 is None or len(m15) < 200:
         print(f"[core-replay] Not enough M15 data ({len(m15) if m15 is not None else 0} bars)")
-        return {"error": "insufficient_data"}
-    print(f"[core-replay] Loaded M15={len(m15)} H1={len(h1)} M5={len(m5)}")
+        return {"error": "insufficient_data", "data_source": data_source}
+    print(f"[core-replay] Loaded data_source={data_source} M15={len(m15)} H1={len(h1) if h1 is not None else 0} M5={len(m5) if m5 is not None else 0}")
 
     engine = CoreStrategyEngine()
     metrics = ReplayMetrics()
+    metrics.init_strategies()
     outcomes: list[TradeOutcome] = []
     seen_fingerprints: set[str] = set()
+    rejection_samples: dict[str, list[dict[str, Any]]] = {s: [] for s in ALL_REJECTION_REASONS.keys()}
 
-    # Walk M15 bars forward — for each step, run the engine on the data slice
-    # ending at this bar, then resolve any new candidate's outcome on the
-    # forward window.
-    stride = 4  # check every 4 bars (= 1 hour) for speed
-    forward_window_bars = 96  # 24 hours of M15 to resolve TP/SL
+    stride = 4
+    forward_window_bars = 96
     total_steps = max(0, (len(m15) - 200 - forward_window_bars) // stride)
     for step, i in enumerate(range(200, len(m15) - forward_window_bars, stride)):
         m15_slice = m15.iloc[: i + 1].copy()
@@ -204,13 +249,40 @@ def run_replay(symbol: str = "XAUUSD", months: int = 6) -> dict[str, Any]:
             continue
         h1_slice = h1[h1["time"] <= end_ts_utc] if h1 is not None and len(h1) > 0 else pd.DataFrame()
         m5_slice = m5[m5["time"] <= end_ts_utc] if m5 is not None and len(m5) > 0 else pd.DataFrame()
-        data = {"M15": m15_slice, "H1": h1_slice, "M5": m5_slice}
+        scan_data = {"M15": m15_slice, "H1": h1_slice, "M5": m5_slice}
         current_price = float(m15_slice.iloc[-1]["close"])
-        result = engine.run(data, current_price=current_price, ctx=None, plan=None, symbol=symbol)
+        result = engine.run(scan_data, current_price=current_price, ctx=None, plan=None, symbol=symbol)
         metrics.candidates += len(result.candidates)
         metrics.rejected += len(result.rejected)
+
+        # Per-strategy rejection histogram
         for rej in result.rejected:
-            metrics.rejected_reasons[rej.reason] = metrics.rejected_reasons.get(rej.reason, 0) + 1
+            metrics.add_rejection(rej.strategy_type, rej.reason)
+            # Capture up to N sample rejections per strategy for later export
+            samples = rejection_samples.get(rej.strategy_type)
+            if samples is not None and export_rejections > 0 and len(samples) < export_rejections:
+                if random.random() < min(1.0, (export_rejections * 1.5) / max(metrics.rejected, 1)):
+                    last_bar = m15_slice.iloc[-1]
+                    samples.append({
+                        "timestamp":        str(end_ts_utc),
+                        "strategy":         rej.strategy_type,
+                        "direction":        rej.direction,
+                        "attempted_level":  rej.level,
+                        "current_price":    current_price,
+                        "rejection_reason": rej.reason,
+                        "candle":           {
+                            "open":   float(last_bar["open"]),
+                            "high":   float(last_bar["high"]),
+                            "low":    float(last_bar["low"]),
+                            "close":  float(last_bar["close"]),
+                        },
+                        "detail":           rej.detail,
+                    })
+
+        # Funnel rollup
+        for st, fm in (result.funnel or {}).items():
+            metrics.funnels[st].merge(fm)
+
         for cand in result.candidates:
             fp = cand.fingerprint()
             if fp in seen_fingerprints:
@@ -231,51 +303,80 @@ def run_replay(symbol: str = "XAUUSD", months: int = 6) -> dict[str, Any]:
                 if outcome.result == "tp1":
                     metrics.tp1_hits += 1
                     metrics.add_strategy(cand.strategy_type, "tp1_hits", 1)
-                if outcome.result == "tp2":
+                elif outcome.result == "tp2":
                     metrics.tp2_hits += 1
-                if outcome.result == "tp3":
+                elif outcome.result == "tp3":
                     metrics.tp3_hits += 1
             elif outcome.result == "sl":
                 metrics.losses += 1
             metrics.net_pips += outcome.realized_pips
             metrics.add_strategy(cand.strategy_type, "net_pips", outcome.realized_pips)
             metrics.add_session(sess, "net_pips", outcome.realized_pips)
+
         if step % 50 == 0:
             print(f"[core-replay] step {step}/{total_steps} candidates={metrics.candidates} activated={metrics.activated}")
 
-    summary = _build_summary(symbol, months, metrics, outcomes)
-    out_path = OUTPUT_DIR / f"{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}.json"
+    summary = _build_summary(symbol, months, metrics, outcomes, data_source, profile_override)
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    out_path = OUTPUT_DIR / f"{run_id}.json"
     out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (OUTPUT_DIR / "latest.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    if export_rejections > 0:
+        sample_path = OUTPUT_DIR / f"rejection_samples_{run_id}.json"
+        sample_path.write_text(
+            json.dumps({k: v for k, v in rejection_samples.items() if v}, indent=2),
+            encoding="utf-8",
+        )
+        print(f"[core-replay] Rejection samples saved: {sample_path}")
+
     print(f"\n[core-replay] Saved: {out_path}")
-    print(json.dumps({k: v for k, v in summary.items() if k != "sample_trades"}, indent=2))
+    # Compact display: drop sample_trades from the printed summary
+    display = {k: v for k, v in summary.items() if k != "sample_trades"}
+    print(json.dumps(display, indent=2))
     return summary
 
 
-def _build_summary(symbol: str, months: int, metrics: ReplayMetrics, outcomes: list[TradeOutcome]) -> dict[str, Any]:
+def _build_summary(
+    symbol: str,
+    months: int,
+    metrics: ReplayMetrics,
+    outcomes: list[TradeOutcome],
+    data_source: str,
+    profile: str | None,
+) -> dict[str, Any]:
     win_rate = (metrics.wins / metrics.activated * 100.0) if metrics.activated else 0.0
     tp1_rate = (metrics.tp1_hits / metrics.activated * 100.0) if metrics.activated else 0.0
     tp2_rate = (metrics.tp2_hits / metrics.activated * 100.0) if metrics.activated else 0.0
     tp3_rate = (metrics.tp3_hits / metrics.activated * 100.0) if metrics.activated else 0.0
     avg_pips = (metrics.net_pips / metrics.activated) if metrics.activated else 0.0
     return {
-        "symbol":      symbol,
-        "months":      months,
-        "candidates":  metrics.candidates,
-        "activated":   metrics.activated,
-        "wins":        metrics.wins,
-        "losses":      metrics.losses,
-        "win_rate":    round(win_rate, 1),
-        "tp1_rate":    round(tp1_rate, 1),
-        "tp2_rate":    round(tp2_rate, 1),
-        "tp3_rate":    round(tp3_rate, 1),
-        "net_pips":    round(metrics.net_pips, 1),
-        "avg_pips":    round(avg_pips, 1),
-        "by_strategy": metrics.by_strategy,
-        "by_session":  metrics.by_session,
-        "rejected_reasons": dict(sorted(metrics.rejected_reasons.items(), key=lambda kv: kv[1], reverse=True)[:20]),
-        "sample_trades": [o.to_dict() for o in outcomes[:50]],
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "symbol":         symbol,
+        "months":         months,
+        "data_source":    data_source,
+        "data_source_note": (
+            "REPLAY WARNING: Synthetic demo data used. Results are not valid for "
+            "strategy performance."
+            if data_source == "synthetic_demo" else
+            "MT5 live historical data."
+        ),
+        "profile":        profile or os.getenv("CORE_STRATEGY_PROFILE", "balanced"),
+        "candidates":     metrics.candidates,
+        "activated":      metrics.activated,
+        "wins":           metrics.wins,
+        "losses":         metrics.losses,
+        "win_rate":       round(win_rate, 1),
+        "tp1_rate":       round(tp1_rate, 1),
+        "tp2_rate":       round(tp2_rate, 1),
+        "tp3_rate":       round(tp3_rate, 1),
+        "net_pips":       round(metrics.net_pips, 1),
+        "avg_pips":       round(avg_pips, 1),
+        "by_strategy":    metrics.by_strategy,
+        "by_session":     metrics.by_session,
+        "rejected_reasons_by_strategy": metrics.rejected_reasons_by_strategy,
+        "funnel":         {k: v.to_dict() for k, v in metrics.funnels.items()},
+        "sample_trades":  [o.to_dict() for o in outcomes[:50]],
+        "generated_at":   datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -283,8 +384,34 @@ def main():
     parser = argparse.ArgumentParser(description="Spencer Core Strategy Engine replay.")
     parser.add_argument("--symbol", type=str, default="XAUUSD")
     parser.add_argument("--months", type=int, default=6)
+    parser.add_argument(
+        "--require-real-data",
+        action="store_true",
+        help="Abort if MT5 is unavailable instead of falling back to synthetic.",
+    )
+    parser.add_argument(
+        "--export-rejections",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Sample up to N rejected candidates per strategy to "
+             "rejection_samples_<run_id>.json for tuning.",
+    )
+    parser.add_argument(
+        "--profile",
+        type=str,
+        choices=["strict", "balanced", "research"],
+        default=None,
+        help="Override CORE_STRATEGY_PROFILE for this run.",
+    )
     args = parser.parse_args()
-    run_replay(symbol=args.symbol, months=args.months)
+    run_replay(
+        symbol=args.symbol,
+        months=args.months,
+        require_real_data=args.require_real_data,
+        export_rejections=args.export_rejections,
+        profile_override=args.profile,
+    )
 
 
 if __name__ == "__main__":

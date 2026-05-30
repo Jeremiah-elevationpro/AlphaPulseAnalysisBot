@@ -37,6 +37,7 @@ from config.settings import (
     CORE_MIN_LIQUIDITY_SCORE,
     CORE_MIN_RISK_PIPS,
     CORE_MIN_TP1_RR,
+    CORE_STRATEGY_PROFILE,
 )
 
 logger = logging.getLogger(__name__)
@@ -150,17 +151,139 @@ class StrategyResult:
     candidates: list[StrategySetup] = field(default_factory=list)
     rejected: list[RejectedCandidate] = field(default_factory=list)
     scan_summary: dict[str, Any] = field(default_factory=dict)
+    funnel: dict[str, FunnelMetrics] = field(default_factory=dict)
+    profile: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "market_condition": self.market_condition,
+            "profile":          self.profile,
             "primary":          self.primary.to_dict() if self.primary else None,
             "alternative":      self.alternative.to_dict() if self.alternative else None,
             "candidates_count": len(self.candidates),
             "rejected_count":   len(self.rejected),
             "rejected":         [r.to_dict() for r in self.rejected[:20]],
+            "rejected_reasons_by_strategy": self._rejected_by_strategy(),
+            "funnel":           {k: v.to_dict() for k, v in self.funnel.items()},
             "scan_summary":     dict(self.scan_summary),
         }
+
+    def _rejected_by_strategy(self) -> dict[str, dict[str, int]]:
+        out: dict[str, dict[str, int]] = {}
+        for r in self.rejected:
+            bucket = out.setdefault(r.strategy_type, {})
+            bucket[r.reason] = bucket.get(r.reason, 0) + 1
+        return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Detailed rejection reason taxonomy (per-strategy granularity)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Replaces the broader "no_break_retest" / "no_confirmation" buckets with
+# specific reasons so the replay tells you WHY a candidate didn't make it.
+
+class SDRejection:
+    NO_ZONE_FOUND       = "sd_no_zone_found"
+    ZONE_NOT_FRESH      = "sd_zone_not_fresh"
+    ZONE_TOO_FAR        = "sd_zone_too_far"
+    NO_RETEST           = "sd_no_retest"
+    NO_REJECTION_CANDLE = "sd_no_rejection_candle"
+    LEVEL_SCORE_TOO_LOW = "sd_level_score_too_low"
+    TP_PATH_INVALID     = "sd_tp_path_invalid"
+    SL_INVALID          = "sd_sl_invalid"
+    RR_INVALID          = "sd_rr_invalid"
+
+
+class LiqRejection:
+    NO_SESSION_LEVELS         = "liq_no_session_levels"
+    NO_VALID_LIQUIDITY        = "liq_no_valid_liquidity"
+    SCORE_TOO_LOW             = "liq_score_too_low"
+    NO_SWEEP                  = "liq_no_sweep"
+    NO_CLOSE_BACK_INSIDE      = "liq_no_close_back_inside"
+    NO_DISPLACEMENT_AFTER_SWEEP = "liq_no_displacement_after_sweep"
+    NO_RETEST                 = "liq_no_retest"
+    TP_PATH_INVALID           = "liq_tp_path_invalid"
+    SL_INVALID                = "liq_sl_invalid"
+    RR_INVALID                = "liq_rr_invalid"
+
+
+class BRRejection:
+    NO_BREAK_CLOSE       = "br_no_break_close"
+    BREAK_TOO_WEAK       = "br_break_too_weak"
+    NO_RETEST            = "br_no_retest"
+    RETEST_TOO_DEEP      = "br_retest_too_deep"
+    NO_CONFIRMATION      = "br_no_confirmation"
+    LEVEL_SCORE_TOO_LOW  = "br_level_score_too_low"
+    TP_PATH_INVALID      = "br_tp_path_invalid"
+    SL_INVALID           = "br_sl_invalid"
+    RR_INVALID           = "br_rr_invalid"
+
+
+# Full set used by replay for safe-init of histograms.
+ALL_REJECTION_REASONS: dict[str, tuple[str, ...]] = {
+    "supply_demand_retest": tuple(
+        v for k, v in vars(SDRejection).items() if k.isupper()
+    ),
+    "session_liquidity_sweep_reversal": tuple(
+        v for k, v in vars(LiqRejection).items() if k.isupper()
+    ),
+    "break_retest_continuation": tuple(
+        v for k, v in vars(BRRejection).items() if k.isupper()
+    ),
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Funnel metrics — per-strategy, per-scan counters that explain candidate flow
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class FunnelMetrics:
+    """Counts at each filter stage. Each strategy fills the keys relevant to
+    it. The replay sums these across all scans so you can see *where* you're
+    losing candidates.
+    """
+
+    strategy_type: str = ""
+    counts: dict[str, int] = field(default_factory=dict)
+
+    def inc(self, key: str, by: int = 1) -> None:
+        self.counts[key] = self.counts.get(key, 0) + by
+
+    def merge(self, other: "FunnelMetrics") -> None:
+        if other is None:
+            return
+        for k, v in (other.counts or {}).items():
+            self.counts[k] = self.counts.get(k, 0) + int(v or 0)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"strategy_type": self.strategy_type, "counts": dict(self.counts)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Profile resolver — converts CORE_STRATEGY_PROFILE into per-strategy multipliers
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+_PROFILE_MULTIPLIERS = {
+    # Profile : (impulse_scale, distance_scale, rr_floor, sweep_min_scale)
+    "strict":   {"impulse": 1.30, "distance": 0.75, "rr_floor": 1.00, "sweep_min": 1.50, "break_min": 1.30},
+    "balanced": {"impulse": 1.00, "distance": 1.00, "rr_floor": 0.80, "sweep_min": 1.00, "break_min": 1.00},
+    "research": {"impulse": 0.70, "distance": 1.40, "rr_floor": 0.60, "sweep_min": 0.50, "break_min": 0.70},
+}
+
+
+def profile_multiplier(key: str) -> float:
+    """Return the multiplier for the active profile. Unknown profile → balanced."""
+    return _PROFILE_MULTIPLIERS.get(
+        CORE_STRATEGY_PROFILE, _PROFILE_MULTIPLIERS["balanced"]
+    ).get(key, 1.0)
+
+
+def active_profile() -> str:
+    return CORE_STRATEGY_PROFILE
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -349,10 +472,12 @@ class CoreStrategyEngine:
         all_candidates: list[StrategySetup] = []
         rejected: list[RejectedCandidate] = []
         per_strategy_counts: dict[str, dict[str, int]] = {}
+        funnels: dict[str, FunnelMetrics] = {}
 
         for name, strategy in self.strategies.items():
+            funnels[name] = FunnelMetrics(strategy_type=name)
             try:
-                candidates, strategy_rejected = strategy.scan(
+                ret = strategy.scan(
                     data,
                     current_price=current_price,
                     ctx=ctx,
@@ -374,8 +499,14 @@ class CoreStrategyEngine:
                 per_strategy_counts[name] = {"candidates": 0, "rejected": 1}
                 continue
 
-            # Each strategy MAY return both raw candidates and pre-rejected ones.
-            # Apply final risk validation here as the last gate.
+            # Accept (candidates, rejected) or (candidates, rejected, funnel).
+            if isinstance(ret, tuple) and len(ret) == 3:
+                candidates, strategy_rejected, strategy_funnel = ret
+                funnels[name].merge(strategy_funnel)
+            else:
+                candidates, strategy_rejected = ret
+
+            # Final shared gates: type allowlist + risk validation.
             validated: list[StrategySetup] = []
             for setup in candidates:
                 if setup.strategy_type not in CORE_ALLOWED_STRATEGY_TYPES:
@@ -391,17 +522,22 @@ class CoreStrategyEngine:
                     continue
                 ok, why = validate_setup_risk(setup)
                 if not ok:
+                    # Bucket the failure under the strategy's own RR/SL reason
+                    # so rejected_reasons_by_strategy stays granular.
+                    bucket = _generic_risk_to_strategy_reason(setup.strategy_type, why)
                     rejected.append(
                         RejectedCandidate(
                             strategy_type=setup.strategy_type,
                             direction=setup.direction,
-                            reason=why,
+                            reason=bucket,
                             level=setup.entry,
-                            detail=f"sl={setup.sl:.2f} tp1={setup.tp1:.2f}",
+                            detail=f"{why} | sl={setup.sl:.2f} tp1={setup.tp1:.2f}",
                         )
                     )
+                    funnels[name].inc("rr_or_sl_rejected_in_engine")
                     continue
                 validated.append(setup)
+                funnels[name].inc("final_candidates")
             rejected.extend(strategy_rejected)
             per_strategy_counts[name] = {
                 "candidates": len(validated),
@@ -419,6 +555,7 @@ class CoreStrategyEngine:
 
         scan_summary = {
             "market_condition": market_condition,
+            "profile":          active_profile(),
             "candidates_total": len(all_candidates),
             "rejected_total":   len(rejected),
             "by_strategy":      per_strategy_counts,
@@ -426,8 +563,9 @@ class CoreStrategyEngine:
         }
 
         logger.info(
-            "CORE STRATEGY SCAN: condition=%s candidates=%d rejected=%d primary=%s",
+            "CORE STRATEGY SCAN: condition=%s profile=%s candidates=%d rejected=%d primary=%s",
             market_condition,
+            active_profile(),
             len(all_candidates),
             len(rejected),
             f"{primary.strategy_type}:{primary.direction}@{primary.entry:.2f}"
@@ -442,6 +580,8 @@ class CoreStrategyEngine:
             candidates=all_candidates,
             rejected=rejected,
             scan_summary=scan_summary,
+            funnel=funnels,
+            profile=active_profile(),
         )
 
     # ──────────────────────────────────────────────────────────────
@@ -558,3 +698,22 @@ def candidates_filter_min_level_intel(
 def log_legacy_disabled(strategy_name: str) -> None:
     """Spec-required log marker when a legacy strategy entry source is blocked."""
     logger.info("LEGACY STRATEGY DISABLED: strategy_name=%s", strategy_name)
+
+
+def _generic_risk_to_strategy_reason(strategy_type: str, generic: str) -> str:
+    """Map a generic validate_setup_risk() reason to the strategy-specific
+    rejection key so rejected_reasons_by_strategy stays granular.
+    """
+    g = generic or ""
+    if "tp" in g.lower() and "above" not in g.lower() and "below" not in g.lower():
+        # malformed
+        pass
+    is_rr = "rr_too_low" in g or "tp1_rr" in g
+    is_sl = "sl_not_below" in g or "sl_not_above" in g or "invalid_entry_or_sl" in g
+    if strategy_type == "supply_demand_retest":
+        return SDRejection.RR_INVALID if is_rr else (SDRejection.SL_INVALID if is_sl else SDRejection.TP_PATH_INVALID)
+    if strategy_type == "session_liquidity_sweep_reversal":
+        return LiqRejection.RR_INVALID if is_rr else (LiqRejection.SL_INVALID if is_sl else LiqRejection.TP_PATH_INVALID)
+    if strategy_type == "break_retest_continuation":
+        return BRRejection.RR_INVALID if is_rr else (BRRejection.SL_INVALID if is_sl else BRRejection.TP_PATH_INVALID)
+    return g or "rr_or_sl_invalid"

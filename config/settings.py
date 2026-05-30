@@ -991,6 +991,52 @@ CORE_ALLOWED_STRATEGY_TYPES = (
     "break_retest_continuation",
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Strategy profile — controls how loose / strict candidate detection runs.
+# ─────────────────────────────────────────────────────────────────────────────
+# Live default: "balanced". Use "research" only inside historical replay to
+# discover more candidates for tuning — it never implies live alerting (the
+# Telegram gate + risk/RR validation still apply). "strict" is the most
+# conservative profile.
+#
+# Profile changes effective thresholds (impulse pips, sweep tolerance, RR floor,
+# distance gates). Each strategy module reads its own CORE_PROFILE_TUNING block
+# and applies a multiplier / override based on this value.
+CORE_STRATEGY_PROFILE = os.getenv("CORE_STRATEGY_PROFILE", "balanced").strip().lower()
+if CORE_STRATEGY_PROFILE not in {"strict", "balanced", "research"}:
+    CORE_STRATEGY_PROFILE = "balanced"
+
+# Per-strategy calibration knobs — env-overridable. Defaults match the
+# "balanced" profile; the strategy modules narrow them for "strict" and
+# widen them for "research".
+
+# Supply & Demand
+SD_MIN_IMPULSE_PIPS = float(os.getenv("SD_MIN_IMPULSE_PIPS", "25"))
+SD_MAX_ZONE_TOUCHES = int(float(os.getenv("SD_MAX_ZONE_TOUCHES", "3")))
+SD_MAX_DISTANCE_PIPS = float(os.getenv("SD_MAX_DISTANCE_PIPS", "100"))
+SD_ALLOW_BODY_ZONE = os.getenv("SD_ALLOW_BODY_ZONE", "true").strip().lower() == "true"
+SD_ALLOW_WICK_ZONE = os.getenv("SD_ALLOW_WICK_ZONE", "true").strip().lower() == "true"
+SD_ZONE_LOOKBACK_BARS = int(float(os.getenv("SD_ZONE_LOOKBACK_BARS", "80")))
+
+# Session Liquidity Sweep Reversal
+LIQ_MIN_SWEEP_PIPS = float(os.getenv("LIQ_MIN_SWEEP_PIPS", "2"))
+LIQ_MAX_SWEEP_PIPS = float(os.getenv("LIQ_MAX_SWEEP_PIPS", "80"))
+LIQ_CLOSE_BACK_REQUIRED = os.getenv("LIQ_CLOSE_BACK_REQUIRED", "true").strip().lower() == "true"
+LIQ_ALLOW_WICK_REJECTION = os.getenv("LIQ_ALLOW_WICK_REJECTION", "true").strip().lower() == "true"
+LIQ_DISPLACEMENT_OPTIONAL_FOR_WATCH = os.getenv("LIQ_DISPLACEMENT_OPTIONAL_FOR_WATCH", "true").strip().lower() == "true"
+LIQ_DISPLACEMENT_REQUIRED_FOR_ENTRY = os.getenv("LIQ_DISPLACEMENT_REQUIRED_FOR_ENTRY", "true").strip().lower() == "true"
+LIQ_SWEEP_LOOKBACK_M15 = int(float(os.getenv("LIQ_SWEEP_LOOKBACK_M15", "12")))
+
+# Break / Retest Continuation
+BR_MIN_BREAK_PIPS = float(os.getenv("BR_MIN_BREAK_PIPS", "10"))
+BR_MAX_RETEST_DISTANCE_PIPS = float(os.getenv("BR_MAX_RETEST_DISTANCE_PIPS", "15"))
+BR_RETEST_TOLERANCE_PIPS = float(os.getenv("BR_RETEST_TOLERANCE_PIPS", "8"))
+BR_CONFIRMATION_REQUIRED = os.getenv("BR_CONFIRMATION_REQUIRED", "true").strip().lower() == "true"
+BR_ALLOW_ONE_CANDLE_RETEST = os.getenv("BR_ALLOW_ONE_CANDLE_RETEST", "true").strip().lower() == "true"
+BR_ALLOW_MULTI_CANDLE_RETEST = os.getenv("BR_ALLOW_MULTI_CANDLE_RETEST", "true").strip().lower() == "true"
+BR_DEEP_VIOLATION_PIPS = float(os.getenv("BR_DEEP_VIOLATION_PIPS", "15"))
+BR_LOOKBACK_BARS = int(float(os.getenv("BR_LOOKBACK_BARS", "60")))
+
 # Spencer Level Intelligence / Scenario Compliance
 LEVEL_INTELLIGENCE_ENABLED = os.getenv("LEVEL_INTELLIGENCE_ENABLED", "true").lower() == "true"
 LEVEL_INTELLIGENCE_BLOCKING_MODE = os.getenv("LEVEL_INTELLIGENCE_BLOCKING_MODE", "false").lower() == "true"

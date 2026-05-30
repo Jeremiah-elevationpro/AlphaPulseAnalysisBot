@@ -1,16 +1,17 @@
 """Break & Retest Continuation Strategy.
 
-BUY:
-  1. Strong resistance breaks (M15 close > resistance + buffer)
-  2. Broken resistance flips to support on retest
-  3. Retest holds (does not deeply violate)
-  4. Bullish confirmation forms
-  5. SL below retest low; TP path = next resistance / liquidity
+Detects a strong level break, a subsequent retest that doesn't deeply violate
+the level, and a bullish/bearish confirmation candle. Each stage of the funnel
+emits a specific rejection code so the replay tells you whether candidates are
+failing at break, at retest, or at confirmation.
 
-SELL: mirror.
+Calibration knobs (config.settings):
+  BR_MIN_BREAK_PIPS, BR_MAX_RETEST_DISTANCE_PIPS, BR_RETEST_TOLERANCE_PIPS,
+  BR_CONFIRMATION_REQUIRED, BR_ALLOW_ONE_CANDLE_RETEST,
+  BR_ALLOW_MULTI_CANDLE_RETEST, BR_DEEP_VIOLATION_PIPS, BR_LOOKBACK_BARS
 
-Pulls resistance / support candidates from market_plan (key_supports,
-key_resistances) and falls back to swing highs/lows in the M15 data.
+Active profile (strict/balanced/research) scales BR_MIN_BREAK_PIPS by
+profile_multiplier("break_min") so research mode discovers more candidates.
 """
 from __future__ import annotations
 
@@ -22,23 +23,33 @@ import pandas as pd
 
 from analysis.sl_engine import validate_sl_direction
 from analysis.tp_engine import check_risk_reward
+from config.settings import (
+    BR_ALLOW_MULTI_CANDLE_RETEST,
+    BR_ALLOW_ONE_CANDLE_RETEST,
+    BR_CONFIRMATION_REQUIRED,
+    BR_DEEP_VIOLATION_PIPS,
+    BR_LOOKBACK_BARS,
+    BR_MAX_RETEST_DISTANCE_PIPS,
+    BR_MIN_BREAK_PIPS,
+    BR_RETEST_TOLERANCE_PIPS,
+)
 from strategies.core_strategy_engine import (
     ALLOWED_BUY_CONFIRMATIONS,
     ALLOWED_SELL_CONFIRMATIONS,
+    BRRejection,
+    FunnelMetrics,
     RejectedCandidate,
     StrategySetup,
     attach_level_intel_evidence,
+    profile_multiplier,
 )
 
 logger = logging.getLogger(__name__)
 
 PIP = 0.1
-BREAK_BUFFER_PIPS = 5.0
-RETEST_TOLERANCE_PIPS = 8.0
-DEEP_VIOLATION_PIPS = 15.0       # retest closing > this far through level = invalid
+BREAK_BUFFER_PIPS = 2.0  # tolerance for "close above" comparison
 BREAK_DISPLACEMENT_MIN_PIPS = 20.0
 SL_BUFFER_PIPS = 3.0
-LOOKBACK_BARS = 60
 
 
 def _pips(a: float, b: float) -> float:
@@ -57,8 +68,16 @@ def _is_bearish(row: pd.Series) -> bool:
     return float(row["close"]) < float(row["open"])
 
 
+def _effective_break_min_pips() -> float:
+    return BR_MIN_BREAK_PIPS * profile_multiplier("break_min")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Level pool — plan-provided plus swing detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def _resistance_pool(plan: Any, m15: pd.DataFrame) -> list[float]:
-    """Combine plan-provided resistances with simple swing-high detection."""
     pool: list[float] = []
     if isinstance(plan, dict):
         for v in (plan.get("key_resistances") or []):
@@ -67,7 +86,7 @@ def _resistance_pool(plan: Any, m15: pd.DataFrame) -> list[float]:
             except Exception:
                 continue
     pool.extend(_swing_highs(m15))
-    return sorted(set(round(p, 2) for p in pool), reverse=True)
+    return sorted({round(p, 2) for p in pool}, reverse=True)
 
 
 def _support_pool(plan: Any, m15: pd.DataFrame) -> list[float]:
@@ -79,14 +98,13 @@ def _support_pool(plan: Any, m15: pd.DataFrame) -> list[float]:
             except Exception:
                 continue
     pool.extend(_swing_lows(m15))
-    return sorted(set(round(p, 2) for p in pool))
+    return sorted({round(p, 2) for p in pool})
 
 
 def _swing_highs(df: pd.DataFrame, window: int = 3) -> list[float]:
-    """Quick swing-high finder over the last LOOKBACK_BARS."""
     if df is None or len(df) < 2 * window + 1:
         return []
-    last = df.tail(LOOKBACK_BARS).reset_index(drop=True)
+    last = df.tail(BR_LOOKBACK_BARS).reset_index(drop=True)
     out: list[float] = []
     highs = last["high"].astype(float).tolist()
     for i in range(window, len(highs) - window):
@@ -98,7 +116,7 @@ def _swing_highs(df: pd.DataFrame, window: int = 3) -> list[float]:
 def _swing_lows(df: pd.DataFrame, window: int = 3) -> list[float]:
     if df is None or len(df) < 2 * window + 1:
         return []
-    last = df.tail(LOOKBACK_BARS).reset_index(drop=True)
+    last = df.tail(BR_LOOKBACK_BARS).reset_index(drop=True)
     out: list[float] = []
     lows = last["low"].astype(float).tolist()
     for i in range(window, len(lows) - window):
@@ -107,92 +125,153 @@ def _swing_lows(df: pd.DataFrame, window: int = 3) -> list[float]:
     return out
 
 
-def _find_break_retest_buy(m15: pd.DataFrame, resistance: float) -> tuple[bool, str | None, float]:
-    """Was `resistance` broken to the upside and now being retested as support?
+# ─────────────────────────────────────────────────────────────────────────────
+# Break + retest detection (returns staged outcome)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Returns (qualifies, confirmation_type, retest_low).
+
+def _check_break_retest_buy(m15: pd.DataFrame, resistance: float) -> dict[str, Any]:
+    """Walks the M15 history for: break above + retest hold + confirmation.
+
+    Returns:
+        {
+            "stage": "no_break" | "break_too_weak" | "no_retest"
+                   | "retest_too_deep" | "no_confirmation" | "ok",
+            "retest_low": float (if reached retest stage),
+            "confirmation_type": str (if ok),
+        }
     """
+    out: dict[str, Any] = {"stage": "no_break", "retest_low": 0.0, "confirmation_type": None}
     if m15 is None or len(m15) < 10:
-        return False, None, 0.0
-    bars = m15.tail(LOOKBACK_BARS).reset_index(drop=True)
-    # find break index: M15 close > resistance + buffer
+        return out
+    bars = m15.tail(BR_LOOKBACK_BARS).reset_index(drop=True)
     break_thresh = resistance + BREAK_BUFFER_PIPS * PIP
     break_mask = bars["close"].astype(float) > break_thresh
     if not break_mask.any():
-        return False, None, 0.0
-    break_idx = int(break_mask[break_mask].index[0])  # first break
+        out["stage"] = "no_break"
+        return out
+    break_idx = int(break_mask[break_mask].index[0])
     break_bar = bars.iloc[break_idx]
-    # break must have meaningful displacement
-    if _body(break_bar) / PIP < BREAK_DISPLACEMENT_MIN_PIPS:
-        return False, None, 0.0
-    after_break = bars.iloc[break_idx + 1 :]
-    if len(after_break) < 1:
-        return False, None, 0.0
-    # find retest = at least one bar low <= resistance + tolerance
-    retest_mask = after_break["low"].astype(float) <= resistance + RETEST_TOLERANCE_PIPS * PIP
+    if _body(break_bar) / PIP < _effective_break_min_pips():
+        out["stage"] = "break_too_weak"
+        return out
+
+    after = bars.iloc[break_idx + 1 :]
+    if len(after) < 1:
+        out["stage"] = "no_retest"
+        return out
+    retest_mask = after["low"].astype(float) <= resistance + BR_RETEST_TOLERANCE_PIPS * PIP
     if not retest_mask.any():
-        return False, None, 0.0
+        out["stage"] = "no_retest"
+        return out
+    # Honor one-vs-multi-candle retest preference
+    retest_bars = after[retest_mask]
+    if not BR_ALLOW_MULTI_CANDLE_RETEST and len(retest_bars) > 3:
+        out["stage"] = "no_retest"
+        return out
+    if not BR_ALLOW_ONE_CANDLE_RETEST and len(retest_bars) <= 1:
+        out["stage"] = "no_retest"
+        return out
     retest_idx = int(retest_mask[retest_mask].index[0])
     retest_bar = bars.iloc[retest_idx]
     retest_low = float(retest_bar["low"])
-    # no deep violation: any close < resistance - DEEP_VIOLATION_PIPS = invalid
-    deep_violation = (after_break["close"].astype(float) < resistance - DEEP_VIOLATION_PIPS * PIP).any()
+    out["retest_low"] = retest_low
+    deep_violation = (after["close"].astype(float) < resistance - BR_DEEP_VIOLATION_PIPS * PIP).any()
     if deep_violation:
-        return False, None, 0.0
-    # confirmation = bullish on last bar AND last close > resistance
+        out["stage"] = "retest_too_deep"
+        return out
+
     last = bars.iloc[-1]
     prev = bars.iloc[-2]
+    if not BR_CONFIRMATION_REQUIRED:
+        out["stage"] = "ok"
+        out["confirmation_type"] = "break_retest_close_above"
+        return out
+    # Last bar must be bullish closing back above resistance
     if _is_bullish(last) and float(last["close"]) > resistance + BREAK_BUFFER_PIPS * PIP:
-        # Choose the most specific confirmation type that applies
         if (
             _is_bearish(prev)
             and float(last["close"]) > float(prev["open"])
             and float(last["open"]) < float(prev["close"])
         ):
-            return True, "bullish_engulfing", retest_low
+            out["stage"] = "ok"
+            out["confirmation_type"] = "bullish_engulfing"
+            return out
         if _body(last) / PIP >= BREAK_DISPLACEMENT_MIN_PIPS:
-            return True, "break_retest_close_above", retest_low
-        return True, "bullish_rejection", retest_low
-    return False, None, 0.0
+            out["stage"] = "ok"
+            out["confirmation_type"] = "break_retest_close_above"
+            return out
+        out["stage"] = "ok"
+        out["confirmation_type"] = "bullish_rejection"
+        return out
+    out["stage"] = "no_confirmation"
+    return out
 
 
-def _find_break_retest_sell(m15: pd.DataFrame, support: float) -> tuple[bool, str | None, float]:
+def _check_break_retest_sell(m15: pd.DataFrame, support: float) -> dict[str, Any]:
+    out: dict[str, Any] = {"stage": "no_break", "retest_high": 0.0, "confirmation_type": None}
     if m15 is None or len(m15) < 10:
-        return False, None, 0.0
-    bars = m15.tail(LOOKBACK_BARS).reset_index(drop=True)
+        return out
+    bars = m15.tail(BR_LOOKBACK_BARS).reset_index(drop=True)
     break_thresh = support - BREAK_BUFFER_PIPS * PIP
     break_mask = bars["close"].astype(float) < break_thresh
     if not break_mask.any():
-        return False, None, 0.0
+        out["stage"] = "no_break"
+        return out
     break_idx = int(break_mask[break_mask].index[0])
     break_bar = bars.iloc[break_idx]
-    if _body(break_bar) / PIP < BREAK_DISPLACEMENT_MIN_PIPS:
-        return False, None, 0.0
-    after_break = bars.iloc[break_idx + 1 :]
-    if len(after_break) < 1:
-        return False, None, 0.0
-    retest_mask = after_break["high"].astype(float) >= support - RETEST_TOLERANCE_PIPS * PIP
+    if _body(break_bar) / PIP < _effective_break_min_pips():
+        out["stage"] = "break_too_weak"
+        return out
+
+    after = bars.iloc[break_idx + 1 :]
+    if len(after) < 1:
+        out["stage"] = "no_retest"
+        return out
+    retest_mask = after["high"].astype(float) >= support - BR_RETEST_TOLERANCE_PIPS * PIP
     if not retest_mask.any():
-        return False, None, 0.0
+        out["stage"] = "no_retest"
+        return out
+    retest_bars = after[retest_mask]
+    if not BR_ALLOW_MULTI_CANDLE_RETEST and len(retest_bars) > 3:
+        out["stage"] = "no_retest"
+        return out
+    if not BR_ALLOW_ONE_CANDLE_RETEST and len(retest_bars) <= 1:
+        out["stage"] = "no_retest"
+        return out
     retest_idx = int(retest_mask[retest_mask].index[0])
     retest_bar = bars.iloc[retest_idx]
     retest_high = float(retest_bar["high"])
-    deep_violation = (after_break["close"].astype(float) > support + DEEP_VIOLATION_PIPS * PIP).any()
+    out["retest_high"] = retest_high
+    deep_violation = (after["close"].astype(float) > support + BR_DEEP_VIOLATION_PIPS * PIP).any()
     if deep_violation:
-        return False, None, 0.0
+        out["stage"] = "retest_too_deep"
+        return out
+
     last = bars.iloc[-1]
     prev = bars.iloc[-2]
+    if not BR_CONFIRMATION_REQUIRED:
+        out["stage"] = "ok"
+        out["confirmation_type"] = "break_retest_close_below"
+        return out
     if _is_bearish(last) and float(last["close"]) < support - BREAK_BUFFER_PIPS * PIP:
         if (
             _is_bullish(prev)
             and float(last["close"]) < float(prev["open"])
             and float(last["open"]) > float(prev["close"])
         ):
-            return True, "bearish_engulfing", retest_high
+            out["stage"] = "ok"
+            out["confirmation_type"] = "bearish_engulfing"
+            return out
         if _body(last) / PIP >= BREAK_DISPLACEMENT_MIN_PIPS:
-            return True, "break_retest_close_below", retest_high
-        return True, "bearish_rejection", retest_high
-    return False, None, 0.0
+            out["stage"] = "ok"
+            out["confirmation_type"] = "break_retest_close_below"
+            return out
+        out["stage"] = "ok"
+        out["confirmation_type"] = "bearish_rejection"
+        return out
+    out["stage"] = "no_confirmation"
+    return out
 
 
 def _tp_ladder(direction: str, entry: float, sl: float, pool: list[float]) -> tuple[float, float, float]:
@@ -200,30 +279,45 @@ def _tp_ladder(direction: str, entry: float, sl: float, pool: list[float]) -> tu
     if direction.upper() == "BUY":
         above = [p for p in pool if p > entry + 5 * PIP]
         if len(above) >= 3:
-            above_sorted = sorted(above)[:3]
-            return round(above_sorted[0], 2), round(above_sorted[1], 2), round(above_sorted[2], 2)
+            sorted_a = sorted(above)[:3]
+            return round(sorted_a[0], 2), round(sorted_a[1], 2), round(sorted_a[2], 2)
         if len(above) >= 1:
-            above_sorted = sorted(above)
-            tp1 = above_sorted[0]
-            tp2 = above_sorted[1] if len(above_sorted) > 1 else round(entry + 2 * risk, 2)
+            sorted_a = sorted(above)
+            tp1 = sorted_a[0]
+            tp2 = sorted_a[1] if len(sorted_a) > 1 else round(entry + 2 * risk, 2)
             tp3 = round(entry + 3 * risk, 2)
             return round(tp1, 2), round(tp2, 2), round(tp3, 2)
         return round(entry + risk, 2), round(entry + 2 * risk, 2), round(entry + 3 * risk, 2)
-    # SELL
     below = [p for p in pool if p < entry - 5 * PIP]
     if len(below) >= 3:
-        below_sorted = sorted(below, reverse=True)[:3]
-        return round(below_sorted[0], 2), round(below_sorted[1], 2), round(below_sorted[2], 2)
+        sorted_b = sorted(below, reverse=True)[:3]
+        return round(sorted_b[0], 2), round(sorted_b[1], 2), round(sorted_b[2], 2)
     if len(below) >= 1:
-        below_sorted = sorted(below, reverse=True)
-        tp1 = below_sorted[0]
-        tp2 = below_sorted[1] if len(below_sorted) > 1 else round(entry - 2 * risk, 2)
+        sorted_b = sorted(below, reverse=True)
+        tp1 = sorted_b[0]
+        tp2 = sorted_b[1] if len(sorted_b) > 1 else round(entry - 2 * risk, 2)
         tp3 = round(entry - 3 * risk, 2)
         return round(tp1, 2), round(tp2, 2), round(tp3, 2)
     return round(entry - risk, 2), round(entry - 2 * risk, 2), round(entry - 3 * risk, 2)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Strategy
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+_STAGE_TO_REASON = {
+    "no_break":         BRRejection.NO_BREAK_CLOSE,
+    "break_too_weak":   BRRejection.BREAK_TOO_WEAK,
+    "no_retest":        BRRejection.NO_RETEST,
+    "retest_too_deep":  BRRejection.RETEST_TOO_DEEP,
+    "no_confirmation":  BRRejection.NO_CONFIRMATION,
+}
+
+
 class BreakRetestContinuationStrategy:
+    strategy_type = "break_retest_continuation"
+
     def __init__(self, level_intel_engine: Any = None) -> None:
         self.level_intel = level_intel_engine
 
@@ -235,120 +329,121 @@ class BreakRetestContinuationStrategy:
         ctx: Any = None,
         plan: Any = None,
         symbol: str = "XAUUSD",
-    ) -> tuple[list[StrategySetup], list[RejectedCandidate]]:
+    ) -> tuple[list[StrategySetup], list[RejectedCandidate], FunnelMetrics]:
         candidates: list[StrategySetup] = []
         rejected: list[RejectedCandidate] = []
+        funnel = FunnelMetrics(strategy_type=self.strategy_type)
+
         if current_price is None:
-            return candidates, rejected
+            return candidates, rejected, funnel
         m15 = data.get("M15")
         if m15 is None or len(m15) < 20:
-            return candidates, rejected
+            return candidates, rejected, funnel
 
         resistances = _resistance_pool(plan, m15)
         supports = _support_pool(plan, m15)
 
-        for r in resistances:
-            # only worth checking levels reasonably close to price
-            if _pips(current_price, r) > 200:
-                continue
-            qualifies, conf, retest_low = _find_break_retest_buy(m15, r)
-            if not qualifies:
-                rejected.append(self._reject("BUY", r, "no_break_retest"))
-                continue
-            if conf not in ALLOWED_BUY_CONFIRMATIONS:
-                rejected.append(self._reject("BUY", r, f"confirmation_disabled:{conf}"))
-                continue
-            entry = float(m15.iloc[-1]["close"])
-            sl = round(retest_low - SL_BUFFER_PIPS * PIP, 2)
-            ok, why = validate_sl_direction("BUY", entry, sl)
-            if not ok:
-                rejected.append(self._reject("BUY", r, f"sl_invalid:{why}"))
-                continue
-            tp1, tp2, tp3 = _tp_ladder("BUY", entry, sl, resistances)
-            rr_check = check_risk_reward("BUY", entry, sl, [tp1, tp2, tp3])
-            if not rr_check.get("tp1_ok", False):
-                rejected.append(self._reject("BUY", r, "rr_invalid"))
-                continue
-            setup = StrategySetup(
-                strategy_type="break_retest_continuation",
-                symbol=symbol,
-                direction="BUY",
-                entry_zone_low=retest_low,
-                entry_zone_high=r + RETEST_TOLERANCE_PIPS * PIP,
-                trigger_level=r,
-                confirmation_required=[conf],
-                entry=round(entry, 2),
-                sl=sl,
-                tp1=tp1,
-                tp2=tp2,
-                tp3=tp3,
-                invalidation=retest_low,
-                reason=f"Break above resistance {r:.2f} held on retest; "
-                       f"{conf} confirmation",
-                confidence_internal=0.0,
-                session_name=getattr(ctx, "session_name", "") if ctx else "",
-                higher_tf="M15",
-                lower_tf="M5",
-                confirmation_candle_time=self._candle_time(m15.iloc[-1]),
-            )
-            attach_level_intel_evidence(setup, self.level_intel, current_price=current_price)
-            candidates.append(setup)
+        for direction, levels, allowed_confs, check_fn, retest_attr in (
+            ("BUY",  resistances, ALLOWED_BUY_CONFIRMATIONS,  _check_break_retest_buy,  "retest_low"),
+            ("SELL", supports,    ALLOWED_SELL_CONFIRMATIONS, _check_break_retest_sell, "retest_high"),
+        ):
+            for level in levels:
+                if _pips(current_price, level) > 250:
+                    continue
+                outcome = check_fn(m15, level)
+                stage = outcome["stage"]
+                if stage == "no_break":
+                    funnel.inc("rejected_no_break")
+                    rejected.append(self._reject(direction, level, BRRejection.NO_BREAK_CLOSE))
+                    continue
+                funnel.inc("breaks_detected")
+                if stage == "break_too_weak":
+                    funnel.inc("rejected_break_too_weak")
+                    rejected.append(self._reject(direction, level, BRRejection.BREAK_TOO_WEAK))
+                    continue
+                funnel.inc("strong_breaks")
+                if stage == "no_retest":
+                    funnel.inc("rejected_no_retest")
+                    rejected.append(self._reject(direction, level, BRRejection.NO_RETEST))
+                    continue
+                funnel.inc("retests_detected")
+                if stage == "retest_too_deep":
+                    funnel.inc("rejected_retest_too_deep")
+                    rejected.append(self._reject(direction, level, BRRejection.RETEST_TOO_DEEP))
+                    continue
+                if stage == "no_confirmation":
+                    funnel.inc("rejected_no_confirmation")
+                    rejected.append(self._reject(direction, level, BRRejection.NO_CONFIRMATION))
+                    continue
+                # stage == "ok"
+                conf = outcome.get("confirmation_type") or ""
+                if conf not in allowed_confs:
+                    funnel.inc("rejected_no_confirmation")
+                    rejected.append(
+                        self._reject(direction, level, BRRejection.NO_CONFIRMATION,
+                                     extra=f"confirmation_disabled:{conf}")
+                    )
+                    continue
+                funnel.inc("confirmation_detected")
+                retest_pivot = float(outcome.get(retest_attr, 0.0))
+                entry = float(m15.iloc[-1]["close"])
+                if direction == "BUY":
+                    sl = round(retest_pivot - SL_BUFFER_PIPS * PIP, 2)
+                else:
+                    sl = round(retest_pivot + SL_BUFFER_PIPS * PIP, 2)
+                ok, why = validate_sl_direction(direction, entry, sl)
+                if not ok:
+                    funnel.inc("rejected_sl_invalid")
+                    rejected.append(self._reject(direction, level, BRRejection.SL_INVALID, extra=why))
+                    continue
+                pool = resistances if direction == "BUY" else supports
+                tp1, tp2, tp3 = _tp_ladder(direction, entry, sl, pool)
+                rr_check = check_risk_reward(direction, entry, sl, [tp1, tp2, tp3])
+                if not rr_check.get("tp1_ok", False):
+                    funnel.inc("rejected_rr_invalid")
+                    rejected.append(
+                        self._reject(direction, level, BRRejection.RR_INVALID,
+                                     extra=f"tp1_rr={rr_check.get('rr_values', [0])[0]:.2f}")
+                    )
+                    continue
+                funnel.inc("risk_valid")
+                setup = StrategySetup(
+                    strategy_type=self.strategy_type,
+                    symbol=symbol,
+                    direction=direction,
+                    entry_zone_low=min(level, retest_pivot) - BR_RETEST_TOLERANCE_PIPS * PIP,
+                    entry_zone_high=max(level, retest_pivot) + BR_RETEST_TOLERANCE_PIPS * PIP,
+                    trigger_level=level,
+                    confirmation_required=[conf],
+                    entry=round(entry, 2),
+                    sl=sl,
+                    tp1=tp1,
+                    tp2=tp2,
+                    tp3=tp3,
+                    invalidation=retest_pivot,
+                    reason=(
+                        f"Break {'above' if direction == 'BUY' else 'below'} "
+                        f"{'resistance' if direction == 'BUY' else 'support'} {level:.2f} "
+                        f"held on retest; {conf} confirmation"
+                    ),
+                    confidence_internal=0.0,
+                    session_name=getattr(ctx, "session_name", "") if ctx else "",
+                    higher_tf="M15",
+                    lower_tf="M5",
+                    confirmation_candle_time=self._candle_time(m15.iloc[-1]),
+                )
+                attach_level_intel_evidence(setup, self.level_intel, current_price=current_price)
+                candidates.append(setup)
 
-        for s in supports:
-            if _pips(current_price, s) > 200:
-                continue
-            qualifies, conf, retest_high = _find_break_retest_sell(m15, s)
-            if not qualifies:
-                rejected.append(self._reject("SELL", s, "no_break_retest"))
-                continue
-            if conf not in ALLOWED_SELL_CONFIRMATIONS:
-                rejected.append(self._reject("SELL", s, f"confirmation_disabled:{conf}"))
-                continue
-            entry = float(m15.iloc[-1]["close"])
-            sl = round(retest_high + SL_BUFFER_PIPS * PIP, 2)
-            ok, why = validate_sl_direction("SELL", entry, sl)
-            if not ok:
-                rejected.append(self._reject("SELL", s, f"sl_invalid:{why}"))
-                continue
-            tp1, tp2, tp3 = _tp_ladder("SELL", entry, sl, supports)
-            rr_check = check_risk_reward("SELL", entry, sl, [tp1, tp2, tp3])
-            if not rr_check.get("tp1_ok", False):
-                rejected.append(self._reject("SELL", s, "rr_invalid"))
-                continue
-            setup = StrategySetup(
-                strategy_type="break_retest_continuation",
-                symbol=symbol,
-                direction="SELL",
-                entry_zone_low=s - RETEST_TOLERANCE_PIPS * PIP,
-                entry_zone_high=retest_high,
-                trigger_level=s,
-                confirmation_required=[conf],
-                entry=round(entry, 2),
-                sl=sl,
-                tp1=tp1,
-                tp2=tp2,
-                tp3=tp3,
-                invalidation=retest_high,
-                reason=f"Break below support {s:.2f} held on retest; "
-                       f"{conf} confirmation",
-                confidence_internal=0.0,
-                session_name=getattr(ctx, "session_name", "") if ctx else "",
-                higher_tf="M15",
-                lower_tf="M5",
-                confirmation_candle_time=self._candle_time(m15.iloc[-1]),
-            )
-            attach_level_intel_evidence(setup, self.level_intel, current_price=current_price)
-            candidates.append(setup)
+        return candidates, rejected, funnel
 
-        return candidates, rejected
-
-    @staticmethod
-    def _reject(direction: str, level: float, reason: str) -> RejectedCandidate:
+    def _reject(self, direction: str, level: float, reason: str, *, extra: str = "") -> RejectedCandidate:
         return RejectedCandidate(
-            strategy_type="break_retest_continuation",
+            strategy_type=self.strategy_type,
             direction=direction,
             reason=reason,
             level=float(level),
+            detail=extra,
         )
 
     @staticmethod

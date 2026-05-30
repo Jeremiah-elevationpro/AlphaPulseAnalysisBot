@@ -39,3 +39,6 @@ spencer_instance.lock
 runtime_alerts_disabled.flag
 telegram_health.json
 *.tsbuildinfo
+
+# Spencer Core Strategy Engine replay outputs (runtime artifacts)
+data/core_strategy_replays/
