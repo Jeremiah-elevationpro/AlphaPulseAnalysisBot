@@ -599,6 +599,122 @@ class TelegramBot:
             self._last_error = result.error or result.failure_reason or "send_failed"
         return bool(result.ok)
 
+    # ─────────────────────────────────────────────────────────────────────
+    # Spencer Core Strategy Engine — simplified trader-facing template
+    # ─────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _core_strategy_label(strategy_type: str) -> str:
+        return {
+            "supply_demand_retest":              "Supply & Demand Retest",
+            "session_liquidity_sweep_reversal":  "Session Liquidity Sweep Reversal",
+            "break_retest_continuation":         "Break & Retest Continuation",
+        }.get(strategy_type, strategy_type.replace("_", " ").title())
+
+    def send_core_strategy_setup(self, payload: dict) -> bool:
+        """Send the Spencer simplified setup template.
+
+        payload = {
+            "primary":      StrategySetup.to_dict(),
+            "alternative":  StrategySetup.to_dict() | None,
+            "market_condition": str,
+        }
+
+        Strict trader-facing format per spec. No watchlists. No full market
+        plan. No raw Level Intelligence dump. No debug.
+        """
+        primary = payload.get("primary") or {}
+        alternative = payload.get("alternative")
+        if not primary:
+            return False
+        nice = self._core_strategy_label(str(primary.get("strategy_type", "")))
+        direction = str(primary.get("direction") or "?").upper()
+        zone_lo = float(primary.get("entry_zone_low") or 0.0)
+        zone_hi = float(primary.get("entry_zone_high") or 0.0)
+        trigger = float(primary.get("trigger_level") or 0.0)
+        sl = float(primary.get("sl") or 0.0)
+        tp1 = float(primary.get("tp1") or 0.0)
+        tp2 = float(primary.get("tp2") or 0.0)
+        tp3 = float(primary.get("tp3") or 0.0)
+        status = str(primary.get("status") or "watching")
+        reason = str(primary.get("reason") or "").strip() or (
+            f"Reaction expected at {trigger:.2f}"
+        )
+        lines = [
+            "🟡 *SPENCER PRIMARY SETUP - XAUUSD*",
+            "",
+            f"Strategy: {nice}",
+            "",
+            f"My best level/zone: `{zone_lo:.2f}-{zone_hi:.2f}`",
+            "",
+            "Main expectation:",
+            reason,
+            "",
+            "Entry plan:",
+            f"{direction} only after confirmation at `{trigger:.2f}`",
+            "",
+            f"SL: `{sl:.2f}`",
+            f"TP1: `{tp1:.2f}`",
+            f"TP2: `{tp2:.2f}`",
+            f"TP3: `{tp3:.2f}`",
+            "",
+            f"Status: {status}",
+            "Waiting for price to reach the level and confirm.",
+        ]
+        primary_text = "\n".join(lines)
+        primary_ok = self._send_logged("CORE_PRIMARY_SETUP", primary_text)
+
+        alt_ok = True
+        if alternative:
+            alt_dir = str(alternative.get("direction") or "?").upper()
+            alt_lo = float(alternative.get("entry_zone_low") or 0.0)
+            alt_hi = float(alternative.get("entry_zone_high") or 0.0)
+            alt_sl = float(alternative.get("sl") or 0.0)
+            alt_tp1 = float(alternative.get("tp1") or 0.0)
+            alt_lines = [
+                "🔵 *SPENCER ALTERNATIVE PLAN - XAUUSD*",
+                "",
+                "If primary level fails:",
+                f"{alt_dir} at `{alt_lo:.2f}-{alt_hi:.2f}`",
+                f"SL `{alt_sl:.2f}`  /  TP1 `{alt_tp1:.2f}`",
+            ]
+            alt_ok = self._send_logged("CORE_ALTERNATIVE_PLAN", "\n".join(alt_lines))
+
+        return bool(primary_ok and alt_ok)
+
+    def send_core_startup_intro(self) -> bool:
+        """Replaces verbose legacy startup chatter with the spec one-liner."""
+        return self._send_logged(
+            "CORE_STARTUP_INTRO",
+            "🧠 Spencer is reading the market now.",
+        )
+
+    @staticmethod
+    def _legacy_emission_blocked(alert_type: str) -> bool:
+        """Defense-in-depth: even if a caller forgets to gate, the legacy
+        Telegram method itself refuses to send when USE_LEGACY_STRATEGIES=False.
+
+        Returns True (= block) when the alert type is a legacy strategy emission
+        and legacy strategies are disabled.
+        """
+        try:
+            from config.settings import USE_LEGACY_STRATEGIES
+        except Exception:
+            return False
+        if USE_LEGACY_STRATEGIES:
+            return False
+        LEGACY_ALERT_TYPES = {
+            "SETUP",            # send_setup_alert
+            "WATCHLIST",        # send_watchlist_setup
+            "WATCH_LEVEL",      # send_watch_level
+            "CONFIRMATION",     # send_confirmation
+            "MARKET_PLAN",      # send_market_plan_alert
+            "ANALYST_ENTRY",    # send_analyst_entry_alert
+            "SCENARIO_MANUAL_REVIEW",
+            "SCENARIO_UPDATE",
+        }
+        return alert_type in LEGACY_ALERT_TYPES
+
     @staticmethod
     def _format_api_error(status_code: int, raw_body: str) -> str:
         try:
@@ -630,6 +746,8 @@ class TelegramBot:
         strategy_name: str = "",
         strategy_score: float = 0.0,
     ) -> bool:
+        if self._legacy_emission_blocked("SETUP"):
+            return False
         """
         Fired when a high-quality setup is identified and fully validated.
         Gives the trader full context before the pending-order trigger.
@@ -749,6 +867,8 @@ class TelegramBot:
         is_psychological: bool = False,
         psych_strength: str = "",
     ) -> bool:
+        if self._legacy_emission_blocked("WATCHLIST"):
+            return False
         """
         Fired for shortlisted accepted levels before confirmation exists.
         This is the early setup/watchlist stage, not a manual entry trigger.
@@ -817,6 +937,8 @@ class TelegramBot:
         scope: str = "",
         is_qm: bool = False,
     ) -> bool:
+        if self._legacy_emission_blocked("WATCH_LEVEL"):
+            return False
         """
         Alert when price is actively approaching a key level.
         Deduplication (one alert per price level) is enforced in main.py.
@@ -984,6 +1106,8 @@ class TelegramBot:
         return self._send_logged("PENDING ORDER ALERT", msg, parse_mode=None)
 
     def send_market_plan_alert(self, market_plan) -> bool:
+        if self._legacy_emission_blocked("MARKET_PLAN"):
+            return False
         plan = market_plan.to_dict() if hasattr(market_plan, "to_dict") else dict(market_plan or {})
         if plan.get("targets_source") and plan.get("targets_source") != "structure_tp_engine":
             logger.warning(
@@ -1233,6 +1357,8 @@ class TelegramBot:
         return "\n".join(lines) + "\n"
 
     def send_analyst_entry_alert(self, setup: dict) -> bool:
+        if self._legacy_emission_blocked("ANALYST_ENTRY"):
+            return False
         ai = dict(setup.get("ai_prediction") or {})
         ai_label = str(ai.get("ai_label") or setup.get("ai_label") or "AI-ALLOWED SETUP")
         tp1_prob = ai.get("tp1_probability")
@@ -1357,6 +1483,8 @@ class TelegramBot:
         return self._send_logged("ANALYST ENTRY", msg, parse_mode=None)
 
     def send_scenario_manual_review_alert(self, payload: dict) -> bool:
+        if self._legacy_emission_blocked("SCENARIO_MANUAL_REVIEW"):
+            return False
         details = dict(payload.get("details") or {})
         scenario_zone = details.get("reclaim_zone") or details.get("breakdown_zone") or "scenario zone"
         msg = (
@@ -1375,6 +1503,8 @@ class TelegramBot:
         return self._send_logged("SCENARIO MANUAL REVIEW", msg, parse_mode=None)
 
     def send_scenario_update_alert(self, update: dict) -> bool:
+        if self._legacy_emission_blocked("SCENARIO_UPDATE"):
+            return False
         title = str(update.get("title") or f"SPENCER SCENARIO UPDATE - {update.get('symbol', 'XAUUSD')}")
         change_type = str(update.get("change_type") or "scenario_update")
         body = str(update.get("message") or "Scenario updated.")

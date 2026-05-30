@@ -46,6 +46,9 @@ import type {
   AIPredictiveLayerState,
   Candle,
   ConfirmationEngineState,
+  CoreStrategyEngineState,
+  CoreStrategyRejected,
+  CoreStrategySetup,
   DashboardState,
   DecisionEngineState,
   DeveloperDiagnosticsState,
@@ -99,6 +102,7 @@ export default function Dashboard() {
     (dashboard.sessionLiquidity ?? data?.sessionLiquidity ?? {}) as SessionLiquidityState
   const strategyWatchlists: StrategyWatchlistState = dashboard.strategyWatchlists ?? {}
   const diagnostics: DiagnosticsState = (dashboard.diagnostics ?? developerDiag) as DiagnosticsState
+  const coreEngine: CoreStrategyEngineState = dashboard.coreStrategyEngine ?? {}
 
   // Chart toggles + active timeframe
   const [chartTimeframe, setChartTimeframe] = useState<PriceFeedTimeframe>("M15")
@@ -271,6 +275,9 @@ export default function Dashboard() {
         <BotControlPanel />
         <ReplayRunner />
       </div>
+
+      {/* Core Strategy Engine — the only source of actionable setups */}
+      <CoreStrategyEnginePanel engine={coreEngine} />
 
       {/* Internal Levels / Spencer Brain — tabs */}
       <InternalLevelsCard
@@ -917,6 +924,179 @@ function ActiveTradeManagementCard({ trade }: { trade: ActiveTradeState }) {
         )}
       </CardContent>
     </Card>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Core Strategy Engine Panel — Spencer strategy reset
+// ─────────────────────────────────────────────────────────────────────────────
+
+function strategyLabel(value?: string | null): string {
+  if (!value) return "—"
+  return {
+    supply_demand_retest:             "Supply & Demand Retest",
+    session_liquidity_sweep_reversal: "Session Liquidity Sweep Reversal",
+    break_retest_continuation:        "Break & Retest Continuation",
+  }[value] ?? value.replace(/_/g, " ")
+}
+
+function CoreStrategyEnginePanel({ engine }: { engine: CoreStrategyEngineState }) {
+  const primary = engine.primary ?? null
+  const alternative = engine.alternative ?? null
+  const useLegacy = Boolean(engine.useLegacyStrategies)
+  const allowed = engine.allowedStrategyTypes ?? []
+  const rejected = engine.rejected ?? []
+  const condition = engine.marketCondition ?? "unknown"
+  return (
+    <Card>
+      <CardHeader className="pb-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-gold-500/20 bg-gold-500/8 text-gold-300">
+            <Target className="h-4 w-4" />
+          </div>
+          <CardTitle>Core Strategy Engine</CardTitle>
+          <Badge variant={useLegacy ? "sell" : "buy"} className="text-[10px]">
+            {useLegacy ? "Legacy mode" : "Reset active"}
+          </Badge>
+          <Badge variant="outline" className="text-[10px]">
+            Market: {condition}
+          </Badge>
+          <Badge variant="outline" className="ml-auto text-[10px]">
+            {engine.candidatesCount ?? 0} candidate · {engine.rejectedCount ?? 0} rejected
+          </Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="flex flex-wrap gap-2 text-[10px] text-muted-foreground">
+          <span>Allowed:</span>
+          {allowed.map((t) => (
+            <Badge key={t} variant="outline" className="text-[10px]">
+              {strategyLabel(t)}
+            </Badge>
+          ))}
+        </div>
+        <div className="grid gap-3 lg:grid-cols-2">
+          <CoreSetupCard label="Primary Setup" setup={primary} tone="gold" />
+          <CoreSetupCard label="Alternative Plan" setup={alternative} tone="purple" />
+        </div>
+        <RejectedCandidatesList rejected={rejected} />
+        <div className="text-right text-[10px] text-muted-foreground">
+          Last scan: {formatRelative(engine.lastScanTime)}
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
+function CoreSetupCard({
+  label,
+  setup,
+  tone,
+}: {
+  label: string
+  setup: CoreStrategySetup | null
+  tone: "gold" | "purple"
+}) {
+  if (!setup) {
+    return (
+      <div className="rounded-lg border border-ap-border bg-ap-surface/35 px-3 py-4 text-xs text-muted-foreground">
+        {label}: No candidate. Spencer is watching for confirmation.
+      </div>
+    )
+  }
+  const dir = String(setup.direction ?? "").toUpperCase()
+  const dirTone = dir === "BUY" ? "buy" : dir === "SELL" ? "sell" : "outline"
+  return (
+    <div className="space-y-2 rounded-lg border border-ap-border bg-ap-surface/35 p-3">
+      <div className="flex items-center justify-between">
+        <div className={cn("text-xs font-semibold", tone === "gold" ? "text-gold-300" : "text-purple-300")}>
+          {label}
+        </div>
+        <Badge variant={dirTone} className="text-[10px]">
+          {dir || "—"}
+        </Badge>
+      </div>
+      <InfoRow label="Strategy" value={strategyLabel(setup.strategy_type)} />
+      <InfoRow
+        label="Zone"
+        value={
+          setup.entry_zone_low != null && setup.entry_zone_high != null
+            ? `${Number(setup.entry_zone_low).toFixed(2)}-${Number(setup.entry_zone_high).toFixed(2)}`
+            : "—"
+        }
+        mono
+      />
+      <InfoRow
+        label="Trigger"
+        value={setup.trigger_level != null ? Number(setup.trigger_level).toFixed(2) : "—"}
+        mono
+      />
+      <InfoRow label="Entry" value={setup.entry != null ? Number(setup.entry).toFixed(2) : "—"} mono />
+      <InfoRow label="SL" value={setup.sl != null ? Number(setup.sl).toFixed(2) : "—"} mono />
+      <InfoRow
+        label="TP1 / TP2 / TP3"
+        value={
+          [setup.tp1, setup.tp2, setup.tp3]
+            .filter((v) => v != null)
+            .map((v) => Number(v).toFixed(2))
+            .join(" / ") || "—"
+        }
+        mono
+      />
+      <InfoRow
+        label="Confidence"
+        value={
+          setup.confidence_internal != null
+            ? `${Number(setup.confidence_internal).toFixed(1)} / 100`
+            : "—"
+        }
+      />
+      <InfoRow
+        label="Confirmation"
+        value={(setup.confirmation_required ?? []).join(" / ") || "—"}
+      />
+      <InfoRow label="Status" value={setup.status ?? "—"} />
+      {setup.reason ? (
+        <div className="text-[11px] text-muted-foreground">{setup.reason}</div>
+      ) : null}
+    </div>
+  )
+}
+
+function RejectedCandidatesList({ rejected }: { rejected: CoreStrategyRejected[] }) {
+  const [open, setOpen] = useState(false)
+  if (!rejected || rejected.length === 0) return null
+  return (
+    <div className="rounded-lg border border-ap-border bg-ap-surface/30">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center justify-between gap-3 px-3 py-2"
+      >
+        <div className="text-xs font-semibold text-muted-foreground">
+          Rejected candidates ({rejected.length})
+        </div>
+        {open ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
+      </button>
+      {open ? (
+        <div className="space-y-1 px-3 pb-3">
+          {rejected.slice(0, 12).map((r, i) => (
+            <div
+              key={i}
+              className="flex flex-wrap items-center gap-2 rounded-md border border-ap-border/60 bg-ap-bg/30 px-2 py-1 text-[11px]"
+            >
+              <Badge variant="outline" className="text-[10px]">
+                {strategyLabel(r.strategy_type)}
+              </Badge>
+              <span className="text-muted-foreground">{r.direction ?? "—"}</span>
+              <span className="num text-foreground">{r.level != null ? Number(r.level).toFixed(2) : "—"}</span>
+              <span className="ml-auto text-[10px] text-sell">{r.reason}</span>
+              {r.detail ? <span className="text-[10px] text-muted-foreground">{r.detail}</span> : null}
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
   )
 }
 

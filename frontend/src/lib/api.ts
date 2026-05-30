@@ -471,6 +471,65 @@ export interface DashboardState {
   aiPredictiveLayer?: AIPredictiveLayerState | null
   activeTrade?: ActiveTradeState | null
   diagnostics?: DiagnosticsState | null
+  coreStrategyEngine?: CoreStrategyEngineState | null
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Spencer Core Strategy Engine — the only source of actionable setups.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type CoreStrategyType =
+  | "supply_demand_retest"
+  | "session_liquidity_sweep_reversal"
+  | "break_retest_continuation"
+  | string
+
+export interface CoreStrategySetup {
+  strategy_type?: CoreStrategyType | null
+  symbol?: string | null
+  direction?: "BUY" | "SELL" | string | null
+  entry_zone_low?: number | null
+  entry_zone_high?: number | null
+  trigger_level?: number | null
+  confirmation_required?: string[] | null
+  entry?: number | null
+  sl?: number | null
+  tp1?: number | null
+  tp2?: number | null
+  tp3?: number | null
+  invalidation?: number | null
+  reason?: string | null
+  confidence_internal?: number | null
+  status?: string | null
+  level_intel_score?: number | null
+  liquidity_score?: number | null
+  ai_label?: string | null
+  scenario_compliance?: string | null
+  session_name?: string | null
+  higher_tf?: string | null
+  lower_tf?: string | null
+  confirmation_candle_time?: string | null
+}
+
+export interface CoreStrategyRejected {
+  strategy_type?: string
+  direction?: string
+  reason?: string
+  level?: number
+  detail?: string
+}
+
+export interface CoreStrategyEngineState {
+  marketCondition?: string | null
+  primary?: CoreStrategySetup | null
+  alternative?: CoreStrategySetup | null
+  candidatesCount?: number | null
+  rejectedCount?: number | null
+  rejected?: CoreStrategyRejected[] | null
+  scanSummary?: Record<string, unknown> | null
+  useLegacyStrategies?: boolean | null
+  allowedStrategyTypes?: string[] | null
+  lastScanTime?: string | null
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

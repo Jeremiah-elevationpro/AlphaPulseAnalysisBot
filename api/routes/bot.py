@@ -184,6 +184,9 @@ def _sync_process_state() -> None:
             state.bot_state["scenario_compliance"]         = five_layer.get("scenario_compliance", state.bot_state.get("scenario_compliance", {}))
             state.bot_state["ai_prediction"]               = hb.get("ai_prediction", state.bot_state.get("ai_prediction", {}))
             state.bot_state["ai_predictive_layer"]          = hb.get("ai_predictive_layer", state.bot_state.get("ai_predictive_layer", {}))
+            state.bot_state["core_strategy_engine"]         = hb.get("core_strategy_engine", state.bot_state.get("core_strategy_engine", {}))
+            state.bot_state["use_legacy_strategies"]        = bool(hb.get("use_legacy_strategies", state.bot_state.get("use_legacy_strategies", False)))
+            state.bot_state["allowed_strategy_types"]       = hb.get("allowed_strategy_types", state.bot_state.get("allowed_strategy_types"))
             state.bot_state["alert_dedupe"]               = hb.get("alert_dedupe", state.bot_state.get("alert_dedupe"))
             state.bot_state["active_instance_id"]          = runtime_control.get("active_instance_id") or hb.get("instance_id")
             state.bot_state["bot_process_alive"]           = True
@@ -625,6 +628,20 @@ def _build_dashboard_state(s: dict, blocks: dict) -> dict:
     session_liquidity = (s.get("market_plan") or {}).get("session_liquidity") or s.get("session_liquidity") or {}
     level_intel = (s.get("five_layer_status") or {}).get("level_intelligence", s.get("level_intelligence", {}))
 
+    core_engine = s.get("core_strategy_engine") or {}
+    core_strategy_engine_block = {
+        "marketCondition":   core_engine.get("market_condition") or "unknown",
+        "primary":           core_engine.get("primary"),
+        "alternative":       core_engine.get("alternative"),
+        "candidatesCount":   int(core_engine.get("candidates_count") or 0),
+        "rejectedCount":     int(core_engine.get("rejected_count") or 0),
+        "rejected":          core_engine.get("rejected") or [],
+        "scanSummary":       core_engine.get("scan_summary") or {},
+        "useLegacyStrategies": bool(s.get("use_legacy_strategies", False)),
+        "allowedStrategyTypes": list(s.get("allowed_strategy_types") or []),
+        "lastScanTime":      (core_engine.get("scan_summary") or {}).get("scanned_at"),
+    }
+
     return {
         "priceFeed":          _build_price_feed_block(s),
         "activePlan":         active_plan,
@@ -634,6 +651,7 @@ def _build_dashboard_state(s: dict, blocks: dict) -> dict:
         "aiPredictiveLayer":  blocks.get("aiPredictiveLayer") or {},
         "activeTrade":        active_trade,
         "diagnostics":        diagnostics,
+        "coreStrategyEngine": core_strategy_engine_block,
     }
 
 

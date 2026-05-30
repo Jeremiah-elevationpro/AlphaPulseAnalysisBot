@@ -67,10 +67,18 @@ from config.settings import (
     PYTORCH_AI_MODEL_VERSION,
     PYTORCH_AI_SCHEMA_PATH,
     SCENARIO_COMPLIANCE_ENABLED,
+    USE_LEGACY_STRATEGIES,
+    CORE_STRATEGY_ENGINE_ENABLED,
+    CORE_ALLOWED_STRATEGY_TYPES,
 )
 from data.mt5_client import MT5Client
 from strategies.strategy_manager import StrategyManager
 from strategies.filters import MarketContextEngine
+from strategies.core_strategy_engine import (
+    CoreStrategyEngine,
+    StrategyResult,
+    log_legacy_disabled,
+)
 from signals.signal_generator import SignalGenerator
 from trade_manager.trade_tracker import TradeManager
 from notifications.telegram_bot import TelegramBot
@@ -108,7 +116,34 @@ class AlphaPulse:
         self.context_engine = MarketContextEngine()
         # StrategyManager is created without a learning engine here;
         # _learning is wired in start() after LearningEngine is ready.
+        # NOTE: when USE_LEGACY_STRATEGIES=False (default), the legacy strategy
+        # manager remains instantiated for back-compat (its scoring/research
+        # outputs feed Level Intelligence) but its setups are NOT emitted to
+        # Telegram or trade management. See `_emit_legacy_setup_alerts`.
         self.strategy_manager = StrategyManager(learning_engine=None, merge_confluence=False)
+
+        # Core Strategy Engine — the only source of actionable setups when
+        # USE_LEGACY_STRATEGIES=False. Wired with shared engines so it can
+        # consult supporting evidence (Level Intelligence, Session Liquidity).
+        self.core_strategy_engine: Optional[CoreStrategyEngine] = None
+        self._last_core_strategy_result: Optional[StrategyResult] = None
+        if CORE_STRATEGY_ENGINE_ENABLED:
+            try:
+                # market_analyst owns the level_intel / session_liquidity engines
+                # in this codebase; lazy attribute access keeps this resilient
+                # against ordering — None at this point is acceptable, engines
+                # get re-bound when market_analyst is created.
+                self.core_strategy_engine = CoreStrategyEngine(
+                    level_intel_engine=None,
+                    session_liquidity_engine=None,
+                )
+                logger.info(
+                    "Core Strategy Engine ENABLED — USE_LEGACY_STRATEGIES=%s",
+                    USE_LEGACY_STRATEGIES,
+                )
+            except Exception as exc:
+                logger.warning("Failed to init Core Strategy Engine: %s", exc)
+                self.core_strategy_engine = None
         self.market_analyst = MarketAnalyst()
         self.level_intelligence_engine = LevelIntelligenceEngine()
         self.gold_confirmation_engine = GoldConfirmationEngine()
@@ -374,6 +409,10 @@ class AlphaPulse:
         # Mark startup time — alerts suppressed for first 5 minutes
         self._startup_time = datetime.now(timezone.utc)
 
+        # Self-claim the runtime instance id so this PID is authoritative even
+        # if the API's launcher PID disagreed (Windows venv launcher quirk).
+        self._claim_instance_id()
+
         self._running = True
         self._run_loop()
 
@@ -516,6 +555,46 @@ class AlphaPulse:
             except Exception as exc:
                 logger.debug("Market analyst generation failed: %s", exc)
                 self._market_plan = None
+        # ─── CORE STRATEGY ENGINE ──────────────────────────────────────────
+        # When USE_LEGACY_STRATEGIES=False (default), the Core Strategy Engine
+        # is the ONLY source of actionable setups. Legacy strategy outputs
+        # remain for supporting evidence (Level Intelligence, replay, dashboard
+        # debug) but their Telegram emission paths are gated below.
+        core_result: Optional[StrategyResult] = None
+        if self.core_strategy_engine is not None:
+            try:
+                # Rebind engines now that market_analyst is initialised
+                self.core_strategy_engine.level_intel = getattr(
+                    getattr(self, "market_analyst", None), "level_intel", None
+                )
+                self.core_strategy_engine.session_liquidity = getattr(
+                    getattr(self, "market_analyst", None), "session_engine", None
+                )
+                core_result = self.core_strategy_engine.run(
+                    data,
+                    current_price=current_price,
+                    ctx=ctx,
+                    plan=self._market_plan,
+                    symbol="XAUUSD",
+                )
+                self._last_core_strategy_result = core_result
+            except Exception as exc:
+                logger.error("CORE STRATEGY ENGINE ERROR: %s", exc, exc_info=True)
+                core_result = None
+
+        # ─── Emit Core Strategy Engine primary/alternative setup ──────────
+        # Only after the silent analysis phase + only when not in legacy mode.
+        if (
+            not USE_LEGACY_STRATEGIES
+            and not in_silent_phase
+            and core_result is not None
+            and core_result.primary is not None
+        ):
+            try:
+                self._emit_core_strategy_setup(core_result)
+            except Exception as exc:
+                logger.warning("CORE STRATEGY EMISSION FAILED: %s", exc, exc_info=True)
+
         strategy_scans = run_result.strategy_scans or {}
         cumulative_fields = {
             "scans_run",
@@ -586,6 +665,15 @@ class AlphaPulse:
         #    _seen_setups handles deduplication so each setup alerts only once per session.
 
         # 5. Process signals from the selected strategy
+        # ── Legacy strategy emission gate ──────────────────────────────────
+        # The legacy strategy_manager.run() output (signals → trades → Telegram)
+        # is the primary source of legacy actionable setups. When the Core
+        # Strategy Engine is in charge (USE_LEGACY_STRATEGIES=False), this
+        # block is skipped entirely — Telegram entry alerts come ONLY from the
+        # Core Strategy Engine primary setup further down.
+        if signals and not USE_LEGACY_STRATEGIES:
+            log_legacy_disabled("legacy_signal_processing")
+            signals = []
         if signals:
             active_signals = []
             for signal in signals:
@@ -1171,6 +1259,22 @@ class AlphaPulse:
                 logger.info("MISSED TP ALERT DIAGNOSTIC: setup_id=%s reason=%s", state.setup_id, reason)
 
     def _handle_market_plan_alerts(self, market_plan, confirmations: list, current_price: float, context, active_signals: list | None = None) -> None:
+        # ── Legacy strategy emission gate ──────────────────────────────────
+        # The full market-plan Telegram alerts, scenario primary/secondary
+        # entries, and analyst confirmation entry alerts are legacy strategy
+        # emission paths. Spencer Core Strategy Engine reset: these no longer
+        # fire when USE_LEGACY_STRATEGIES=False. State (memory persistence,
+        # dedupe, dashboard surfacing of the market plan) still runs.
+        if not USE_LEGACY_STRATEGIES:
+            log_legacy_disabled("market_plan_alerts")
+            # Still persist the plan_dict so the dashboard / level intelligence
+            # can read it — just suppress Telegram emission.
+            try:
+                plan_dict = market_plan.to_dict() if hasattr(market_plan, "to_dict") else dict(market_plan or {})
+                self._persist_analyst_market_plan(plan_dict, context)
+            except Exception:
+                pass
+            return
         plan_dict = market_plan.to_dict() if hasattr(market_plan, "to_dict") else dict(market_plan or {})
         signature = self._market_plan_signature(plan_dict)
         now = datetime.now(timezone.utc)
@@ -1857,6 +1961,37 @@ class AlphaPulse:
             "shutdown_requested": False,
         }
 
+    def _claim_instance_id(self) -> None:
+        """Overwrite bot_runtime_control.active_instance_id with this process's PID.
+
+        The API spawns main.py via subprocess.Popen and writes the launcher PID
+        into runtime_control. On Windows venvs, python.exe re-execs into a child
+        with a different PID, so the running scan loop's PID can disagree with
+        the API's recorded value — causing every runtime alert to be skipped
+        as 'stale instance'. Self-claiming here makes the loop authoritative.
+        """
+        try:
+            existing = self._read_runtime_control() or {}
+            recorded = str(existing.get("active_instance_id") or "")
+            self_pid = self._instance_id  # already set to str(os.getpid())
+            if recorded == self_pid:
+                return
+            payload = {
+                "status":                  existing.get("status") or "running",
+                "active_instance_id":      self_pid,
+                "runtime_alerts_enabled":  bool(existing.get("runtime_alerts_enabled", True)),
+                "shutdown_requested":      False,
+                "last_shutdown_time":      existing.get("last_shutdown_time"),
+                "updated_at":              datetime.now(timezone.utc).isoformat(),
+            }
+            self._runtime_control_file.write_text(json.dumps(payload), encoding="utf-8")
+            logger.info(
+                "INSTANCE ID SELF-CLAIM: rewrote active_instance_id %s -> %s",
+                recorded or "(empty)", self_pid,
+            )
+        except Exception as exc:
+            logger.warning("INSTANCE ID SELF-CLAIM FAILED: %s", exc)
+
     def can_send_runtime_alert(self, alert_type: str, instance_id: str | None = None) -> bool:
         runtime_control = self._read_runtime_control()
         active_instance_id = str(runtime_control.get("active_instance_id") or "")
@@ -1927,7 +2062,104 @@ class AlphaPulse:
             return True
         return False
 
+    def _emit_core_strategy_setup(self, result: StrategyResult) -> None:
+        """Emit the Core Strategy Engine primary (and alternative) setup to Telegram.
+
+        Uses the new simplified template via TelegramBot.send_core_strategy_setup.
+        Dedupe on the primary setup's fingerprint per the standard alert_dedupe
+        machinery so repeated scans don't repost.
+        """
+        primary = result.primary
+        alternative = result.alternative
+        if primary is None:
+            return
+        fp = primary.fingerprint()
+        can_send, reason = self._alert_dedupe.should_send_alert(
+            "core_primary",
+            fp,
+            self._event_signature(primary.to_dict()),
+            cooldown_seconds=PRIMARY_SETUP_ALERT_COOLDOWN_MINUTES * 60,
+        )
+        if not can_send:
+            logger.info("CORE PRIMARY SKIPPED: %s reason=%s", fp, reason)
+            return
+        payload = {
+            "primary":     primary.to_dict(),
+            "alternative": alternative.to_dict() if alternative else None,
+            "market_condition": result.market_condition,
+        }
+        sent = False
+        sender = getattr(self.telegram, "send_core_strategy_setup", None)
+        if callable(sender):
+            try:
+                sent = bool(sender(payload))
+            except Exception as exc:
+                logger.warning("send_core_strategy_setup raised: %s", exc)
+                sent = False
+        else:
+            # Backwards-compatible fallback if the new template hasn't been
+            # wired in this build — emit a plain system alert so the user
+            # still sees something.
+            try:
+                msg = self._build_core_strategy_text(primary, alternative, result.market_condition)
+                sent = bool(self.telegram.send_system_alert(msg))
+            except Exception as exc:
+                logger.warning("Core fallback send_system_alert failed: %s", exc)
+        if sent:
+            self._alert_dedupe.mark_alert_sent("core_primary", fp, self._event_signature(primary.to_dict()))
+            logger.info(
+                "CORE PRIMARY SENT: strategy=%s direction=%s entry=%.2f sl=%.2f tp1=%.2f",
+                primary.strategy_type, primary.direction, primary.entry, primary.sl, primary.tp1,
+            )
+
+    @staticmethod
+    def _build_core_strategy_text(primary, alternative, market_condition: str) -> str:
+        """Plain-text fallback template — used only when send_core_strategy_setup
+        isn't implemented in this build. Keeps the same trader-facing layout."""
+        nice_name = {
+            "supply_demand_retest":              "Supply & Demand Retest",
+            "session_liquidity_sweep_reversal":  "Session Liquidity Sweep Reversal",
+            "break_retest_continuation":         "Break & Retest Continuation",
+        }.get(primary.strategy_type, primary.strategy_type)
+        lines = [
+            "🟡 SPENCER PRIMARY SETUP - XAUUSD",
+            "",
+            f"Strategy: {nice_name}",
+            "",
+            f"My best level/zone: {primary.entry_zone_low:.2f}-{primary.entry_zone_high:.2f}",
+            "",
+            "Main expectation:",
+            primary.reason,
+            "",
+            "Entry plan:",
+            f"{primary.direction} only after confirmation at {primary.trigger_level:.2f}",
+            "",
+            f"SL: {primary.sl:.2f}",
+            f"TP1: {primary.tp1:.2f}",
+            f"TP2: {primary.tp2:.2f}",
+            f"TP3: {primary.tp3:.2f}",
+            "",
+            f"Status: {primary.status}",
+            "Waiting for price to reach the level and confirm.",
+        ]
+        if alternative is not None:
+            lines += [
+                "",
+                "Alternative plan:",
+                "🔵 SPENCER ALTERNATIVE PLAN - XAUUSD",
+                "",
+                "If primary level fails:",
+                f"{alternative.direction} {alternative.entry_zone_low:.2f}-{alternative.entry_zone_high:.2f} "
+                f"(SL {alternative.sl:.2f} / TP1 {alternative.tp1:.2f})",
+            ]
+        return "\n".join(lines)
+
     def _send_resume_watch_alerts(self, plan_dict: dict, primary: dict, secondary: dict, now: datetime) -> None:
+        # Legacy strategy emission gate — see _handle_market_plan_alerts.
+        if not USE_LEGACY_STRATEGIES:
+            log_legacy_disabled("resume_watch_alerts")
+            self._resume_watch_checked = True
+            return
         if self._resume_watch_checked or not SPENCER_RESUME_WATCH_ALERT_ENABLED:
             return
 
@@ -2502,6 +2734,20 @@ class AlphaPulse:
                 "ai_prediction":         ai_prediction,
                 "ai_predictive_layer":   ai_predictive_layer,
                 "priceFeed":             price_feed,
+                "core_strategy_engine":  (
+                    self._last_core_strategy_result.to_dict()
+                    if self._last_core_strategy_result else {
+                        "market_condition": "unknown",
+                        "primary": None,
+                        "alternative": None,
+                        "candidates_count": 0,
+                        "rejected_count": 0,
+                        "rejected": [],
+                        "scan_summary": {},
+                    }
+                ),
+                "use_legacy_strategies": bool(USE_LEGACY_STRATEGIES),
+                "allowed_strategy_types": list(CORE_ALLOWED_STRATEGY_TYPES),
                 "active_instance_id":   runtime_control.get("active_instance_id"),
                 "background_tasks_active": sum(1 for active in self._background_tasks.values() if active),
                 "runtime_alerts_enabled": bool(
@@ -2749,6 +2995,10 @@ class AlphaPulse:
         The later confirmation and simulated trade-tracking flow remains driven
         by the existing signal pipeline.
         """
+        # Legacy strategy emission gate — Spencer Core Strategy Engine reset.
+        if not USE_LEGACY_STRATEGIES:
+            log_legacy_disabled("shortlisted_level_alerts")
+            return 0
         ctx = getattr(outlook, "context", None)
         _session_name = getattr(ctx, "session_name", "unknown") if ctx else "unknown"
 

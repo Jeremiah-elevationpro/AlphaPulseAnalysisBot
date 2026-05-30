@@ -97,7 +97,11 @@ class LiveBreakRetestAnalyzer:
                 quality_score=72.0,
                 selection_score=72.0,
             )
-            candle_time = pd.Timestamp(candidate.retest_time or candidate.break_time, tz="UTC")
+            # Guard against already-tz-aware Timestamps — modern pandas raises if you
+            # pass tz="UTC" alongside a tz-aware value. MT5 candle times come in as
+            # tz-aware UTC already, so prefer tz_convert when applicable.
+            _ts_src = pd.Timestamp(candidate.retest_time or candidate.break_time)
+            candle_time = _ts_src.tz_localize("UTC") if _ts_src.tz is None else _ts_src.tz_convert("UTC")
             confirmation = ConfirmationResult(
                 confirmed=True,
                 direction=candidate.direction,

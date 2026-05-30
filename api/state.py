@@ -108,6 +108,14 @@ bot_state: dict = {
         "watchlist_skipped_duplicate": 0,
         "last_skip_reason": None,
     },
+    # Spencer Core Strategy Engine — populated by main.py heartbeat
+    "core_strategy_engine":       {},
+    "use_legacy_strategies":      False,
+    "allowed_strategy_types":     [
+        "supply_demand_retest",
+        "session_liquidity_sweep_reversal",
+        "break_retest_continuation",
+    ],
 }
 
 replay_runs: dict[int, dict] = {}

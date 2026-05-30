@@ -273,6 +273,9 @@ MARKET_PLAN_RESEND_ON_MINOR_PRICE_CHANGE = os.getenv("MARKET_PLAN_RESEND_ON_MINO
 ENTRY_ALERT_COOLDOWN_MINUTES = int(os.getenv("ENTRY_ALERT_COOLDOWN_MINUTES", "30"))
 TELEGRAM_VERBOSE_MARKET_PLAN = os.getenv("TELEGRAM_VERBOSE_MARKET_PLAN", "false").strip().lower() == "true"
 PRIMARY_SETUP_ALERT_COOLDOWN_MINUTES = int(os.getenv("PRIMARY_SETUP_ALERT_COOLDOWN_MINUTES", "60"))
+MIN_TELEGRAM_SETUP_RISK_PIPS = float(os.getenv("MIN_TELEGRAM_SETUP_RISK_PIPS", "5"))
+TELEGRAM_SEND_STILL_WATCHING_ALERTS = os.getenv("TELEGRAM_SEND_STILL_WATCHING_ALERTS", "false").strip().lower() == "true"
+STILL_WATCHING_ALERT_COOLDOWN_MINUTES = int(os.getenv("STILL_WATCHING_ALERT_COOLDOWN_MINUTES", "120"))
 ENTRY_ZONE_DUPLICATE_TOLERANCE_PIPS = float(os.getenv("ENTRY_ZONE_DUPLICATE_TOLERANCE_PIPS", "10"))
 MT5_NO_DATA_ALERT_COOLDOWN_MINUTES = int(os.getenv("MT5_NO_DATA_ALERT_COOLDOWN_MINUTES", "30"))
 TELEGRAM_RUNTIME_ALERTS_ENABLED = os.getenv("TELEGRAM_RUNTIME_ALERTS_ENABLED", "true").lower() == "true"
@@ -873,16 +876,16 @@ SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", 60))
 # ─────────────────────────────────────────────
 # MetaTrader 5
 # ─────────────────────────────────────────────
-MT5_LOGIN = int(os.getenv("MT5_LOGIN", "0"))
-MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
-MT5_SERVER = os.getenv("MT5_SERVER", "")
+MT5_LOGIN = int(os.getenv("MT5_LOGIN", "435409123"))
+MT5_PASSWORD = os.getenv("MT5_PASSWORD", "Jeremiah26$")
+MT5_SERVER = os.getenv("MT5_SERVER", "Exness-MT5Trial9")
 MT5_PATH = os.getenv("MT5_PATH", "C:\\Program Files\\MetaTrader 5\\terminal64.exe")
 
 # ─────────────────────────────────────────────
 # TELEGRAM
 # ─────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8423015469:AAETTIiz9ydz83aMOECVFAwpTFVbTYhfrE8")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1003937713982")
 
 # ─────────────────────────────────────────────
 # DATABASE
@@ -950,6 +953,42 @@ MANUAL_SETUP_APPROACH_DISTANCE_PIPS = float(
 )
 MANUAL_SETUP_ALERT_COOLDOWN_MINUTES = int(
     os.getenv("MANUAL_SETUP_ALERT_COOLDOWN_MINUTES", "30")
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spencer Core Strategy Engine — strategy reset
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# When USE_LEGACY_STRATEGIES is False (default), the bot ONLY emits actionable
+# setups from the three Core Strategy Engine strategies:
+#
+#   • supply_demand_retest
+#   • session_liquidity_sweep_reversal
+#   • break_retest_continuation
+#
+# All legacy strategy entry sources (Malaysian SNR, standalone QM, standalone
+# gap sweep, structure-shift entries, psych-level entries, full-market-plan
+# watchlist alerts, scenario primary/secondary entries) are blocked from
+# generating Telegram setup alerts, registering active trades, or producing
+# independent scenarios — they may remain in the codebase but as supporting
+# evidence only.
+#
+# Set USE_LEGACY_STRATEGIES=True via env var as a kill switch / rollback to
+# restore the previous strategy_manager behavior.
+USE_LEGACY_STRATEGIES = os.getenv("USE_LEGACY_STRATEGIES", "false").strip().lower() == "true"
+CORE_STRATEGY_ENGINE_ENABLED = os.getenv("CORE_STRATEGY_ENGINE_ENABLED", "true").strip().lower() == "true"
+# Score thresholds for the three core strategies — defaults match spec.
+CORE_MIN_LEVEL_INTEL_SCORE = float(os.getenv("CORE_MIN_LEVEL_INTEL_SCORE", "65"))
+CORE_MIN_LIQUIDITY_SCORE = float(os.getenv("CORE_MIN_LIQUIDITY_SCORE", "70"))
+CORE_MIN_RISK_PIPS = float(os.getenv("CORE_MIN_RISK_PIPS", "5"))
+CORE_MIN_TP1_RR = float(os.getenv("CORE_MIN_TP1_RR", "0.8"))
+# Hard list of strategy types the Core engine is allowed to emit. Any other
+# strategy_type returned by upstream code must be dropped before reaching
+# Telegram/trade management when USE_LEGACY_STRATEGIES is False.
+CORE_ALLOWED_STRATEGY_TYPES = (
+    "supply_demand_retest",
+    "session_liquidity_sweep_reversal",
+    "break_retest_continuation",
 )
 
 # Spencer Level Intelligence / Scenario Compliance
